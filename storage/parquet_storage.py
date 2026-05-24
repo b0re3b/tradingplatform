@@ -7,7 +7,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -591,12 +591,127 @@ class ParquetStorage:
     # Normalizers
     # ------------------------------------------------------------------
 
+
+    def _normalize_entity_payload(
+        self,
+        payload: Mapping[str, Any],
+        *candidate_paths: str,
+    ) -> dict[str, Any]:
+        """
+        Build a storage-friendly payload from both legacy flat EventBus events
+        and the newer state-driven payload shapes.
+
+        The state-driven pipeline can publish low-frequency persistable events
+        where the actual object is nested under keys like ``candle``, ``snapshot``
+        or ``data``. Older storage code expected OHLCV/open-interest/funding
+        fields on the top level. This helper merges top-level scope fields with
+        the first matching nested entity so normalizers can support both shapes.
+        """
+        base = self._as_mapping(payload)
+        if not base:
+            return {}
+
+        for path in candidate_paths:
+            nested = self._get_path(base, path)
+            nested_map = self._as_mapping(nested)
+            if nested_map:
+                merged = dict(base)
+                merged.update(nested_map)
+                return merged
+
+        return dict(base)
+
+    def _as_mapping(self, value: Any) -> dict[str, Any]:
+        plain = self._plain_value(value)
+        if isinstance(plain, Mapping):
+            return {str(key): inner for key, inner in plain.items()}
+        return {}
+
+    def _plain_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            with contextlib.suppress(Exception):
+                return self._plain_value(to_dict())
+
+        if is_dataclass(value):
+            with contextlib.suppress(Exception):
+                return self._plain_value(asdict(value))
+
+        if isinstance(value, Mapping):
+            return {
+                str(key): self._plain_value(inner)
+                for key, inner in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            return [self._plain_value(item) for item in value]
+
+        # Support simple slots-based DTOs that are not dataclasses.
+        slots = getattr(value.__class__, "__slots__", None)
+        if slots:
+            result: dict[str, Any] = {}
+            for slot in slots:
+                if isinstance(slot, str) and hasattr(value, slot):
+                    result[slot] = self._plain_value(getattr(value, slot))
+            if result:
+                return result
+
+        if hasattr(value, "__dict__"):
+            with contextlib.suppress(Exception):
+                return {
+                    str(key): self._plain_value(inner)
+                    for key, inner in vars(value).items()
+                    if not str(key).startswith("_")
+                }
+
+        return value
+
+    def _get_path(self, payload: Mapping[str, Any], path: str) -> Any:
+        current: Any = payload
+        for part in path.split("."):
+            current_map = self._as_mapping(current)
+            if not current_map or part not in current_map:
+                return None
+            current = current_map.get(part)
+        return current
+
+    def _first_from(
+        self,
+        payload: Mapping[str, Any],
+        *keys: str,
+    ) -> Any:
+        for key in keys:
+            if "." in key:
+                value = self._get_path(payload, key)
+            else:
+                value = payload.get(key)
+            if value is not None:
+                return value
+        return None
+
     def _normalize_candle(
         self,
         payload: Mapping[str, Any],
         *,
         topic: str,
     ) -> dict[str, Any] | None:
+        payload = self._normalize_entity_payload(
+            payload,
+            "candle",
+            "closed_candle",
+            "last_closed_candle",
+            "data.candle",
+            "data",
+            "snapshot.last_closed_candle",
+            "snapshot.candle",
+            "snapshot",
+            "state.last_closed_candle",
+            "state.candle",
+        )
+
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
         timeframe = self._required_str(payload, "timeframe")
@@ -605,20 +720,52 @@ class ParquetStorage:
             payload,
             "open_time_ms",
             "open_time",
+            "start_time_ms",
+            "start_time",
             "timestamp_ms",
             "timestamp",
+            "event_time",
         )
+
+        close_time_ms = self._first_int(
+            payload,
+            "close_time_ms",
+            "close_time",
+            "end_time_ms",
+            "end_time",
+        )
+
+        if open_time_ms is None and close_time_ms is not None and timeframe:
+            open_time_ms = close_time_ms - self._timeframe_to_ms(timeframe) + 1
 
         if exchange is None or symbol is None or timeframe is None or open_time_ms is None:
             return None
 
-        is_closed = self._safe_bool(payload.get("is_closed"))
+        # ``market.candle.closed`` is already a closed-candle topic. In the
+        # state-driven flow some emitters use this topic as a low-frequency
+        # persistable trigger without carrying ``is_closed`` explicitly.
+        is_closed = (
+            self._safe_bool(payload.get("is_closed"))
+            or self._safe_bool(payload.get("closed"))
+            or topic.endswith(".closed")
+        )
         if not is_closed:
             return None
 
-        close_time_ms = self._first_int(payload, "close_time_ms", "close_time")
         if close_time_ms is None:
             close_time_ms = self._infer_close_time_ms(open_time_ms, timeframe)
+
+        open_price = self._safe_float(payload.get("open"))
+        high_price = self._safe_float(payload.get("high"))
+        low_price = self._safe_float(payload.get("low"))
+        close_price = self._safe_float(payload.get("close"))
+
+        if open_price is None or high_price is None or low_price is None or close_price is None:
+            return None
+
+        volume = self._first_float(payload, "volume", "base_volume", "qty", "quantity")
+        quote_volume = self._first_float(payload, "quote_volume", "quote_asset_volume", "turnover")
+        trades_count = self._first_int(payload, "trades_count", "trade_count", "num_trades", "number_of_trades")
 
         return {
             "topic": topic,
@@ -629,17 +776,17 @@ class ParquetStorage:
             "timeframe": timeframe,
             "open_time_ms": open_time_ms,
             "close_time_ms": close_time_ms,
-            "open": self._safe_float(payload.get("open")),
-            "high": self._safe_float(payload.get("high")),
-            "low": self._safe_float(payload.get("low")),
-            "close": self._safe_float(payload.get("close")),
-            "volume": self._safe_float(payload.get("volume")),
-            "quote_volume": self._safe_float(payload.get("quote_volume")),
-            "trades_count": self._safe_int(payload.get("trades_count")),
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": volume,
+            "quote_volume": quote_volume,
+            "trades_count": trades_count,
             "is_closed": True,
             "timestamp_ms": self._event_timestamp(payload, fallback=open_time_ms),
             "received_at_ms": self._received_at(payload),
-            "source": payload.get("source"),
+            "source": payload.get("source") or payload.get("price_source"),
             "ingested_at_ms": self._now_ms(),
         }
 
@@ -649,12 +796,22 @@ class ParquetStorage:
         *,
         topic: str,
     ) -> dict[str, Any] | None:
+        payload = self._normalize_entity_payload(
+            payload,
+            "trade",
+            "data.trade",
+            "data",
+            "snapshot.trade",
+            "event.trade",
+        )
+
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
         timestamp_ms = self._first_int(
             payload,
             "timestamp_ms",
+            "trade_time_ms",
             "trade_time",
             "event_time",
             "time",
@@ -662,7 +819,7 @@ class ParquetStorage:
         )
 
         price = self._safe_float(payload.get("price"))
-        quantity = self._first_float(payload, "quantity", "qty", "size", "amount")
+        quantity = self._first_float(payload, "quantity", "qty", "size", "amount", "base_quantity")
 
         if exchange is None or symbol is None or timestamp_ms is None:
             return None
@@ -671,7 +828,10 @@ class ParquetStorage:
 
         side = self._normalize_side(payload.get("side"))
         aggressor_side = self._normalize_side(
-            payload.get("aggressor_side") or payload.get("taker_side") or side
+            payload.get("aggressor_side")
+            or payload.get("taker_side")
+            or payload.get("buyer_side")
+            or side
         )
 
         return {
@@ -685,7 +845,7 @@ class ParquetStorage:
             "received_at_ms": self._received_at(payload),
             "price": price,
             "quantity": quantity,
-            "quote_quantity": self._first_float(payload, "quote_quantity", "quote_qty"),
+            "quote_quantity": self._first_float(payload, "quote_quantity", "quote_qty", "quote_size", "turnover"),
             "side": side,
             "aggressor_side": aggressor_side,
             "buyer_is_maker": self._safe_optional_bool(payload.get("buyer_is_maker")),
@@ -699,6 +859,18 @@ class ParquetStorage:
         *,
         topic: str,
     ) -> dict[str, Any] | None:
+        payload = self._normalize_entity_payload(
+            payload,
+            "orderbook",
+            "book",
+            "snapshot.orderbook",
+            "snapshot.book",
+            "snapshot",
+            "data.orderbook",
+            "data.book",
+            "data",
+        )
+
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
@@ -713,8 +885,18 @@ class ParquetStorage:
 
         timestamp_ms = self._event_timestamp(payload)
 
-        best_bid = self._first_level_price(bids)
-        best_ask = self._first_level_price(asks)
+        best_bid = (
+            self._safe_float(payload.get("best_bid"))
+            or self._first_level_price(bids)
+        )
+        best_ask = (
+            self._safe_float(payload.get("best_ask"))
+            or self._first_level_price(asks)
+        )
+        mid_price = (
+            self._safe_float(payload.get("mid_price"))
+            or self._calc_mid_price(best_bid, best_ask)
+        )
 
         return {
             "topic": topic,
@@ -722,16 +904,16 @@ class ParquetStorage:
             "exchange": exchange,
             "symbol": symbol,
             "market_type": self._market_type(payload),
-            "timestamp_ms": timestamp_ms,
+            "timestamp_ms": timestamp_ms or self._now_ms(),
             "received_at_ms": self._received_at(payload),
-            "sequence": self._first_int(payload, "sequence", "update_id", "last_update_id"),
+            "sequence": self._first_int(payload, "sequence", "update_id", "last_update_id", "final_update_id"),
             "depth": max(len(bids), len(asks)),
             "bids_json": self._json_dumps(bids),
             "asks_json": self._json_dumps(asks),
             "best_bid": best_bid,
             "best_ask": best_ask,
             "spread": self._calc_spread(best_bid, best_ask),
-            "mid_price": self._calc_mid_price(best_bid, best_ask),
+            "mid_price": mid_price,
             "source": payload.get("source"),
             "ingested_at_ms": self._now_ms(),
         }
@@ -742,18 +924,30 @@ class ParquetStorage:
         *,
         topic: str,
     ) -> dict[str, Any] | None:
+        payload = self._normalize_entity_payload(
+            payload,
+            "funding",
+            "funding_snapshot",
+            "snapshot.funding",
+            "snapshot",
+            "data.funding",
+            "data",
+        )
+
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
         timestamp_ms = self._first_int(
             payload,
             "timestamp_ms",
+            "funding_time_ms",
             "funding_time",
             "time",
             "timestamp",
+            "event_time",
         )
 
-        funding_rate = self._safe_float(payload.get("funding_rate"))
+        funding_rate = self._first_float(payload, "funding_rate", "rate")
 
         if exchange is None or symbol is None or timestamp_ms is None:
             return None
@@ -787,18 +981,30 @@ class ParquetStorage:
         *,
         topic: str,
     ) -> dict[str, Any] | None:
+        payload = self._normalize_entity_payload(
+            payload,
+            "open_interest",
+            "open_interest_snapshot",
+            "snapshot.open_interest",
+            "snapshot",
+            "data.open_interest",
+            "data",
+        )
+
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
         timestamp_ms = self._first_int(
             payload,
             "timestamp_ms",
+            "open_interest_time_ms",
             "open_interest_time",
             "time",
             "timestamp",
+            "event_time",
         )
 
-        open_interest = self._safe_float(payload.get("open_interest"))
+        open_interest = self._first_float(payload, "open_interest", "oi")
 
         if exchange is None or symbol is None or timestamp_ms is None:
             return None
@@ -816,6 +1022,7 @@ class ParquetStorage:
             "open_interest": open_interest,
             "open_interest_value": self._safe_float(payload.get("open_interest_value")),
             "mark_price": self._safe_float(payload.get("mark_price")),
+            "index_price": self._safe_float(payload.get("index_price")),
             "source": payload.get("source"),
             "ingested_at_ms": self._now_ms(),
         }
@@ -826,15 +1033,31 @@ class ParquetStorage:
         *,
         topic: str,
     ) -> dict[str, Any] | None:
+        payload = self._normalize_entity_payload(
+            payload,
+            "liquidation",
+            "liquidation_event",
+            "event.liquidation",
+            "event",
+            "data.liquidation",
+            "data",
+            "snapshot.liquidation",
+        )
+
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
         timestamp_ms = self._event_timestamp(payload)
 
         price = self._safe_float(payload.get("price"))
-        quantity = self._first_float(payload, "quantity", "qty", "size", "amount")
+        quantity = self._first_float(payload, "quantity", "qty", "size", "amount", "base_quantity")
+        notional = self._safe_float(payload.get("notional"))
+        if notional is None and price is not None and quantity is not None:
+            notional = price * quantity
 
         if exchange is None or symbol is None or timestamp_ms is None:
+            return None
+        if price is None and notional is None:
             return None
 
         return {
@@ -848,7 +1071,7 @@ class ParquetStorage:
             "side": self._normalize_side(payload.get("side")),
             "price": price,
             "quantity": quantity,
-            "notional": self._safe_float(payload.get("notional")),
+            "notional": notional,
             "order_id": self._safe_str(payload.get("order_id")),
             "source": payload.get("source"),
             "ingested_at_ms": self._now_ms(),
@@ -998,14 +1221,20 @@ class ParquetStorage:
 
     def _extract_payload(self, event: Event | Mapping[str, Any]) -> Mapping[str, Any]:
         if isinstance(event, Event):
-            payload = event.payload
+            payload = self._plain_value(event.payload)
             return payload if isinstance(payload, Mapping) else {}
 
         if isinstance(event, Mapping):
-            payload = event.get("payload")
+            plain_event = self._plain_value(event)
+            if not isinstance(plain_event, Mapping):
+                return {}
+
+            payload = plain_event.get("payload")
+            payload = self._plain_value(payload)
             if isinstance(payload, Mapping):
                 return payload
-            return event
+
+            return plain_event
 
         return {}
 
@@ -1079,7 +1308,8 @@ class ParquetStorage:
             payload.get("market_type")
             or payload.get("category")
             or payload.get("inst_type")
-            or "perpetual"
+            or payload.get("contract_type")
+            or "usdm_futures"
         )
         return str(value).lower()
 
@@ -1122,6 +1352,32 @@ class ParquetStorage:
     def _safe_int(self, value: Any) -> int | None:
         if value is None:
             return None
+
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+
+            # Numeric strings are common for exchange timestamps.
+            with contextlib.suppress(ValueError, TypeError):
+                return int(float(text))
+
+            # ISO timestamps appear in state-driven DTOs and analytics payloads.
+            normalized = text.replace("Z", "+00:00")
+            with contextlib.suppress(ValueError):
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp() * 1000)
+
+            return None
+
         try:
             return int(float(value))
         except (TypeError, ValueError):
@@ -1278,6 +1534,8 @@ class ParquetStorage:
         }
 
     def _json_safe_value(self, value: Any) -> Any:
+        value = self._plain_value(value)
+
         if value is None:
             return None
 

@@ -12,6 +12,7 @@ from core.config import Config
 from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
+from data.market_ingestion import MarketIngestionService
 
 
 @dataclass(slots=True)
@@ -91,7 +92,8 @@ class BinanceWebSocketClient:
     - connect to Binance public market streams;
     - optionally connect to Binance private user stream;
     - normalize raw Binance messages into internal payloads;
-    - publish events through EventBus;
+    - write high-frequency market data into MarketIngestionService/MarketStateStore;
+    - publish only lifecycle/private exchange events through EventBus;
     - use Scheduler for listenKey keepalive;
     - never call analytics, strategy, risk, or execution directly.
 
@@ -136,6 +138,7 @@ class BinanceWebSocketClient:
         orderbook_batch_max_size: int = 500,
         trade_emit_min_interval_ms: int = 250,
         trade_batch_max_size: int = 1000,
+        market_ingestion: MarketIngestionService | None = None,
     ) -> None:
         resolved_config = ws_config or BinanceWebSocketClientConfig.from_core_config(
             config=config,
@@ -152,6 +155,7 @@ class BinanceWebSocketClient:
 
         self._config = config
         self._event_bus = event_bus
+        self._market_ingestion = market_ingestion
         self._scheduler = scheduler
         self._ws_config = resolved_config
 
@@ -719,7 +723,10 @@ class BinanceWebSocketClient:
         )
 
         if interval_ms <= 0:
-            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_orderbook_delta(payload)
+            else:
+                await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
             return
 
         normalized_key = key or str(payload.get("symbol") or "unknown").upper()
@@ -783,11 +790,16 @@ class BinanceWebSocketClient:
                 "updates": updates,
             }
 
-            await self._emit_event(
-                "market.orderbook.batch",
-                batch_payload,
-                priority=EventPriority.LOW,
-            )
+            if self._market_ingestion is not None:
+                # Preserve delta order while avoiding EventBus raw market-data flood.
+                for update in updates:
+                    await self._market_ingestion.ingest_orderbook_delta(update)
+            else:
+                await self._emit_event(
+                    "market.orderbook.batch",
+                    batch_payload,
+                    priority=EventPriority.LOW,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -829,7 +841,10 @@ class BinanceWebSocketClient:
         )
 
         if interval_ms <= 0:
-            await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_trade(payload)
+            else:
+                await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
             return
 
         normalized_key = key or str(payload.get("symbol") or "unknown").upper()
@@ -893,11 +908,14 @@ class BinanceWebSocketClient:
                 "trades": trades,
             }
 
-            await self._emit_event(
-                "market.trades.batch",
-                batch_payload,
-                priority=EventPriority.LOW,
-            )
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_trades_batch(batch_payload)
+            else:
+                await self._emit_event(
+                    "market.trades.batch",
+                    batch_payload,
+                    priority=EventPriority.LOW,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -941,8 +959,10 @@ class BinanceWebSocketClient:
             "exchange": self.EXCHANGE,
             "market_type": "usdm_futures",
             "symbol": data.get("s"),
+            "type": "delta",
             "first_update_id": data.get("U"),
             "final_update_id": data.get("u"),
+            "previous_final_update_id": data.get("pu"),
             "bids": [
                 [self._safe_float(price), self._safe_float(qty)]
                 for price, qty in data.get("b", [])
@@ -986,11 +1006,14 @@ class BinanceWebSocketClient:
             "event_time": data.get("E"),
         }
 
-        await self._emit_event(
-            "market.candle",
-            payload,
-            priority=EventPriority.HIGH,
-        )
+        if self._market_ingestion is not None:
+            await self._market_ingestion.ingest_candle(payload)
+        else:
+            await self._emit_event(
+                "market.candle",
+                payload,
+                priority=EventPriority.HIGH,
+            )
 
     async def _publish_liquidation_event(self, data: dict[str, Any]) -> None:
         """Publish Binance USD-M forceOrder stream as canonical liquidation input."""
@@ -1032,11 +1055,14 @@ class BinanceWebSocketClient:
             self._logger.debug("Skipping incomplete Binance liquidation payload | payload=%s", payload)
             return
 
-        await self._emit_event(
-            "market.liquidation",
-            payload,
-            priority=EventPriority.HIGH,
-        )
+        if self._market_ingestion is not None:
+            await self._market_ingestion.ingest_liquidation(payload)
+        else:
+            await self._emit_event(
+                "market.liquidation",
+                payload,
+                priority=EventPriority.HIGH,
+            )
 
     # ------------------------------------------------------------------
     # Event publishers: private exchange updates

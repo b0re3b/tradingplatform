@@ -4,17 +4,17 @@ from __future__ import annotations
 # Facade / runtime analyzers
 # ============================================================
 
-from .spread_analyzer import SpreadAnalyzer
-from .base import BaseSpreadAnalyzer
-from .spot_futures_analyzer import SpotFuturesSpreadAnalyzer
-from .cross_exchange_analyzer import CrossExchangeSpreadAnalyzer
+from analytics.spreads.spread_analyzer import SpreadAnalyzer
+from analytics.spreads.base import BaseSpreadAnalyzer
+from analytics.spreads.spot_futures_analyzer import SpotFuturesSpreadAnalyzer
+from analytics.spreads.cross_exchange_analyzer import CrossExchangeSpreadAnalyzer
 
 
 # ============================================================
 # Config
 # ============================================================
 
-from .config import (
+from analytics.spreads.config import (
     BaseSpreadConfig,
     SpotFuturesSpreadConfig,
     CrossExchangeSpreadConfig,
@@ -25,7 +25,7 @@ from .config import (
 # Enums
 # ============================================================
 
-from .enums import (
+from analytics.spreads.enums import (
     StrEnumMixin,
     SpreadType,
     InstrumentType,
@@ -45,7 +45,7 @@ from .enums import (
 # Models
 # ============================================================
 
-from .models import (
+from analytics.spreads.models import (
     QuoteSnapshot,
     FundingSnapshot,
     RollingStats,
@@ -60,7 +60,7 @@ from .models import (
 # Regime detector
 # ============================================================
 
-from .spread_regime_detector import (
+from analytics.spreads.spread_regime_detector import (
     RegimeDetectionResult,
     RegimeShiftResult,
     SpreadRegimeDetector,
@@ -71,7 +71,7 @@ from .spread_regime_detector import (
 # Signal engine
 # ============================================================
 
-from .spread_signal_engine import (
+from analytics.spreads.spread_signal_engine import (
     SignalBuildReason,
     SignalBuildResult,
     SignalEngineResult,
@@ -83,7 +83,7 @@ from .spread_signal_engine import (
 # Opportunity detector
 # ============================================================
 
-from .spread_opportunity_detector import (
+from analytics.spreads.spread_opportunity_detector import (
     OpportunityDetectionReason,
     OpportunityDetectionResult,
     SpreadOpportunityDetector,
@@ -94,7 +94,7 @@ from .spread_opportunity_detector import (
 # Costs
 # ============================================================
 
-from .spread_costs import (
+from analytics.spreads.spread_costs import (
     CostSide,
     LiquiditySide,
     SpreadCostBreakdown,
@@ -120,7 +120,7 @@ from .spread_costs import (
 # Utils
 # ============================================================
 
-from .spread_utils import (
+from analytics.spreads.spread_utils import (
     DECIMAL_ZERO,
     DECIMAL_ONE,
     DECIMAL_TWO,

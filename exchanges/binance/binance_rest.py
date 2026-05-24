@@ -13,6 +13,22 @@ import aiohttp
 from core.config import Config
 from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
+from data.market_ingestion import MarketIngestionService
+
+
+class BinanceSymbolUnavailableError(Exception):
+    """
+    Raised when Binance returns a non-retryable symbol-level error code such as
+    -4108 (symbol on delivering/settling/closed/pre-trading) or -1121 (invalid
+    symbol).  Callers that poll derivative data should catch this and disable
+    the symbol without retrying.
+    """
+
+    def __init__(self, code: int, message: str, symbol: str | None = None) -> None:
+        self.code = code
+        self.message = message
+        self.symbol = symbol
+        super().__init__(f"Binance symbol unavailable | code={code} symbol={symbol} message={message}")
 
 
 @dataclass(slots=True)
@@ -42,6 +58,31 @@ class BinanceFuturesRestClientConfig:
     # cannot serve those endpoints. Returning an empty snapshot prevents noisy
     # sync failures while keeping all trading/write endpoints strictly protected.
     allow_private_read_without_credentials: bool = True
+
+    # ---------------------------------------------------------------------------
+    # Derivative snapshot polling throttle
+    # ---------------------------------------------------------------------------
+    # How many symbols to poll concurrently for open-interest / derivative data.
+    # Binance rate-limits /fapi/v1/openInterest aggressively; keep this at 1-2.
+    derivative_snapshot_poll_concurrency: int = 1
+    # How many symbols per batch tick.
+    derivative_snapshot_poll_batch_size: int = 2
+    # Minimum seconds between derivative snapshot poll ticks.
+    derivative_snapshot_poll_interval_seconds: float = 180.0
+
+    # ---------------------------------------------------------------------------
+    # Symbol availability management
+    # ---------------------------------------------------------------------------
+    # Binance error codes that mean the symbol is permanently unavailable for
+    # the current operation (delivering, settling, pre-trading, invalid).
+    # These are NOT retried — the symbol is disabled immediately.
+    # -4108: symbol on delivering/delivered/settling/closed/pre-trading
+    # -1121: invalid symbol
+    symbol_unavailable_error_codes: tuple[int, ...] = (-4108, -1121)
+
+    # Pre-configured symbol blocklist.  Any symbol in this set is silently
+    # skipped for derivative polling without attempting a request.
+    derivative_symbol_blocklist: tuple[str, ...] = ()
 
     @classmethod
     def from_core_config(cls, config: Config) -> "BinanceFuturesRestClientConfig":
@@ -88,9 +129,11 @@ class BinanceRestClient:
         config: Config,
         event_bus: EventBus,
         rest_config: BinanceFuturesRestClientConfig | None = None,
+        market_ingestion: MarketIngestionService | None = None,
     ) -> None:
         self._config = config
         self._event_bus = event_bus
+        self._market_ingestion = market_ingestion
         self._rest_config = rest_config or BinanceFuturesRestClientConfig.from_core_config(config)
 
         self._logger = get_logger(
@@ -105,6 +148,18 @@ class BinanceRestClient:
         self._session: aiohttp.ClientSession | None = None
         self._time_offset_ms: int = 0
         self._started = False
+
+        # Runtime symbol blocklist — populated dynamically when Binance returns
+        # a symbol-unavailable error code (-4108 / -1121).  Pre-seeded from
+        # the static config blocklist so callers can also set it via env/config.
+        self._derivative_symbol_blocklist: set[str] = {
+            s.upper() for s in self._rest_config.derivative_symbol_blocklist
+        }
+
+        # Semaphore that limits concurrent derivative snapshot REST requests.
+        self._derivative_poll_semaphore = asyncio.Semaphore(
+            max(1, self._rest_config.derivative_snapshot_poll_concurrency)
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -277,11 +332,14 @@ class BinanceRestClient:
             "snapshot_time": self._current_timestamp_ms(),
         }
 
-        await self._emit_event(
-            "market.orderbook.snapshot",
-            normalized,
-            priority=EventPriority.NORMAL,
-        )
+        if self._market_ingestion is not None:
+            await self._market_ingestion.ingest_orderbook_snapshot(normalized)
+        else:
+            await self._emit_event(
+                "market.orderbook.snapshot",
+                normalized,
+                priority=EventPriority.NORMAL,
+            )
 
         return normalized
 
@@ -322,18 +380,22 @@ class BinanceRestClient:
             if isinstance(trade, dict)
         ]
 
-        await self._emit_event(
-            "market.trades.snapshot",
-            {
+        trades_snapshot_payload = {
                 "exchange": self.EXCHANGE,
                 "market_type": "usdm_futures",
                 "symbol": symbol,
                 "count": len(normalized),
                 "trades": normalized,
                 "snapshot_time": self._current_timestamp_ms(),
-            },
-            priority=EventPriority.LOW,
-        )
+            }
+        if self._market_ingestion is not None:
+            await self._market_ingestion.ingest_trades_batch(trades_snapshot_payload)
+        else:
+            await self._emit_event(
+                "market.trades.snapshot",
+                trades_snapshot_payload,
+                priority=EventPriority.LOW,
+            )
 
         return normalized
 
@@ -376,9 +438,7 @@ class BinanceRestClient:
             if isinstance(item, list) and len(item) >= 11
         ]
 
-        await self._emit_event(
-            "market.candles.snapshot",
-            {
+        candles_snapshot_payload = {
                 "exchange": self.EXCHANGE,
                 "market_type": "usdm_futures",
                 "symbol": symbol,
@@ -386,9 +446,15 @@ class BinanceRestClient:
                 "count": len(normalized),
                 "candles": normalized,
                 "snapshot_time": self._current_timestamp_ms(),
-            },
-            priority=EventPriority.LOW,
-        )
+            }
+        if self._market_ingestion is not None:
+            await self._market_ingestion.ingest_candles_batch(candles_snapshot_payload)
+        else:
+            await self._emit_event(
+                "market.candles.snapshot",
+                candles_snapshot_payload,
+                priority=EventPriority.LOW,
+            )
 
         return normalized
 
@@ -448,18 +514,23 @@ class BinanceRestClient:
             if isinstance(item, dict)
         ]
 
-        await self._emit_event(
-            "market.funding.snapshot",
-            {
+        funding_snapshot_payload = {
                 "exchange": self.EXCHANGE,
                 "market_type": "usdm_futures",
                 "symbol": symbol,
                 "count": len(normalized),
                 "items": normalized,
                 "snapshot_time": self._current_timestamp_ms(),
-            },
-            priority=EventPriority.NORMAL,
-        )
+            }
+        if self._market_ingestion is not None:
+            for item in normalized:
+                await self._market_ingestion.ingest_funding(item)
+        else:
+            await self._emit_event(
+                "market.funding.snapshot",
+                funding_snapshot_payload,
+                priority=EventPriority.NORMAL,
+            )
 
         return normalized
 
@@ -470,11 +541,35 @@ class BinanceRestClient:
     ) -> dict[str, Any]:
         symbol = symbol.upper()
 
-        payload = await self._request(
-            method="GET",
-            path="/fapi/v1/openInterest",
-            params={"symbol": symbol},
-        )
+        if symbol in self._derivative_symbol_blocklist:
+            self._logger.debug(
+                "Skipping open interest poll — symbol in blocklist | symbol=%s",
+                symbol,
+            )
+            return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "blocklisted"}
+
+        async with self._derivative_poll_semaphore:
+            try:
+                payload = await self._request(
+                    method="GET",
+                    path="/fapi/v1/openInterest",
+                    params={"symbol": symbol},
+                )
+            except asyncio.TimeoutError as exc:
+                self._logger.warning(
+                    "Open interest poll timed out — will retry next tick | symbol=%s timeout_seconds=%s",
+                    symbol,
+                    self._rest_config.timeout_seconds,
+                )
+                return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "timeout"}
+            except BinanceSymbolUnavailableError as exc:
+                self._derivative_symbol_blocklist.add(symbol)
+                self._logger.warning(
+                    "Symbol disabled for derivative polling — permanently unavailable | symbol=%s code=%s",
+                    symbol,
+                    exc.code,
+                )
+                return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "symbol_unavailable", "code": exc.code}
 
         normalized = {
             "exchange": self.EXCHANGE,
@@ -485,11 +580,14 @@ class BinanceRestClient:
             "snapshot_time": self._current_timestamp_ms(),
         }
 
-        await self._emit_event(
-            "market.open_interest.snapshot",
-            normalized,
-            priority=EventPriority.NORMAL,
-        )
+        if self._market_ingestion is not None:
+            await self._market_ingestion.ingest_open_interest(normalized)
+        else:
+            await self._emit_event(
+                "market.open_interest.snapshot",
+                normalized,
+                priority=EventPriority.NORMAL,
+            )
 
         return normalized
 
@@ -818,13 +916,21 @@ class BinanceRestClient:
         if symbol is not None:
             params["symbol"] = symbol.upper()
 
-        payload = await self._request(
-            method="GET",
-            path="/fapi/v1/openOrders",
-            params=params,
-            signed=True,
-            auth_required=True,
-        )
+        try:
+            payload = await self._request(
+                method="GET",
+                path="/fapi/v1/openOrders",
+                params=params,
+                signed=True,
+                auth_required=True,
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "get_open_orders timed out — returning empty snapshot | symbol=%s timeout_seconds=%s",
+                symbol,
+                self._rest_config.timeout_seconds,
+            )
+            return []
 
         normalized = [
             self._normalize_order(order)
@@ -1339,6 +1445,27 @@ class BinanceRestClient:
                         error_payload = self._parse_error_payload(response_text)
                         error_code = self._safe_int(error_payload.get("code"))
 
+                        # Symbol-unavailable errors are non-retryable. Raise
+                        # immediately so the caller can disable the symbol.
+                        if (
+                            isinstance(error_code, int)
+                            and error_code in self._rest_config.symbol_unavailable_error_codes
+                        ):
+                            symbol_hint = self._safe_symbol_from_params(base_params)
+                            self._logger.warning(
+                                "Binance symbol unavailable (non-retryable) | method=%s path=%s code=%s symbol=%s message=%s",
+                                method,
+                                path,
+                                error_code,
+                                symbol_hint,
+                                error_payload.get("message"),
+                            )
+                            raise BinanceSymbolUnavailableError(
+                                code=error_code,
+                                message=str(error_payload.get("message") or ""),
+                                symbol=symbol_hint,
+                            )
+
                         await self._handle_http_error(
                             method=method,
                             path=path,
@@ -1374,6 +1501,23 @@ class BinanceRestClient:
                     code = payload.get("code") if isinstance(payload, dict) else None
                     code_i = self._safe_int(code)
                     if isinstance(code_i, int) and code_i < 0:
+                        # Symbol-unavailable business errors — no retry.
+                        if code_i in self._rest_config.symbol_unavailable_error_codes:
+                            symbol_hint = self._safe_symbol_from_params(base_params)
+                            self._logger.warning(
+                                "Binance symbol unavailable (business error, non-retryable) | method=%s path=%s code=%s symbol=%s msg=%s",
+                                method,
+                                path,
+                                code_i,
+                                symbol_hint,
+                                payload.get("msg"),
+                            )
+                            raise BinanceSymbolUnavailableError(
+                                code=code_i,
+                                message=str(payload.get("msg") or ""),
+                                symbol=symbol_hint,
+                            )
+
                         await self._handle_business_error(
                             method=method,
                             path=path,
@@ -1417,6 +1561,22 @@ class BinanceRestClient:
 
             except asyncio.CancelledError:
                 raise
+            except BinanceSymbolUnavailableError:
+                # Never retry — propagate immediately so callers can disable the symbol.
+                raise
+            except asyncio.TimeoutError as exc:
+                last_error = exc
+                self._logger.warning(
+                    "Binance Futures REST timeout | method=%s path=%s attempt=%s/%s timeout_seconds=%s",
+                    method,
+                    path,
+                    attempt + 1,
+                    self._rest_config.request_retries + 1,
+                    self._rest_config.timeout_seconds,
+                )
+                if attempt >= self._rest_config.request_retries:
+                    raise
+                await asyncio.sleep(self._rest_config.retry_delay_seconds)
             except Exception as exc:
                 last_error = exc
 
@@ -1446,6 +1606,44 @@ class BinanceRestClient:
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
             await self.start()
+
+    # ------------------------------------------------------------------
+    # Derivative symbol blocklist management
+    # ------------------------------------------------------------------
+
+    def block_derivative_symbol(self, symbol: str) -> None:
+        """
+        Add a symbol to the runtime derivative polling blocklist.
+
+        The symbol will be skipped on all future ``get_open_interest()`` calls
+        without any REST request being made.  This is called automatically when
+        Binance returns a symbol-unavailable error (-4108 / -1121), but callers
+        can also pre-populate the blocklist via config or by calling this method
+        directly.
+        """
+        self._derivative_symbol_blocklist.add(symbol.upper())
+        self._logger.info(
+            "Symbol added to derivative polling blocklist | symbol=%s total_blocked=%s",
+            symbol.upper(),
+            len(self._derivative_symbol_blocklist),
+        )
+
+    def unblock_derivative_symbol(self, symbol: str) -> None:
+        """Remove a symbol from the runtime derivative polling blocklist."""
+        self._derivative_symbol_blocklist.discard(symbol.upper())
+
+    def derivative_symbol_blocklist(self) -> frozenset[str]:
+        """Return a snapshot of the current derivative polling blocklist."""
+        return frozenset(self._derivative_symbol_blocklist)
+
+    @staticmethod
+    def _safe_symbol_from_params(params: dict[str, Any]) -> str | None:
+        """Best-effort extraction of the symbol from request params for error logging."""
+        for key in ("symbol", "Symbol", "SYMBOL"):
+            val = params.get(key)
+            if val:
+                return str(val)
+        return None
 
     async def _handle_http_error(
         self,

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import math
 
 import asyncio
@@ -2002,9 +2003,15 @@ class BaseOrderFlowAnalyzer(ABC):
         headers.setdefault("source_type", self._source_type.value)
 
         try:
+            strategy_payload = ensure_strategy_payload_contract(
+                payload,
+                topic=topic,
+                source=source,
+                domain="orderflow",
+            )
             return await self._event_bus.emit(
                 topic,
-                payload,
+                strategy_payload,
                 priority=self._config.publish_priority,
                 source=source,
                 headers=headers,

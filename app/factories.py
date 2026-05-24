@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable
 
 from core.config import Config
@@ -9,6 +10,9 @@ from core.scheduler import Scheduler
 from data.candles_cache import CandlesCache
 from data.funding_cache import FundingCache
 from data.market_stream import MarketStream
+from data.market_state import MarketStateStore
+from data.market_ingestion import MarketIngestionConfig, MarketIngestionService
+from data.market_scheduler import MarketScheduler, MarketSchedulerConfig
 from data.open_interest_cache import OpenInterestCache
 from data.orderbook_cache import OrderBookCache
 from data.trades_cache import TradesCache
@@ -68,9 +72,98 @@ from .runtime import RuntimeSettings, chunked
 from .universe import ExchangeUniverse
 
 
+
+
+# -----------------------------------------------------------------------------
+# Compatibility helpers
+# -----------------------------------------------------------------------------
+
+
+def _supports_kw(callable_obj: Any, key: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return key in signature.parameters
+
+
+def _filter_supported_kwargs(callable_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in kwargs.items() if _supports_kw(callable_obj, key)}
+
+
+def _construct(cls: type[Any], *args: Any, **kwargs: Any) -> Any:
+    return cls(*args, **_filter_supported_kwargs(cls, kwargs))
+
+
+def _call_with_supported_kwargs(func: Callable[..., Any], **kwargs: Any) -> Any:
+    return func(**_filter_supported_kwargs(func, kwargs))
+
+
 # -----------------------------------------------------------------------------
 # Exchanges / data
 # -----------------------------------------------------------------------------
+
+
+def build_market_state_store(
+    config: Config,
+    event_bus: EventBus | None = None,
+    scheduler: Scheduler | None = None,
+    settings: RuntimeSettings | None = None,
+) -> MarketStateStore:
+    """Build the central state-driven market data store."""
+    return MarketStateStore()
+
+
+def build_market_ingestion_service(
+    *,
+    config: Config,
+    event_bus: EventBus,
+    scheduler: Scheduler | None = None,
+    market_state_store: MarketStateStore,
+    settings: RuntimeSettings | None = None,
+) -> MarketIngestionService:
+    """Build the single write boundary for WS/REST/warmup market data."""
+    ingestion_config = MarketIngestionConfig(
+        default_exchange=getattr(settings, "default_exchange", "binance") if settings is not None else "binance",
+        default_market_type=getattr(settings, "default_market_type", "usdm_futures") if settings is not None else "usdm_futures",
+        default_timeframe=(
+            str(getattr(settings, "timeframes", ["1m"])[0])
+            if settings is not None and getattr(settings, "timeframes", None)
+            else "1m"
+        ),
+    )
+    return MarketIngestionService(
+        state_store=market_state_store,
+        event_bus=event_bus,
+        config=ingestion_config,
+    )
+
+
+def build_market_scheduler(
+    *,
+    config: Config,
+    event_bus: EventBus,
+    scheduler: Scheduler,
+    market_state_store: MarketStateStore,
+    settings: RuntimeSettings | None = None,
+) -> MarketScheduler:
+    """Build controlled dirty-snapshot evaluator for state-driven analytics."""
+    market_scheduler_config = MarketSchedulerConfig(
+        enabled=True,
+        interval_seconds=float(getattr(settings, "market_scheduler_interval_seconds", 1.0)) if settings is not None else 1.0,
+        batch_size=int(getattr(settings, "market_scheduler_batch_size", 100)) if settings is not None else 100,
+        run_immediately=False,
+        emit_snapshot_ready_events=False,
+    )
+    return MarketScheduler(
+        state_store=market_state_store,
+        scheduler=scheduler,
+        event_bus=event_bus,
+        config=market_scheduler_config,
+    )
 
 
 def build_rest_clients(
@@ -78,6 +171,7 @@ def build_rest_clients(
     event_bus: EventBus,
     scheduler: Scheduler | None = None,
     settings: RuntimeSettings | None = None,
+    market_ingestion: MarketIngestionService | None = None,
 ) -> dict[str, Any]:
     """
     Build only REST clients that are enabled through RuntimeSettings/.env.
@@ -92,13 +186,13 @@ def build_rest_clients(
 
     clients: dict[str, Any] = {}
     if "binance" in enabled:
-        clients["binance"] = BinanceRestClient(config=config, event_bus=event_bus)
+        clients["binance"] = _construct(BinanceRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
     if "bybit" in enabled:
-        clients["bybit"] = BybitRestClient(config=config, event_bus=event_bus)
+        clients["bybit"] = _construct(BybitRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
     if "okx" in enabled:
-        clients["okx"] = OkxRestClient(config=config, event_bus=event_bus)
+        clients["okx"] = _construct(OkxRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
     if "mexc" in enabled:
-        clients["mexc"] = MexcRestClient(config=config, event_bus=event_bus)
+        clients["mexc"] = _construct(MexcRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
     return clients
 
 
@@ -109,6 +203,7 @@ def build_exchange_ws_clients(
     scheduler: Scheduler,
     universe: ExchangeUniverse,
     settings: RuntimeSettings,
+    market_ingestion: MarketIngestionService | None = None,
 ) -> dict[str, Any]:
     """
     Build WS clients from .env-driven RuntimeSettings.
@@ -158,6 +253,7 @@ def build_exchange_ws_clients(
                 event_bus=event_bus,
                 scheduler=scheduler,
                 ws_config=shard_config,
+                market_ingestion=market_ingestion,
             )
 
     if "bybit" in settings.market_data_exchanges:
@@ -175,6 +271,7 @@ def build_exchange_ws_clients(
                 trade_emit_min_interval_ms=settings.bybit_trade_emit_min_interval_ms,
                 trade_batch_max_size=settings.bybit_trade_batch_max_size,
                 enable_private_stream=settings.bybit_enable_private_stream,
+                market_ingestion=market_ingestion,
             )
 
     if "okx" in settings.market_data_exchanges:
@@ -191,6 +288,7 @@ def build_exchange_ws_clients(
                 trade_emit_min_interval_ms=settings.okx_trade_emit_min_interval_ms,
                 trade_batch_max_size=settings.okx_trade_batch_max_size,
                 enable_private_stream=settings.okx_enable_private_stream,
+                market_ingestion=market_ingestion,
             )
 
     if "mexc" in settings.market_data_exchanges:
@@ -206,18 +304,42 @@ def build_exchange_ws_clients(
                 trade_emit_min_interval_ms=settings.mexc_trade_emit_min_interval_ms,
                 trade_batch_max_size=settings.mexc_trade_batch_max_size,
                 enable_private_stream=settings.mexc_enable_private_stream,
+                market_ingestion=market_ingestion,
             )
 
     return clients
 
 
-def build_data_caches(config: Config, event_bus: EventBus, scheduler: Scheduler) -> dict[str, Any]:
+def build_data_caches(
+    config: Config,
+    event_bus: EventBus,
+    scheduler: Scheduler,
+    *,
+    market_state_store: MarketStateStore | None = None,
+    market_ingestion: MarketIngestionService | None = None,
+) -> dict[str, Any]:
+    """Build state-driven cache facades.
+
+    These objects no longer subscribe to high-frequency raw market.* topics when
+    used with the new state layer; they expose the familiar read/apply API for
+    analytics and compatibility.
+    """
+    common = {
+        "config": config,
+        "event_bus": event_bus,
+        "scheduler": scheduler,
+        "state_store": market_state_store,
+        "market_state": market_state_store,
+        "market_state_store": market_state_store,
+        "ingestion": market_ingestion,
+        "market_ingestion": market_ingestion,
+    }
     return {
-        "orderbook": OrderBookCache(config=config, event_bus=event_bus, scheduler=scheduler),
-        "trades": TradesCache(config=config, event_bus=event_bus, scheduler=scheduler),
-        "candles": CandlesCache(config=config, event_bus=event_bus, scheduler=scheduler),
-        "funding": FundingCache(config=config, event_bus=event_bus, scheduler=scheduler),
-        "open_interest": OpenInterestCache(config=config, event_bus=event_bus, scheduler=scheduler),
+        "orderbook": _construct(OrderBookCache, **common),
+        "trades": _construct(TradesCache, **common),
+        "candles": _construct(CandlesCache, **common),
+        "funding": _construct(FundingCache, **common),
+        "open_interest": _construct(OpenInterestCache, **common),
     }
 
 
@@ -244,13 +366,21 @@ def build_market_stream(
     scheduler: Scheduler,
     exchange_clients: dict[str, Any],
     caches: dict[str, Any],
+    market_state_store: MarketStateStore | None = None,
+    market_ingestion: MarketIngestionService | None = None,
+    market_scheduler: MarketScheduler | None = None,
 ) -> MarketStream:
-    return MarketStream(
+    return _construct(
+        MarketStream,
         config=config,
         event_bus=event_bus,
         scheduler=scheduler,
         exchange_clients=exchange_clients,
         caches=list(caches.values()),
+        market_state=market_state_store,
+        state_store=market_state_store,
+        ingestion=market_ingestion,
+        market_scheduler=market_scheduler,
     )
 
 
@@ -267,6 +397,8 @@ def build_analytics_components(
     caches: dict[str, Any],
     universe: ExchangeUniverse,
     settings: RuntimeSettings,
+    market_state_store: MarketStateStore | None = None,
+    market_scheduler: MarketScheduler | None = None,
 ) -> list[Any]:
     """
     Build analytics from .env-driven RuntimeSettings.
@@ -302,50 +434,92 @@ def build_analytics_components(
     )
     liquidity_map = LiquidityMap(config=liquidity_config)
 
-    components: list[Any] = [
-        OrderFlowAnalyzer(
+    components: list[Any] = []
+
+    def add_component(component: Any, *, evaluator_name: str | None = None) -> Any:
+        components.append(component)
+        if market_scheduler is not None:
+            callback = getattr(component, "process_market_snapshot", None)
+            if callable(callback):
+                name = evaluator_name or f"{component.__class__.__name__}:{len(components)}"
+                market_scheduler.register_evaluator(name=name, callback=callback)
+        return component
+
+    add_component(
+        _construct(
+            OrderFlowAnalyzer,
             event_bus=event_bus,
             scheduler=scheduler,
-            trades_cache=caches["trades"],
-            orderbook_cache=caches["orderbook"],
+            trades_cache=caches.get("trades"),
+            orderbook_cache=caches.get("orderbook"),
+            market_state_store=market_state_store,
             default_exchange=settings.orderflow_default_exchange,
             default_market_type=settings.orderflow_default_market_type,
             default_timeframe=settings.orderflow_default_timeframe,
         ),
-        OIAnalyzer(event_bus=event_bus, scheduler=scheduler),
-        FundingAnalyzer(event_bus=event_bus, scheduler=scheduler),
-        LiquidationStream(
+        evaluator_name="analytics.orderflow",
+    )
+
+    add_component(
+        _construct(OIAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
+        evaluator_name="analytics.open_interest",
+    )
+    add_component(
+        _construct(FundingAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
+        evaluator_name="analytics.funding",
+    )
+    add_component(
+        _construct(
+            LiquidationStream,
             event_bus=event_bus,
             scheduler=scheduler,
             config=LiquidationStreamConfig(),
+            market_state_store=market_state_store,
         ),
-        LiquidityService(
+        evaluator_name="analytics.liquidations.stream",
+    )
+    add_component(
+        _construct(
+            LiquidityService,
             event_bus=event_bus,
             scheduler=scheduler,
             config=liquidity_config,
             liquidity_map=liquidity_map,
+            market_state_store=market_state_store,
         ),
-        *[
-            PriceActionAnalyzer(
-                symbol,
-                timeframe=timeframe,
-                event_bus=event_bus,
-                exchange=settings.price_action_exchange,
-                market_type=settings.price_action_market_type,
-                scheduler=scheduler,
+        evaluator_name="analytics.liquidity",
+    )
+
+    for symbol in price_action_symbols:
+        for timeframe in price_action_timeframes:
+            add_component(
+                _construct(
+                    PriceActionAnalyzer,
+                    symbol,
+                    timeframe=timeframe,
+                    event_bus=event_bus,
+                    exchange=settings.price_action_exchange,
+                    market_type=settings.price_action_market_type,
+                    scheduler=scheduler,
+                    market_state_store=market_state_store,
+                ),
+                evaluator_name=f"analytics.price_action:{symbol}:{timeframe}",
             )
-            for symbol in price_action_symbols
-            for timeframe in price_action_timeframes
-        ],
-        SpoofingAnalyzer(
+
+    add_component(
+        _construct(
+            SpoofingAnalyzer,
             event_bus=event_bus,
             scheduler=scheduler,
             config=SpoofingConfig(),
-            orderbook_cache=caches["orderbook"],
+            orderbook_cache=caches.get("orderbook"),
+            market_state_store=market_state_store,
         ),
-        SpreadAnalyzer(event_bus=event_bus, scheduler=scheduler),
-        WhaleAnalyzer(config=WhalesConfig(), event_bus=event_bus, scheduler=scheduler),
-    ]
+        evaluator_name="analytics.spoofing",
+    )
+    add_component(_construct(SpreadAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store), evaluator_name="analytics.spreads")
+    add_component(_construct(WhaleAnalyzer, config=WhalesConfig(), event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store), evaluator_name="analytics.whales")
+
     return components
 
 

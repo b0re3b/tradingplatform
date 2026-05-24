@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import abc
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, is_dataclass
@@ -1507,9 +1508,15 @@ class BasePriceActionModule(Generic[StateT], abc.ABC):
             safe_payload = {"value": safe_payload, **self.scope_payload}
 
         try:
+            strategy_payload = ensure_strategy_payload_contract(
+                dict(safe_payload),
+                topic=normalized_event_name,
+                source=source or self.module_name,
+                domain="price_action",
+            )
             return await self.event_bus.emit(
                 normalized_event_name,
-                dict(safe_payload),
+                strategy_payload,
                 priority=priority if priority is not None else self.config.event_priority,
                 source=source or self.module_name,
                 correlation_id=correlation_id,

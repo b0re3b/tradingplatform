@@ -28,9 +28,9 @@ DEFAULT_RAW_LIQUIDATION_TOPIC = "market.liquidation"
 
 # Data/cache layer outputs.
 DEFAULT_LIQUIDATION_RAW_TOPIC = "market.liquidation.raw"
-DEFAULT_LIQUIDATION_NORMALIZED_TOPIC = "market.liquidation.normalized"
-DEFAULT_LIQUIDATION_LARGE_TOPIC = "market.liquidation.large"
-DEFAULT_LIQUIDATIONS_UPDATED_TOPIC = "market.liquidations.updated"
+DEFAULT_LIQUIDATION_NORMALIZED_TOPIC = "analytics.liquidations.normalized"
+DEFAULT_LIQUIDATION_LARGE_TOPIC = "analytics.liquidations.large"
+DEFAULT_LIQUIDATIONS_UPDATED_TOPIC = "analytics.liquidations.updated"
 
 # Stream diagnostics.
 DEFAULT_STREAM_HEALTH_TOPIC = "system.analytics.liquidations.stream.health"

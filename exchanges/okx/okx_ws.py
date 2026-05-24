@@ -91,7 +91,8 @@ class OkxWebSocketClient:
     - connect to OKX public WebSocket channels;
     - optionally connect to OKX private WebSocket channels;
     - normalize raw OKX payloads into internal market/exchange events;
-    - publish events through EventBus;
+    - write high-frequency market data into MarketIngestionService/MarketStateStore;
+    - publish only lifecycle/private exchange events through EventBus;
     - never call analytics, strategy, risk, or execution directly;
     - never contain trading decision logic.
 
@@ -138,6 +139,7 @@ class OkxWebSocketClient:
         orderbook_batch_max_size: int = 500,
         trade_emit_min_interval_ms: int = 250,
         trade_batch_max_size: int = 1000,
+        market_ingestion: MarketIngestionService | None = None,
     ) -> None:
         resolved_config = ws_config or OkxWebSocketClientConfig.from_core_config(
             config=config,
@@ -833,7 +835,10 @@ class OkxWebSocketClient:
         )
 
         if interval_ms <= 0:
-            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_orderbook_delta(payload)
+            else:
+                await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
             return
 
         normalized_key = key or str(payload.get("symbol") or "unknown").upper()
@@ -897,11 +902,16 @@ class OkxWebSocketClient:
                 "updates": updates,
             }
 
-            await self._emit_event(
-                "market.orderbook.batch",
-                batch_payload,
-                priority=EventPriority.LOW,
-            )
+            if self._market_ingestion is not None:
+                # Preserve delta order while avoiding EventBus raw market-data flood.
+                for update in updates:
+                    await self._market_ingestion.ingest_orderbook_delta(update)
+            else:
+                await self._emit_event(
+                    "market.orderbook.batch",
+                    batch_payload,
+                    priority=EventPriority.LOW,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -943,7 +953,10 @@ class OkxWebSocketClient:
         )
 
         if interval_ms <= 0:
-            await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_trade(payload)
+            else:
+                await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
             return
 
         normalized_key = key or str(payload.get("symbol") or "unknown").upper()
@@ -1007,11 +1020,14 @@ class OkxWebSocketClient:
                 "trades": trades,
             }
 
-            await self._emit_event(
-                "market.trades.batch",
-                batch_payload,
-                priority=EventPriority.LOW,
-            )
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_trades_batch(batch_payload)
+            else:
+                await self._emit_event(
+                    "market.trades.batch",
+                    batch_payload,
+                    priority=EventPriority.LOW,
+                )
 
         except asyncio.CancelledError:
             raise

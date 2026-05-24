@@ -103,27 +103,43 @@ class EventBus:
     # High-volume market-data topics are intentionally lossy. They may be
     # dropped under backpressure before they are allowed to evict critical
     # trading/system events from the shared queue.
+    #
+    # signal.rejected is a *diagnostic* event — a high rejection rate should
+    # never deadlock the bus.  analytics.* and storage.* output events are also
+    # lossy: they must not block evaluators when the bus is saturated.
     LOSSY_TOPIC_PREFIXES: tuple[str, ...] = (
         "market.trade",
         "market.trades.",
         "market.orderbook",
         "market.orderbook.",
+        "signal.rejected",
+        "analytics.liquidity.",
+        "analytics.liquidations.",
+        "analytics.spoofing.",
+        "analytics.whales.",
+        "analytics.spreads.",
+        "storage.",
+        "market.candle.closed",
+        "market.candles.",
+        "market.state.",
     )
 
     # Protected topics must not be evicted by market-data pressure. If the
     # queue is full and no lossy queued event can be removed, async publishers
     # will backpressure until capacity is available.
+    #
+    # Only true trading-critical topics are protected. Diagnostic and analytics
+    # output topics are intentionally excluded (see LOSSY_TOPIC_PREFIXES).
     PROTECTED_TOPIC_PREFIXES: tuple[str, ...] = (
-        "market.candle",
-        "market.candles.",
-        "analytics.",
-        "strategy.",
-        "signal.",
+        "signal.generated",
+        "signal.confirmed",
         "risk.",
         "execution.",
         "position.",
         "account.",
-        "system.",
+        "system.critical",
+        "system.shutdown",
+        "system.startup",
     )
 
     def __init__(
@@ -800,11 +816,14 @@ class EventBus:
             )
 
     def stats(self) -> dict[str, Any]:
+        queue_size = self._queue.qsize()
+        utilization = queue_size / self._max_queue_size if self._max_queue_size > 0 else 0.0
         return {
             "running": self._running,
             "stopping": self._stopping,
-            "queue_size": self._queue.qsize(),
+            "queue_size": queue_size,
             "max_queue_size": self._max_queue_size,
+            "queue_utilization": round(utilization, 4),
             "worker_count": self._worker_count,
             "subscriptions": len(self._subscriptions),
             "published": self._metrics["published"],

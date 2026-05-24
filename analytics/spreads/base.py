@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -1404,9 +1405,15 @@ class BaseSpreadAnalyzer(ABC):
         except Exception:
             pass
         try:
+            strategy_payload = ensure_strategy_payload_contract(
+                self._payload_for_eventbus(payload),
+                topic=topic,
+                source=self._service_name,
+                domain="spreads",
+            )
             accepted = await self._event_bus.emit(
                 topic,
-                self._payload_for_eventbus(payload),
+                strategy_payload,
                 priority=priority,
                 source=self._service_name,
                 correlation_id=correlation_id,

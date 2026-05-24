@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import inspect
 import math
 import time
@@ -11,6 +12,7 @@ from typing import Any
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
+from analytics.market_state_contract import MarketStateSnapshotSource, _plain
 
 from .config import OIAnalyzerConfig
 from .enums import OIAnomalyType, OIRegime
@@ -377,6 +379,7 @@ class OIAnalyzer:
         regime_detector: OIRegimeDetector | None = None,
         divergence_detector: OIDivergenceDetector | None = None,
         anomaly_detector: OIAnomalyDetector | None = None,
+        market_state_store: Any | None = None,
     ) -> None:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -404,6 +407,10 @@ class OIAnalyzer:
         self.config = config or OIAnalyzerConfig()
         self.config.validate()
         self.config.assert_production_topics_allowed()
+        self._market_state_store = market_state_store
+        self._state_snapshot_source = (
+            MarketStateSnapshotSource(market_state_store) if market_state_store is not None else None
+        )
 
         self.logger = get_logger(
             __name__,
@@ -429,6 +436,57 @@ class OIAnalyzer:
 
         self._registered = False
         self._stats = OIAnalyzerRuntimeStats()
+
+    async def process_market_state_snapshot(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> Any | None:
+        """Evaluate open-interest analytics from MarketStateStore snapshot."""
+        source = getattr(self, "_state_snapshot_source", None)
+        if source is None:
+            return None
+        snapshot = await source.snapshot(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe or getattr(self.config, "default_timeframe", None),
+        )
+        oi = getattr(snapshot, "open_interest", None) if snapshot is not None else None
+        if oi is None:
+            return None
+        payload = _plain(oi)
+        if not isinstance(payload, dict):
+            payload = {"open_interest": payload}
+        payload = {
+            **dict(payload),
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe or getattr(self.config, "default_timeframe", None),
+            "source_topic": "market_state.snapshot",
+        }
+        for name in ("_on_open_interest_updated", "_handle_open_interest_updated", "on_open_interest_updated"):
+            method = getattr(self, name, None)
+            if callable(method):
+                result = method(payload)
+                if hasattr(result, "__await__"):
+                    result = await result
+                return result
+        return payload
+
+    async def process_market_snapshot(self, snapshot: Any) -> Any | None:
+        """MarketScheduler-compatible evaluator callback."""
+        scope = getattr(snapshot, "scope", None)
+        return await self.process_market_state_snapshot(
+            exchange=getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or getattr(self.config, "default_exchange", "binance"),
+            market_type=getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None) or getattr(self.config, "default_market_type", "usdm_futures"),
+            symbol=getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None),
+            timeframe=getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or getattr(self.config, "default_timeframe", None),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle / registration
@@ -2250,9 +2308,15 @@ class OIAnalyzer:
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_emit", _analytics_args)
         except Exception:
             pass
+        strategy_payload = ensure_strategy_payload_contract(
+            payload,
+            topic=topic,
+            source=self.config.source_name,
+            domain="open_interest",
+        )
         return await self.event_bus.emit(
             topic,
-            payload,
+            strategy_payload,
             priority=priority,
             source=self.config.source_name,
             correlation_id=correlation_id,

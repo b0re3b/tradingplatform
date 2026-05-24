@@ -145,6 +145,7 @@ class BybitWebSocketClient:
         orderbook_batch_max_size: int = 500,
         trade_emit_min_interval_ms: int = 250,
         trade_batch_max_size: int = 1000,
+        market_ingestion: MarketIngestionService | None = None,
     ) -> None:
         resolved_config = ws_config or BybitWebSocketClientConfig.from_core_config(
             config=config,
@@ -784,7 +785,10 @@ class BybitWebSocketClient:
         )
 
         if interval_ms <= 0:
-            await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_orderbook_delta(payload)
+            else:
+                await self._emit_event("market.orderbook", payload, priority=EventPriority.LOW)
             return
 
         normalized_key = key or str(payload.get("symbol") or "unknown").upper()
@@ -848,11 +852,16 @@ class BybitWebSocketClient:
                 "updates": updates,
             }
 
-            await self._emit_event(
-                "market.orderbook.batch",
-                batch_payload,
-                priority=EventPriority.LOW,
-            )
+            if self._market_ingestion is not None:
+                # Preserve delta order while avoiding EventBus raw market-data flood.
+                for update in updates:
+                    await self._market_ingestion.ingest_orderbook_delta(update)
+            else:
+                await self._emit_event(
+                    "market.orderbook.batch",
+                    batch_payload,
+                    priority=EventPriority.LOW,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -894,7 +903,10 @@ class BybitWebSocketClient:
         )
 
         if interval_ms <= 0:
-            await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_trade(payload)
+            else:
+                await self._emit_event("market.trade", payload, priority=EventPriority.LOW)
             return
 
         normalized_key = key or str(payload.get("symbol") or "unknown").upper()
@@ -958,11 +970,14 @@ class BybitWebSocketClient:
                 "trades": trades,
             }
 
-            await self._emit_event(
-                "market.trades.batch",
-                batch_payload,
-                priority=EventPriority.LOW,
-            )
+            if self._market_ingestion is not None:
+                await self._market_ingestion.ingest_trades_batch(batch_payload)
+            else:
+                await self._emit_event(
+                    "market.trades.batch",
+                    batch_payload,
+                    priority=EventPriority.LOW,
+                )
 
         except asyncio.CancelledError:
             raise

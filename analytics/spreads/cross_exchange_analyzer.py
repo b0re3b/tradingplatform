@@ -8,21 +8,21 @@ from typing import Any
 from core.event_bus import Event, EventBus, EventPriority
 from core.scheduler import Scheduler
 
-from .base import BaseSpreadAnalyzer
-from .config import CrossExchangeSpreadConfig
-from .enums import InstrumentType, PricingSource, QuoteValidity, SpreadType
-from .models import (
+from analytics.spreads.base import BaseSpreadAnalyzer
+from analytics.spreads.config import CrossExchangeSpreadConfig
+from analytics.spreads.enums import InstrumentType, PricingSource, QuoteValidity, SpreadType
+from analytics.spreads.models import (
     ArbitrageOpportunity,
     QuoteSnapshot,
     SpreadKey,
     SpreadSnapshot,
     spread_key_to_dict,
 )
-from .spread_opportunity_detector import (
+from analytics.spreads.spread_opportunity_detector import (
     OpportunityDetectionResult,
     SpreadOpportunityDetector,
 )
-from .spread_utils import (
+from analytics.spreads.spread_utils import (
     DECIMAL_ZERO,
     RollingDecimalWindow,
     aligned_quotes,

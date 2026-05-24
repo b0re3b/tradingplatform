@@ -10,9 +10,12 @@ from typing import Any
 
 from core.config import Config
 from core.logger import get_logger
-
+from core.event_flow_monitor import EventFlowMonitor, EventFlowMonitorConfig
 from app.factories import (
     build_analytics_components,
+    build_market_ingestion_service,
+    build_market_scheduler,
+    build_market_state_store,
     build_data_caches,
     build_exchange_ws_clients,
     build_execution_components,
@@ -196,13 +199,16 @@ class TradingSystemRuntime:
     Order:
     1. core EventBus/Scheduler
     2. REST clients and symbol discovery
-    3. sharded WS clients and data caches
+    3. sharded WS clients and data caches registration
     4. analytics
-    5. strategy
-    6. risk
-    7. execution
-    8. Telegram observer
-    9. independent news branch
+    5. startup warmup
+    6. strategy
+    7. risk
+    8. execution
+    9. Telegram observer
+    10. live market stream
+    11. derivative snapshot polling
+    12. independent news branch
     """
 
     def __init__(self, config: Config, settings: RuntimeSettings) -> None:
@@ -212,7 +218,10 @@ class TradingSystemRuntime:
 
         self.event_bus = build_event_bus(config)
         self.scheduler = build_scheduler(config, self.event_bus)
-
+        self._event_flow_monitor: EventFlowMonitor | None = None
+        self.market_state_store: Any | None = None
+        self.market_ingestion: Any | None = None
+        self.market_scheduler: Any | None = None
         self.rest_clients: dict[str, Any] = {}
         self.ws_clients: dict[str, Any] = {}
         self.caches: dict[str, Any] = {}
@@ -232,10 +241,46 @@ class TradingSystemRuntime:
             return
 
         await self.event_bus.start()
+        self._event_flow_monitor = EventFlowMonitor(
+            self.event_bus,
+            EventFlowMonitorConfig.from_env(),
+        )
+
+        await self._event_flow_monitor.start()
         await self.scheduler.start()
 
-        # REST clients first: needed for discovery and Binance execution.
-        self.rest_clients = build_rest_clients(self.config, self.event_bus, self.scheduler, self.settings)
+        # State-driven market-data foundation. REST/WS adapters write through
+        # MarketIngestionService instead of emitting high-frequency raw market.*
+        # events to EventBus. Analytics reads snapshots via MarketScheduler.
+        self.market_state_store = build_market_state_store(
+            self.config,
+            event_bus=self.event_bus,
+            scheduler=self.scheduler,
+            settings=self.settings,
+        )
+        self.market_ingestion = build_market_ingestion_service(
+            config=self.config,
+            event_bus=self.event_bus,
+            scheduler=self.scheduler,
+            market_state_store=self.market_state_store,
+            settings=self.settings,
+        )
+        self.market_scheduler = build_market_scheduler(
+            config=self.config,
+            event_bus=self.event_bus,
+            scheduler=self.scheduler,
+            market_state_store=self.market_state_store,
+            settings=self.settings,
+        )
+
+        # REST clients first: needed for discovery, warmup and Binance execution.
+        self.rest_clients = build_rest_clients(
+            self.config,
+            self.event_bus,
+            self.scheduler,
+            self.settings,
+            market_ingestion=self.market_ingestion,
+        )
         for rest in self.rest_clients.values():
             await register_component(rest)
             await start_component(rest)
@@ -257,8 +302,15 @@ class TradingSystemRuntime:
                 scheduler=self.scheduler,
                 universe=universe,
                 settings=self.settings,
+                market_ingestion=self.market_ingestion,
             )
-            self.caches = build_data_caches(self.config, self.event_bus, self.scheduler)
+            self.caches = build_data_caches(
+                self.config,
+                self.event_bus,
+                self.scheduler,
+                market_state_store=self.market_state_store,
+                market_ingestion=self.market_ingestion,
+            )
 
             if self.settings.startup_warmup_persist_enabled:
                 self.parquet_storage = build_parquet_storage(
@@ -283,6 +335,9 @@ class TradingSystemRuntime:
                 scheduler=self.scheduler,
                 exchange_clients=self.ws_clients,
                 caches=self.caches,
+                market_state_store=self.market_state_store,
+                market_ingestion=self.market_ingestion,
+                market_scheduler=self.market_scheduler,
             )
             self._market_stream = market_stream
             self.components.append(market_stream)
@@ -302,6 +357,8 @@ class TradingSystemRuntime:
                 caches=self.caches,
                 universe=universe,
                 settings=self.settings,
+                market_state_store=self.market_state_store,
+                market_scheduler=self.market_scheduler,
             )
             for component in analytics_components:
                 # Components that have start() call register() internally (e.g.
@@ -315,23 +372,19 @@ class TradingSystemRuntime:
                 self.components.append(component)
                 await _start_analytics_component(component)
 
+            # Start snapshot evaluation before warmup so REST warmup data written
+            # into MarketStateStore can immediately feed analytics, while
+            # strategy/risk/execution are still not running.
+            if self.market_scheduler is not None:
+                await start_component(self.market_scheduler)
+
             await self._run_startup_warmup(universe)
 
-            # Orderflow/liquidations are live WebSocket-driven. Start WS only after
-            # warmup has completed, so live analytics cannot race ahead of
-            # historical context.
-            if self._market_stream is not None:
-                await start_component(self._market_stream)
-                self._verify_liquidation_ws_capability()
-
-            # Binance USD-M open interest/funding are REST snapshot endpoints.
-            # Start live fixed-rate polling after warmup and after all caches +
-            # analytics subscriptions are active.
-            self._start_derivative_snapshot_polling(universe)
-        elif self._market_stream is not None:
-            # Analytics disabled: market stream can start immediately after caches
-            # registration because there is no strategy warmup dependency.
-            await start_component(self._market_stream)
+            # Live market publishers are intentionally started later, after
+            # strategy/risk/execution/Telegram consumers are subscribed. Warmup
+            # can safely run here because it uses REST and cache/analytics state,
+            # while live WS and derivative polling must not race ahead of the
+            # trading pipeline.
 
         if self.settings.enable_strategy:
             strategy_engine = build_strategy_engine(
@@ -371,6 +424,20 @@ class TradingSystemRuntime:
                         "News is isolated from trading pipeline."
                     ),
                 )
+
+        # Start live market-data publishers only after the consumers that depend
+        # on them are already active: strategy, risk, execution and Telegram.
+        # This prevents live analytics events from being emitted before the
+        # trading pipeline can observe/reject/build them.
+        if self._market_stream is not None:
+            await start_component(self._market_stream)
+            self._verify_liquidation_ws_capability()
+
+        # Binance USD-M open interest/funding are REST snapshot endpoints. Start
+        # polling after live consumers are subscribed, but before independent
+        # news, so derivative analytics can feed strategy immediately.
+        if self.settings.enable_analytics:
+            self._start_derivative_snapshot_polling(universe)
 
         if self.settings.enable_news:
             self.news_service = build_news_service(self.event_bus, self.scheduler)
@@ -540,6 +607,21 @@ class TradingSystemRuntime:
         if settle:
             await asyncio.sleep(settle)
 
+    async def _evaluate_market_state_once(self, *, reason: str) -> None:
+        """Run one bounded state-snapshot analytics tick if the state scheduler exists."""
+        if self.market_scheduler is None:
+            return
+        evaluate = getattr(self.market_scheduler, "evaluate_dirty_once", None)
+        if not callable(evaluate):
+            return
+        try:
+            result = evaluate()
+            if inspect.isawaitable(result):
+                result = await result
+            logger.debug("Market state evaluated | reason=%s result=%s", reason, result)
+        except Exception:
+            logger.exception("Market state evaluation failed | reason=%s", reason)
+
     async def _run_startup_warmup(self, universe: Any) -> None:
         """
         Load the minimum historical context required by analytics before the
@@ -657,6 +739,7 @@ class TradingSystemRuntime:
                     kline_success += 1
                 else:
                     kline_failed.append(f"{symbol}:{timeframe}:{error or 'empty'}")
+            await self._evaluate_market_state_once(reason="startup_warmup_klines_batch")
             await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
 
         # Funding warmup gives FundingAnalyzer enough samples for statistics/regime.
@@ -671,8 +754,10 @@ class TradingSystemRuntime:
                     funding_success += 1
                 else:
                     funding_failed.append(f"{symbol}:{error or 'empty'}")
+            await self._evaluate_market_state_once(reason="startup_warmup_funding_batch")
             await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
 
+        await self._evaluate_market_state_once(reason="startup_warmup_complete")
         await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
 
         if self.settings.startup_warmup_required:
@@ -680,9 +765,12 @@ class TradingSystemRuntime:
                 raise RuntimeError(
                     "Startup warmup failed: no historical candles were loaded for price_action/liquidity"
                 )
+
             if symbols and funding_success <= 0:
-                raise RuntimeError(
-                    "Startup warmup failed: no historical funding records were loaded"
+                logger.warning(
+                    "Startup warmup loaded no historical funding records; continuing because funding warmup is optional | symbols=%s failed_examples=%s",
+                    len(symbols),
+                    funding_failed[:20],
                 )
 
         logger.info(
@@ -906,6 +994,7 @@ class TradingSystemRuntime:
                     return
                 batch = active_symbols[start : start + batch_size]
                 await asyncio.gather(*(poll_symbol(symbol, sem) for symbol in batch))
+                await self._evaluate_market_state_once(reason="derivative_snapshot_poll_batch")
 
         async def fixed_rate_loop() -> None:
             next_run = asyncio.get_running_loop().time()
@@ -1014,6 +1103,20 @@ class TradingSystemRuntime:
                     rest.__class__.__name__,
                 )
 
+        if self._event_flow_monitor is not None:
+            try:
+                await self._event_flow_monitor.stop()
+            except Exception:
+                logger.exception("Failed to stop event flow monitor")
+            finally:
+                self._event_flow_monitor = None
+
+        if self.market_scheduler is not None:
+            try:
+                await stop_component(self.market_scheduler)
+            except Exception:
+                logger.exception("Failed to stop market scheduler")
+
         try:
             await self.scheduler.stop(
                 wait_running_jobs=self.config.scheduler.wait_running_jobs_on_shutdown,
@@ -1021,6 +1124,13 @@ class TradingSystemRuntime:
             )
         except Exception:
             logger.exception("Failed to stop scheduler")
+
+        if self._event_flow_monitor is not None:
+            try:
+                await self._event_flow_monitor.stop()
+            except Exception:
+                logger.exception("Failed to stop event flow monitor")
+            self._event_flow_monitor = None
 
         try:
             await self.event_bus.stop(drain=True, timeout=10.0)

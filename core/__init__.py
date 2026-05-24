@@ -33,6 +33,16 @@ from .event_bus import (
     Subscription,
 )
 
+# ============================================================
+# Event flow monitor
+# ============================================================
+
+from .event_flow_monitor import (
+    DEFAULT_MONITORED_TOPICS,
+    EventFlowMonitor,
+    EventFlowMonitorConfig,
+)
+
 
 # ============================================================
 # Logger
@@ -84,6 +94,11 @@ __all__ = [
     "EventPriority",
     "QueueFullPolicy",
     "Subscription",
+
+    # Event flow monitor
+    "DEFAULT_MONITORED_TOPICS",
+    "EventFlowMonitor",
+    "EventFlowMonitorConfig",
 
     # Logger
     "ContextFilter",

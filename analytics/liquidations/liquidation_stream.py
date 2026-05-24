@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import hashlib
 import inspect
 import time
@@ -62,28 +63,32 @@ class LiquidationHistoryStoreProtocol(Protocol):
 
 class LiquidationStream:
     """
-    Multi-exchange EventBus consumer/cache for liquidation events.
+    State-driven liquidation analytics stream.
 
     Correct production flow:
         exchange adapters
-            -> EventBus.emit("market.liquidation", raw normalized exchange payload)
-            -> LiquidationStream
+            -> MarketIngestionService.ingest_liquidation(...)
+            -> MarketStateStore
+            -> LiquidationStream.process_market_state_snapshot(...)
             -> LiquidationEvent
-            -> LiquidationState / LiquidationMetrics
-            -> market.liquidation.normalized
-            -> market.liquidation.large
-            -> market.liquidations.updated
-            -> CascadeDetector / whales / funding context
+            -> shared LiquidationState / LiquidationMetrics
+            -> analytics/normalized liquidation output events
+            -> CascadeDetector / strategy context
+
+    Backward compatibility:
+        If market_state_store is not injected, the class can still subscribe to
+        legacy raw EventBus topics.  In the new production path, raw
+        market.liquidation is NOT used as the primary input.
 
     Responsibilities:
-    - subscribe to raw liquidation payloads from EventBus;
-    - accept data from many exchanges on the same topic without scope conflicts;
-    - normalize raw payloads into LiquidationEvent;
+    - read liquidation windows from MarketStateStore snapshots;
+    - accept data from many exchanges without scope conflicts;
+    - normalize snapshot liquidation items into LiquidationEvent;
     - filter invalid/stale/duplicate events;
     - update shared LiquidationState using LiquidationKey;
     - update LiquidationMetrics;
     - optionally append normalized events to injected history store;
-    - publish normalized / large / updated events;
+    - publish normalized / large / updated analytics events;
     - register health/snapshot/cleanup jobs through core.Scheduler.
 
     Scope:
@@ -109,6 +114,7 @@ class LiquidationStream:
         state: LiquidationState | None = None,
         metrics: LiquidationMetrics | None = None,
         history_store: LiquidationHistoryStoreProtocol | None = None,
+        market_state_store: Any | None = None,
         service_name: str = "liquidation_stream",
     ) -> None:
         try:
@@ -138,6 +144,7 @@ class LiquidationStream:
         self.config.validate()
         self.service_name = service_name
         self.history_store = history_store
+        self.market_state_store = market_state_store
 
         self.state = state or get_shared_liquidation_state(
             max_events_per_symbol=self.config.max_buffer_size_per_symbol,
@@ -201,6 +208,10 @@ class LiquidationStream:
             maxlen=max(1, self.config.recent_large_events_size),
         )
 
+        self._processed_snapshot_scopes = 0
+        self._processed_snapshot_liquidations = 0
+        self._state_input_mode = self.market_state_store is not None
+
         self._healthcheck_job_id: str | None = None
         self._snapshot_job_id: str | None = None
         self._cleanup_job_id: str | None = None
@@ -243,14 +254,19 @@ class LiquidationStream:
             self.logger.info("LiquidationStream registration skipped: disabled by config")
             return
 
-        for topic in self.config.input_topics:
-            self.config.assert_input_topic_allowed(topic)
-            self._subscriptions.append(
-                self.event_bus.subscribe(
-                    topic,
-                    self.on_raw_liquidation,
-                    name=f"{self.service_name}.on_raw_liquidation",
+        if self.market_state_store is None:
+            for topic in self.config.input_topics:
+                self.config.assert_input_topic_allowed(topic)
+                self._subscriptions.append(
+                    self.event_bus.subscribe(
+                        topic,
+                        self.on_raw_liquidation,
+                        name=f"{self.service_name}.on_raw_liquidation",
+                    )
                 )
+        else:
+            self.logger.info(
+                "LiquidationStream registered in state-driven mode; raw EventBus liquidation subscriptions are disabled"
             )
 
         self._register_scheduler_jobs()
@@ -263,6 +279,7 @@ class LiquidationStream:
                 "output_topics": list(self.config.output_topics),
                 "scheduler_enabled": self.scheduler is not None,
                 "scope": "exchange:market_type:symbol:timeframe",
+                "input_mode": "market_state" if self.market_state_store is not None else "event_bus_legacy",
             },
         )
 
@@ -453,6 +470,133 @@ class LiquidationStream:
             pass
         await self.stop()
         await self.start()
+
+    # ------------------------------------------------------------------
+    # State-driven input API
+    # ------------------------------------------------------------------
+
+    async def process_dirty_state_scopes(self, *, limit: int | None = 500, depth: int | None = None) -> int:
+        """Process dirty MarketStateStore snapshots that include liquidation changes.
+
+        This is the preferred production entrypoint for MarketScheduler.  It does
+        not consume raw EventBus market.liquidation events; it reads already
+        ingested market state snapshots and publishes only analytics outputs.
+        """
+        if self.market_state_store is None:
+            return 0
+
+        snapshots_for_dirty = getattr(self.market_state_store, "snapshots_for_dirty", None)
+        if not callable(snapshots_for_dirty):
+            self.logger.warning("MarketStateStore has no snapshots_for_dirty() method")
+            return 0
+
+        snapshots = await snapshots_for_dirty(limit=limit, depth=depth)
+        processed = 0
+        for snapshot in snapshots:
+            dirty_reasons = {str(reason).lower() for reason in (getattr(snapshot, "dirty_reasons", ()) or ())}
+            if dirty_reasons and "liquidation" not in dirty_reasons:
+                continue
+            processed += await self.process_market_state_snapshot(snapshot=snapshot)
+        return processed
+
+    async def process_market_state_snapshot(
+        self,
+        snapshot: Any | None = None,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        depth: int | None = None,
+    ) -> int:
+        """Read liquidation items from MarketStateStore and update analytics state.
+
+        Either pass an already built MarketSnapshot or pass scope fields so this
+        method can request the snapshot from the injected MarketStateStore.
+        Returns the number of newly accepted liquidation events.
+        """
+        if snapshot is None:
+            if self.market_state_store is None:
+                return 0
+            if not symbol:
+                raise ValueError("symbol is required when snapshot is not provided")
+            from data.market_models import MarketScope
+
+            scope = MarketScope(
+                exchange=exchange or "binance",
+                market_type=market_type or DEFAULT_MARKET_TYPE,
+                symbol=symbol,
+                timeframe=timeframe or DEFAULT_TIMEFRAME,
+            )
+            snapshot = await self.market_state_store.snapshot(scope, depth=depth)
+
+        self._processed_snapshot_scopes += 1
+        processed = 0
+        for payload in self._liquidation_payloads_from_snapshot(snapshot):
+            event = await self.handle_raw_message(payload)
+            if event is not None:
+                processed += 1
+        self._processed_snapshot_liquidations += processed
+        return processed
+
+    def _liquidation_payloads_from_snapshot(self, snapshot: Any) -> list[dict[str, Any]]:
+        scope = getattr(snapshot, "scope", None)
+        exchange = getattr(scope, "exchange", None) or self.config.default_exchange if hasattr(self.config, "default_exchange") else None
+        market_type = getattr(scope, "market_type", None) or DEFAULT_MARKET_TYPE
+        symbol = getattr(scope, "symbol", None)
+        timeframe = getattr(scope, "timeframe", None) or DEFAULT_TIMEFRAME
+        exchange_symbol = getattr(scope, "exchange_symbol", None) or symbol
+
+        # MarketSnapshot.current_price exists in the new data layer; keep a
+        # fallback for dict-like snapshots or older test doubles.
+        current_price = getattr(snapshot, "current_price", None)
+        if current_price is None:
+            current_price = getattr(snapshot, "last_price", None) or getattr(snapshot, "reference_price", None)
+
+        items = list(getattr(snapshot, "liquidations", ()) or ())
+        payloads: list[dict[str, Any]] = []
+        for item in items:
+            if hasattr(item, "to_dict") and callable(item.to_dict):
+                item_dict = dict(item.to_dict())
+            elif isinstance(item, dict):
+                item_dict = dict(item)
+            else:
+                item_dict = {
+                    "price": getattr(item, "price", None),
+                    "quantity": getattr(item, "quantity", None),
+                    "side": getattr(item, "side", None),
+                    "timestamp_ms": getattr(item, "timestamp_ms", None),
+                    "order_id": getattr(item, "order_id", None),
+                    "metadata": dict(getattr(item, "metadata", {}) or {}),
+                }
+
+            metadata = dict(item_dict.get("metadata") or {})
+            payload = {
+                "exchange": metadata.get("exchange") or exchange,
+                "market_type": metadata.get("market_type") or market_type,
+                "symbol": metadata.get("symbol") or symbol,
+                "timeframe": metadata.get("timeframe") or timeframe,
+                "exchange_symbol": metadata.get("exchange_symbol") or exchange_symbol,
+                "side": item_dict.get("side"),
+                "price": item_dict.get("price"),
+                "quantity": item_dict.get("quantity"),
+                "order_id": item_dict.get("order_id") or metadata.get("order_id"),
+                "trade_id": metadata.get("trade_id"),
+                "event_id": metadata.get("event_id") or metadata.get("id"),
+                "timestamp_ms": item_dict.get("timestamp_ms") or metadata.get("timestamp_ms"),
+                "event_time": item_dict.get("timestamp_ms") or metadata.get("event_time"),
+                "current_price": current_price or item_dict.get("price"),
+                "reference_price": current_price or item_dict.get("price"),
+                "source_topic": "market_state.liquidations",
+                "source": "market_state_store",
+                "metadata": {
+                    **metadata,
+                    "input_mode": "market_state_snapshot",
+                    "snapshot_updated_at_ms": getattr(snapshot, "updated_at_ms", None),
+                },
+            }
+            payloads.append(payload)
+        return payloads
 
     # ------------------------------------------------------------------
     # EventBus input handler
@@ -790,9 +934,15 @@ class LiquidationStream:
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "publish_event", _analytics_args)
         except Exception:
             pass
+        strategy_payload = ensure_strategy_payload_contract(
+            event,
+            topic=self.config.publish_topic_normalized,
+            source=self.service_name,
+            domain="liquidations",
+        )
         accepted = await self.event_bus.emit(
             self.config.publish_topic_normalized,
-            event,
+            strategy_payload,
             priority=EventPriority.NORMAL,
             source=self.service_name,
             correlation_id=event.correlation_id,
@@ -845,9 +995,15 @@ class LiquidationStream:
             "last_received_at": event.received_at.isoformat(),
             "symbol_state_total": symbol_state_total,
         }
+        strategy_payload = ensure_strategy_payload_contract(
+            payload,
+            topic=self.publish_topic_updated,
+            source=self.service_name,
+            domain="liquidations",
+        )
         accepted = await self.event_bus.emit(
             self.publish_topic_updated,
-            payload,
+            strategy_payload,
             priority=EventPriority.NORMAL,
             source=self.service_name,
             correlation_id=event.correlation_id,
@@ -883,9 +1039,15 @@ class LiquidationStream:
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "publish_large_event", _analytics_args)
         except Exception:
             pass
+        strategy_payload = ensure_strategy_payload_contract(
+            event,
+            topic=self.config.publish_topic_large,
+            source=self.service_name,
+            domain="liquidations",
+        )
         accepted = await self.event_bus.emit(
             self.config.publish_topic_large,
-            event,
+            strategy_payload,
             priority=EventPriority.HIGH,
             source=self.service_name,
             correlation_id=event.correlation_id,
@@ -1987,6 +2149,9 @@ class LiquidationStream:
             "published_updated": self._published_updated,
             "published_health": self._published_health,
             "published_snapshots": self._published_snapshots,
+            "input_mode": "market_state" if self.market_state_store is not None else "event_bus_legacy",
+            "processed_snapshot_scopes": self._processed_snapshot_scopes,
+            "processed_snapshot_liquidations": self._processed_snapshot_liquidations,
             "last_message_at": self._last_message_at.isoformat() if self._last_message_at else None,
             "last_event_at": self._last_event_at.isoformat() if self._last_event_at else None,
             "last_error": self._last_error,

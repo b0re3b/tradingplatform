@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -78,6 +79,7 @@ class CascadeDetector:
         state: LiquidationState | None = None,
         scheduler: Scheduler | None = None,
         metrics: LiquidationMetrics | None = None,
+        market_state_store: Any | None = None,
         service_name: str = "cascade_detector",
     ) -> None:
         try:
@@ -109,6 +111,7 @@ class CascadeDetector:
 
         self.state = state or get_shared_liquidation_state()
         self.metrics = metrics or LiquidationMetrics()
+        self.market_state_store = market_state_store
         self.service_name = service_name
 
         self.logger = get_logger(
@@ -126,6 +129,8 @@ class CascadeDetector:
         self._subscription: Subscription | None = None
 
         self._processed_events = 0
+        self._processed_snapshot_scopes = 0
+        self._processed_snapshot_detections = 0
         self._invalid_payload_skips = 0
         self._cascade_signals_emitted = 0
         self._exhaustion_signals_emitted = 0
@@ -186,11 +191,16 @@ class CascadeDetector:
 
         self.config.assert_input_topic_allowed()
 
-        self._subscription = self.event_bus.subscribe(
-            self.config.input_topic,
-            self.on_liquidation_event,
-            name=f"{self.service_name}.on_liquidation_event",
-        )
+        if self.market_state_store is None:
+            self._subscription = self.event_bus.subscribe(
+                self.config.input_topic,
+                self.on_liquidation_event,
+                name=f"{self.service_name}.on_liquidation_event",
+            )
+        else:
+            self.logger.info(
+                "CascadeDetector registered in state-driven mode; normalized EventBus input subscription is disabled"
+            )
 
         self._register_scheduler_jobs()
         self._registered = True
@@ -255,6 +265,7 @@ class CascadeDetector:
                 "min_total_notional_usd": str(self.config.min_total_notional_usd),
                 "min_side_imbalance_ratio": self.config.min_side_imbalance_ratio,
                 "scope": "exchange:market_type:symbol:timeframe",
+                "input_mode": "market_state" if self.market_state_store is not None else "event_bus_legacy",
             },
         )
 
@@ -315,6 +326,75 @@ class CascadeDetector:
             pass
         await self.stop()
         await self.start()
+
+    # ---------------------------------------------------------------------
+    # State-driven input API
+    # ---------------------------------------------------------------------
+
+    async def process_market_state_snapshot(
+        self,
+        snapshot: Any | None = None,
+        *,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        depth: int | None = None,
+    ) -> CascadeDetectionResult | None:
+        """Evaluate cascade state for a MarketStateStore snapshot.
+
+        LiquidationStream should process the same snapshot first and update the
+        shared LiquidationState.  This detector then reads that shared state and
+        emits analytics.liquidations.* if thresholds pass.
+        """
+        if snapshot is None:
+            if self.market_state_store is None:
+                return None
+            if not symbol:
+                raise ValueError("symbol is required when snapshot is not provided")
+            from data.market_models import MarketScope
+
+            scope = MarketScope(
+                exchange=exchange or "binance",
+                market_type=market_type or "usdm_futures",
+                symbol=symbol,
+                timeframe=timeframe or "1m",
+            )
+            snapshot = await self.market_state_store.snapshot(scope, depth=depth)
+
+        scope = getattr(snapshot, "scope", None)
+        if scope is None:
+            self._invalid_payload_skips += 1
+            return None
+
+        key = make_liquidation_key(
+            exchange=getattr(scope, "exchange", None),
+            market_type=getattr(scope, "market_type", None),
+            symbol=getattr(scope, "symbol", None),
+            timeframe=getattr(scope, "timeframe", None) or "1m",
+        )
+        symbol_state = self.state.get_key(key)
+        self._processed_snapshot_scopes += 1
+
+        if symbol_state is None or symbol_state.is_empty:
+            self._empty_window_skips += 1
+            return None
+
+        # Trigger off the newest event in the shared state for this scope.
+        trigger_event = list(symbol_state.events)[-1]
+        if symbol_state.is_in_cooldown(trigger_event.timestamp):
+            self._cooldown_skips += 1
+            return None
+
+        result = await self._detect_for_symbol_state(
+            symbol_state,
+            trigger_event=trigger_event,
+            correlation_id=getattr(trigger_event, "correlation_id", None),
+        )
+        if result is not None:
+            self._processed_snapshot_detections += 1
+            await self._emit_detection_result(result)
+        return result
 
     # ---------------------------------------------------------------------
     # Main EventBus handler
@@ -900,9 +980,15 @@ class CascadeDetector:
             event_type=LiquidationEventType.CASCADE,
         )
 
+        strategy_payload = ensure_strategy_payload_contract(
+            result,
+            topic=self.config.publish_topic_detected,
+            source=self.service_name,
+            domain="liquidations",
+        )
         accepted = await self.event_bus.emit(
             self.config.publish_topic_detected,
-            result,
+            strategy_payload,
             priority=EventPriority.HIGH,
             source=self.service_name,
             correlation_id=result.correlation_id,
@@ -941,9 +1027,15 @@ class CascadeDetector:
                 event_type=LiquidationEventType.EXHAUSTION,
             )
 
+            exhaustion_payload = ensure_strategy_payload_contract(
+                result,
+                topic=self.config.publish_topic_exhaustion,
+                source=self.service_name,
+                domain="liquidations",
+            )
             exhaustion_accepted = await self.event_bus.emit(
                 self.config.publish_topic_exhaustion,
-                result,
+                exhaustion_payload,
                 priority=EventPriority.HIGH,
                 source=self.service_name,
                 correlation_id=result.correlation_id,
@@ -1687,6 +1779,9 @@ class CascadeDetector:
             "output_topics": list(self.config.output_topics),
             "uptime_seconds": uptime_seconds,
             "processed_events": self._processed_events,
+            "input_mode": "market_state" if self.market_state_store is not None else "event_bus_legacy",
+            "processed_snapshot_scopes": self._processed_snapshot_scopes,
+            "processed_snapshot_detections": self._processed_snapshot_detections,
             "invalid_payload_skips": self._invalid_payload_skips,
             "cascade_signals_emitted": self._cascade_signals_emitted,
             "exhaustion_signals_emitted": self._exhaustion_signals_emitted,

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from core.event_bus import Event, EventBus
 from core.scheduler import Scheduler
+from analytics.market_state_contract import MarketStateSnapshotSource, snapshot_candles
 
 from analytics.price_action.base import BasePriceActionConfig, BasePriceActionModule
 from analytics.price_action.fair_value_gap import FairValueGapAnalyzer, FairValueGapConfig
@@ -206,6 +207,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         fair_value_gap: FairValueGapAnalyzer | None = None,
         liquidity_levels: LiquidityLevelsAnalyzer | None = None,
         trend: TrendAnalyzer | None = None,
+        market_state_store: Any | None = None,
     ) -> None:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -243,6 +245,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         )
 
         self.config: PriceActionAnalyzerConfig = resolved_config
+        self._market_state_store = market_state_store
+        self._state_snapshot_source = (
+            MarketStateSnapshotSource(market_state_store) if market_state_store is not None else None
+        )
 
         # Enable flags are authoritative. Explicitly injected children must not
         # bypass disabled module configuration.
@@ -609,6 +615,128 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                     )
 
         await super().shutdown()
+
+    async def process_market_state_snapshot(self) -> dict[str, Any]:
+        """Evaluate this price-action scope from MarketStateStore candles.
+
+        This is the current state-driven input contract.  It replaces
+        direct consumption of high-frequency market.candles.updated events.
+        Child analyzers keep their domain logic; this facade supplies them with
+        a consistent candle snapshot and then publishes analytics.price_action.updated.
+        """
+        source = getattr(self, "_state_snapshot_source", None)
+        if source is None:
+            return {"processed": False, "reason": "market_state_store_not_configured"}
+
+        snapshot = await source.snapshot(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+        candles = snapshot_candles(snapshot, timeframe=self.timeframe) if snapshot is not None else []
+        if not candles:
+            return {"processed": False, "reason": "no_candles"}
+
+        updated: list[str] = []
+        for module_name, module in (
+            ("market_structure", self.market_structure),
+            ("support_resistance", self.support_resistance),
+            ("fair_value_gap", self.fair_value_gap),
+            ("liquidity_levels", self.liquidity_levels),
+            ("trend", self.trend),
+        ):
+            if module is None:
+                continue
+            update = getattr(module, "update", None)
+            if not callable(update):
+                continue
+            try:
+                result = update(candles=candles)
+            except TypeError:
+                result = update(candles)
+            self._child_update_counts[module_name] = self._child_update_counts.get(module_name, 0) + 1
+            self._last_child_payloads[module_name] = result if isinstance(result, dict) else {"result": result}
+            updated.append(module_name)
+
+        await self.publish_composite_update(
+            updated_module=updated[-1] if updated else None,
+            source_topic="market_state.snapshot",
+        )
+        return {"processed": True, "updated_modules": updated, "candles": len(candles)}
+
+    async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        """MarketScheduler-compatible evaluator callback.
+
+        Each PriceActionAnalyzer instance is scope-bound.  The MarketScheduler
+        calls every evaluator for every dirty snapshot, so this method must
+        ignore snapshots outside this analyzer's own scope and must never mutate
+        ``self.exchange`` / ``self.symbol`` / ``self.timeframe``.  Mutating the
+        facade scope makes child module state leak between symbols and causes
+        PriceActionCompositeState scope validation errors.
+        """
+        if snapshot is None:
+            return {"processed": False, "reason": "missing_snapshot"}
+
+        scope = getattr(snapshot, "scope", None)
+        snapshot_exchange = getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None)
+        snapshot_market_type = getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None)
+        snapshot_symbol = getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None)
+        snapshot_timeframe = getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None)
+
+        if (
+            str(snapshot_exchange or "").lower() != str(self.exchange or "").lower()
+            or str(snapshot_market_type or "").lower() != str(self.market_type or "").lower()
+            or str(snapshot_symbol or "").upper() != str(self.symbol or "").upper()
+            or str(snapshot_timeframe or "") != str(self.timeframe or "")
+        ):
+            return {
+                "processed": False,
+                "reason": "scope_mismatch",
+                "snapshot_scope": {
+                    "exchange": snapshot_exchange,
+                    "market_type": snapshot_market_type,
+                    "symbol": snapshot_symbol,
+                    "timeframe": snapshot_timeframe,
+                },
+                "analyzer_scope": {
+                    "exchange": self.exchange,
+                    "market_type": self.market_type,
+                    "symbol": self.symbol,
+                    "timeframe": self.timeframe,
+                },
+            }
+
+        candles = snapshot_candles(snapshot, timeframe=self.timeframe)
+        if not candles:
+            return {"processed": False, "reason": "no_candles"}
+
+        updated: list[str] = []
+        for module_name, module in (
+            ("market_structure", self.market_structure),
+            ("support_resistance", self.support_resistance),
+            ("fair_value_gap", self.fair_value_gap),
+            ("liquidity_levels", self.liquidity_levels),
+            ("trend", self.trend),
+        ):
+            if module is None:
+                continue
+            update = getattr(module, "update", None)
+            if not callable(update):
+                continue
+            try:
+                result = update(candles=candles)
+            except TypeError:
+                result = update(candles)
+            self._child_update_counts[module_name] = self._child_update_counts.get(module_name, 0) + 1
+            self._last_child_payloads[module_name] = result if isinstance(result, dict) else {"result": result}
+            updated.append(module_name)
+
+        await self.publish_composite_update(
+            updated_module=updated[-1] if updated else None,
+            source_topic="market_state.snapshot",
+        )
+        return {"processed": True, "updated_modules": updated, "candles": len(candles)}
 
     # ------------------------------------------------------------------
     # EventBus handlers for child module updates

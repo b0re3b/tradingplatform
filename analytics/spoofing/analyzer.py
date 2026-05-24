@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping, Protocol
 
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.scheduler import Scheduler
+from analytics.market_state_contract import build_state_backed_cache_bundle, MarketStateSnapshotSource
 
 from .base import BaseSpoofingAnalyzer
 from .config import SpoofingConfig
@@ -99,6 +100,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         scheduler: Scheduler | None,
         config: SpoofingConfig,
         orderbook_cache: SupportsOrderBookCache | None = None,
+        market_state_store: Any | None = None,
         persistence_tracker: PersistenceTracker | None = None,
         wall_detector: OrderbookWallDetector | None = None,
         pull_detector: OrderPullDetector | None = None,
@@ -135,7 +137,10 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         )
 
         self.config.validate()
-        self.orderbook_cache = orderbook_cache
+        self._market_state_store = market_state_store
+        state_cache_bundle = build_state_backed_cache_bundle(market_state_store)
+        self.orderbook_cache = orderbook_cache or (state_cache_bundle.orderbook if state_cache_bundle is not None else None)
+        self._state_snapshot_source = state_cache_bundle.source if state_cache_bundle is not None else None
 
         self.persistence_tracker = persistence_tracker or PersistenceTracker(
             event_bus=event_bus,

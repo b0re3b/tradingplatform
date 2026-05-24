@@ -98,6 +98,7 @@ def build_liquidation_stream_and_cascade_detector(
     state: LiquidationState | None = None,
     metrics: LiquidationMetrics | None = None,
     history_store: LiquidationHistoryStoreProtocol | None = None,
+    market_state_store: Any | None = None,
 ) -> tuple[LiquidationStream, CascadeDetector]:
     """Build LiquidationStream and CascadeDetector with one shared state.
 
@@ -117,6 +118,7 @@ def build_liquidation_stream_and_cascade_detector(
         state=resolved_state,
         metrics=resolved_metrics,
         history_store=history_store,
+        market_state_store=market_state_store,
     )
     detector = CascadeDetector(
         event_bus=event_bus,
@@ -124,6 +126,7 @@ def build_liquidation_stream_and_cascade_detector(
         config=cascade_config or CascadeDetectorConfig(),
         state=resolved_state,
         metrics=resolved_metrics,
+        market_state_store=market_state_store,
     )
     return stream, detector
 
@@ -137,6 +140,7 @@ def build_liquidations_components(
     state: LiquidationState | None = None,
     metrics: LiquidationMetrics | None = None,
     history_store: LiquidationHistoryStoreProtocol | None = None,
+    market_state_store: Any | None = None,
 ) -> list[Any]:
     """Return liquidation analytics components using one shared state."""
     stream, detector = build_liquidation_stream_and_cascade_detector(
@@ -147,6 +151,7 @@ def build_liquidations_components(
         state=state,
         metrics=metrics,
         history_store=history_store,
+        market_state_store=market_state_store,
     )
     return [stream, detector]
 

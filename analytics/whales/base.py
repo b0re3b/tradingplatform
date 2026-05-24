@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping
@@ -921,7 +922,12 @@ class BaseWhaleComponent(ABC):
         if not topic or not topic.strip():
             raise ValueError("EventBus topic must be a non-empty string")
 
-        event_payload = self._payload_for_eventbus(payload)
+        event_payload = ensure_strategy_payload_contract(
+            self._payload_for_eventbus(payload),
+            topic=topic,
+            source=source or self.component_name,
+            domain="whales",
+        )
 
         try:
             accepted = await self.event_bus.emit(

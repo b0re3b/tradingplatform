@@ -11,6 +11,7 @@ import aiohttp
 from core.config import Config
 from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
+from data.market_ingestion import MarketIngestionService
 
 
 @dataclass(slots=True)
@@ -75,9 +76,11 @@ class BybitRestClient:
         config: Config,
         event_bus: EventBus,
         rest_config: BybitMarketRestClientConfig | None = None,
+        market_ingestion: MarketIngestionService | None = None,
     ) -> None:
         self._config = config
         self._event_bus = event_bus
+        self._market_ingestion = market_ingestion
         self._rest_config = rest_config or BybitMarketRestClientConfig.from_core_config(config)
 
         self._logger = get_logger(

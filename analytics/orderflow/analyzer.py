@@ -6,6 +6,7 @@ from typing import Any, TypeAlias, Union
 from core.event_bus import EventBus, EventPriority
 from core.logger import get_logger
 from core.scheduler import Scheduler
+from analytics.market_state_contract import build_state_backed_cache_bundle, MarketStateSnapshotSource
 
 from .aggressive_trades import AggressiveTradesAnalyzer
 from .config import OrderFlowConfig
@@ -72,8 +73,9 @@ class OrderFlowAnalyzer:
         self,
         *,
         event_bus: EventBus,
-        trades_cache: Any,
-        orderbook_cache: Any,
+        trades_cache: Any | None = None,
+        orderbook_cache: Any | None = None,
+        market_state_store: Any | None = None,
         config: OrderFlowConfig | None = None,
         scheduler: Scheduler | None = None,
         trades_topic_patterns: list[str] | tuple[str, ...] | None = None,
@@ -105,8 +107,11 @@ class OrderFlowAnalyzer:
             pass
         self._event_bus = event_bus
         self._scheduler = scheduler
-        self._trades_cache = trades_cache
-        self._orderbook_cache = orderbook_cache
+        self._market_state_store = market_state_store
+        state_cache_bundle = build_state_backed_cache_bundle(market_state_store)
+        self._trades_cache = trades_cache or (state_cache_bundle.trades if state_cache_bundle is not None else None)
+        self._orderbook_cache = orderbook_cache or (state_cache_bundle.orderbook if state_cache_bundle is not None else None)
+        self._state_snapshot_source = state_cache_bundle.source if state_cache_bundle is not None else None
         self._config = config or OrderFlowConfig()
 
         self._config.validate()
@@ -718,6 +723,21 @@ class OrderFlowAnalyzer:
         )
         return await self.process_key(key)
 
+    async def process_market_snapshot(self, snapshot: Any) -> dict[str, BaseOrderFlowStats | None | dict[str, str] | list[str]]:
+        """MarketScheduler-compatible evaluator callback.
+
+        The scheduler should pass the same MarketSnapshot to every analytics
+        evaluator; orderflow then reads trades/orderbook through its state-backed
+        cache facades and does not drain the dirty registry by itself.
+        """
+        scope = getattr(snapshot, "scope", None)
+        return await self.process_market(
+            exchange=getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or self._default_exchange,
+            market_type=getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None) or self._default_market_type,
+            symbol=getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None),
+            timeframe=getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or self._default_timeframe,
+        )
+
     async def process_symbol(
         self,
         symbol: str,
@@ -756,6 +776,39 @@ class OrderFlowAnalyzer:
             timeframe=self._default_timeframe,
         )
         return await self.process_key(key)
+
+    async def process_dirty_state_scopes(self, *, limit: int = 1000) -> dict[str, Any]:
+        """Process dirty scopes from MarketStateStore without raw market EventBus topics.
+
+        This is the state-driven input contract used by MarketScheduler/app wiring.
+        It coalesces dirty market-state updates into one processing pass per scope.
+        """
+        source = getattr(self, "_state_snapshot_source", None)
+        if source is None:
+            return {"processed": 0, "skipped": 0, "reason": "market_state_store_not_configured"}
+
+        processed = 0
+        skipped = 0
+        scopes = await source.dirty_scopes(
+            limit=limit,
+            sources={"trade", "trades", "orderbook", "orderbook_delta", "orderbook_snapshot"},
+        )
+        for scope in scopes:
+            exchange = getattr(scope, "exchange", None) or (scope.get("exchange") if isinstance(scope, dict) else None)
+            market_type = getattr(scope, "market_type", None) or (scope.get("market_type") if isinstance(scope, dict) else None)
+            symbol = getattr(scope, "symbol", None) or (scope.get("symbol") if isinstance(scope, dict) else None)
+            timeframe = getattr(scope, "timeframe", None) or (scope.get("timeframe") if isinstance(scope, dict) else None)
+            if not symbol:
+                skipped += 1
+                continue
+            await self.process_market(
+                exchange=exchange or self._default_exchange,
+                market_type=market_type or self._default_market_type,
+                symbol=symbol,
+                timeframe=timeframe or self._default_timeframe,
+            )
+            processed += 1
+        return {"processed": processed, "skipped": skipped}
 
     async def cleanup(self) -> None:
         """

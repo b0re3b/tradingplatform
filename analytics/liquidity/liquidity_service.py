@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 import asyncio
 import inspect
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from typing import Any, Sequence
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
+from analytics.market_state_contract import MarketStateSnapshotSource, snapshot_candles
 
 from analytics.liquidity.config import LiquidityConfig
 from analytics.liquidity.enums import SweepStatus
@@ -354,6 +356,7 @@ class LiquidityService:
         config: LiquidityConfig,
         liquidity_map: LiquidityMap,
         state: LiquidityState | None = None,
+        market_state_store: Any | None = None,
         service_name: str = "analytics_liquidity",
     ) -> None:
         try:
@@ -385,6 +388,10 @@ class LiquidityService:
 
         self._liquidity_map = liquidity_map
         self._state = state or LiquidityState()
+        self._market_state_store = market_state_store
+        self._state_snapshot_source = (
+            MarketStateSnapshotSource(market_state_store) if market_state_store is not None else None
+        )
 
         self._service_name = service_name
 
@@ -868,6 +875,92 @@ class LiquidityService:
                 extra_clusters=extra_clusters,
                 force=force,
             )
+
+    async def process_market_state_snapshot(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+        force: bool = False,
+    ) -> LiquidityMapSnapshot | None:
+        """Evaluate liquidity from MarketStateStore candles/orderbook snapshot.
+
+        This is the state-driven input contract and replaces direct reliance on
+        market.candles.updated / market.orderbook.updated EventBus input.
+        """
+        source = getattr(self, "_state_snapshot_source", None)
+        if source is None:
+            self._stats.skipped_no_context += 1
+            return None
+        snapshot = await source.snapshot(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        if snapshot is None:
+            self._stats.skipped_no_context += 1
+            return None
+        candles = snapshot_candles(snapshot, timeframe=timeframe)
+        orderbook = getattr(snapshot, "orderbook", None)
+        current_price = (
+            getattr(snapshot, "last_price", None)
+            or getattr(snapshot, "mark_price", None)
+            or getattr(orderbook, "mid_price", None)
+        )
+        await self._on_candles_updated({
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles": list(candles or []),
+            "current_price": current_price,
+            "source_topic": "market_state.snapshot",
+        })
+        return await self.rebuild_snapshot(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+            force=force,
+        )
+
+    async def process_market_snapshot(self, snapshot: Any) -> LiquidityMapSnapshot | None:
+        """MarketScheduler-compatible evaluator callback."""
+        if snapshot is None:
+            return None
+
+        cfg = getattr(self, "_config", None) or getattr(self, "config", None)
+        scope = getattr(snapshot, "scope", None)
+        exchange = (
+            getattr(scope, "exchange", None)
+            or getattr(snapshot, "exchange", None)
+            or getattr(cfg, "default_exchange", None)
+            or "binance"
+        )
+        market_type = (
+            getattr(scope, "market_type", None)
+            or getattr(snapshot, "market_type", None)
+            or getattr(cfg, "default_market_type", None)
+            or "usdm_futures"
+        )
+        symbol = getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None)
+        timeframe = (
+            getattr(scope, "timeframe", None)
+            or getattr(snapshot, "timeframe", None)
+            or getattr(cfg, "default_timeframe", None)
+            or "1m"
+        )
+        if not symbol:
+            return None
+        return await self.process_market_state_snapshot(
+            exchange=str(exchange),
+            market_type=str(market_type),
+            symbol=str(symbol).upper(),
+            timeframe=str(timeframe),
+        )
 
     def get_state(self) -> LiquidityState:
         try:
@@ -1915,9 +2008,15 @@ class LiquidityService:
             if event_type:
                 headers["event_type"] = event_type
 
+            strategy_payload = ensure_strategy_payload_contract(
+                payload,
+                topic=topic,
+                source=self._service_name,
+                domain="liquidity",
+            )
             return await self._event_bus.emit(
                 topic,
-                payload,
+                strategy_payload,
                 priority=priority,
                 source=self._service_name,
                 headers=headers,

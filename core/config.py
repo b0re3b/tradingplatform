@@ -257,9 +257,17 @@ class Config:
             ),
             logging=LoggingConfig(
                 level=(_get_env("LOG_LEVEL", "INFO") or "INFO").upper(),
-                json_logs=_to_bool(_get_env("LOG_JSON"), False),
-                enable_file_logging=_to_bool(_get_env("LOG_TO_FILE"), False),
-                log_dir=_get_env("LOG_DIR", str(logs_dir)) or str(logs_dir),
+                json_logs=_to_bool(_first_env("LOG_JSON", "JSON_LOGS"), False),
+                enable_file_logging=_to_bool(
+                    _first_env(
+                        "LOG_TO_FILE",
+                        "LOG_FILE_ENABLED",
+                        "ENABLE_FILE_LOGGING",
+                        "LOG_ENABLE_FILE",
+                    ),
+                    False,
+                ),
+                log_dir=_first_env("LOG_DIR", "APP_LOGS_DIR", default=str(logs_dir)) or str(logs_dir),
                 max_bytes=_to_int(_get_env("LOG_MAX_BYTES"), 10 * 1024 * 1024),
                 backup_count=_to_int(_get_env("LOG_BACKUP_COUNT"), 5),
             ),

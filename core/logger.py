@@ -273,15 +273,29 @@ def init_logger(
         return
 
     resolved_log_level = (log_level or os.getenv("LOG_LEVEL", "INFO")).upper()
+    def _env_bool(*keys: str, default: bool = False) -> bool:
+        for key in keys:
+            value = os.getenv(key)
+            if value is None or value.strip() == "":
+                continue
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return default
+
     resolved_json_logs = (
         json_logs if json_logs is not None
-        else os.getenv("LOG_JSON", "false").lower() == "true"
+        else _env_bool("LOG_JSON", "JSON_LOGS", default=False)
     )
     resolved_enable_file_logging = (
         enable_file_logging if enable_file_logging is not None
-        else os.getenv("LOG_TO_FILE", "false").lower() == "true"
+        else _env_bool(
+            "LOG_TO_FILE",
+            "LOG_FILE_ENABLED",
+            "ENABLE_FILE_LOGGING",
+            "LOG_ENABLE_FILE",
+            default=False,
+        )
     )
-    resolved_log_dir = log_dir or os.getenv("LOG_DIR", "logs")
+    resolved_log_dir = log_dir or os.getenv("LOG_DIR") or os.getenv("APP_LOGS_DIR") or "logs"
 
     config = {
         "version": 1,

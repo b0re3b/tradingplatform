@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from analytics.strategy_contract import ensure_strategy_payload_contract
 from abc import ABC, abstractmethod
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
@@ -1008,11 +1009,18 @@ class BaseSpoofingModule(ABC):
             return False
 
         try:
+            source = f"analytics.spoofing.{self.component.value}"
+            strategy_payload = ensure_strategy_payload_contract(
+                self._serialize_value(payload),
+                topic=topic,
+                source=source,
+                domain="spoofing",
+            )
             return await self.event_bus.emit(
                 topic,
-                self._serialize_value(payload),
+                strategy_payload,
                 priority=priority,
-                source=f"analytics.spoofing.{self.component.value}",
+                source=source,
                 correlation_id=correlation_id,
                 headers=headers or {},
             )
