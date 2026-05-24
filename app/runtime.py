@@ -207,6 +207,14 @@ class RuntimeSettings:
     market_scheduler_snapshot_depth: int = 50
     market_state_max_candles_per_scope: int = 12_000
 
+    # MarketIngestion -> storage bridge. Persistence itself is implemented in
+    # data.MarketIngestionService and storage.ParquetStorage; app only passes
+    # runtime configuration.
+    market_ingestion_emit_persistable_events: bool = True
+    market_ingestion_persist_trades: bool = False
+    market_ingestion_persist_orderbook_snapshots: bool = True
+    market_ingestion_suppress_batch_candle_events: bool = True
+
     strategy_preset_name: str = "scalping"
     strategy_use_required_features: bool = False
     strategy_registry_strict: bool = False
@@ -229,13 +237,17 @@ class RuntimeSettings:
     startup_warmup_persist_required: bool = True
     startup_warmup_flush_storage_before_trading: bool = True
 
-    # Startup Parquet restore. Loads locally persisted candles/funding back
-    # through MarketIngestionService before REST warmup/live WS.
+    # Startup Parquet restore. Loads locally persisted market datasets back
+    # through MarketStateRestorer -> MarketIngestionService before REST warmup/live WS.
     startup_parquet_load_enabled: bool = True
     startup_parquet_load_required: bool = False
     startup_parquet_load_days: float = 7.0
     startup_parquet_load_candles: bool = True
+    startup_parquet_load_trades: bool = False
+    startup_parquet_load_orderbook_snapshots: bool = True
     startup_parquet_load_funding: bool = True
+    startup_parquet_load_open_interest: bool = True
+    startup_parquet_load_liquidations: bool = True
     startup_parquet_load_batch_size: int = 1_000
     startup_parquet_load_evaluate_after_load: bool = True
 
@@ -341,6 +353,10 @@ class RuntimeSettings:
             market_scheduler_batch_size=max(1, env_int("MARKET_SCHEDULER_BATCH_SIZE", 100)),
             market_scheduler_snapshot_depth=max(1, env_int("MARKET_SCHEDULER_SNAPSHOT_DEPTH", 50)),
             market_state_max_candles_per_scope=max(1, env_int("MARKET_STATE_MAX_CANDLES_PER_SCOPE", 12_000)),
+            market_ingestion_emit_persistable_events=env_bool("MARKET_INGESTION_EMIT_PERSISTABLE_EVENTS", True),
+            market_ingestion_persist_trades=env_bool("MARKET_INGESTION_PERSIST_TRADES", False),
+            market_ingestion_persist_orderbook_snapshots=env_bool("MARKET_INGESTION_PERSIST_ORDERBOOK_SNAPSHOTS", True),
+            market_ingestion_suppress_batch_candle_events=env_bool("MARKET_INGESTION_SUPPRESS_BATCH_CANDLE_EVENTS", True),
 
             strategy_preset_name=env_str("STRATEGY_PRESET_NAME", "scalping"),
             strategy_use_required_features=env_bool("STRATEGY_USE_REQUIRED_FEATURES", False),
@@ -366,7 +382,11 @@ class RuntimeSettings:
             startup_parquet_load_required=env_bool("STARTUP_PARQUET_LOAD_REQUIRED", False),
             startup_parquet_load_days=max(0.0, env_float("STARTUP_PARQUET_LOAD_DAYS", env_float("STARTUP_WARMUP_DAYS", 7.0))),
             startup_parquet_load_candles=env_bool("STARTUP_PARQUET_LOAD_CANDLES", True),
+            startup_parquet_load_trades=env_bool("STARTUP_PARQUET_LOAD_TRADES", False),
+            startup_parquet_load_orderbook_snapshots=env_bool("STARTUP_PARQUET_LOAD_ORDERBOOK_SNAPSHOTS", True),
             startup_parquet_load_funding=env_bool("STARTUP_PARQUET_LOAD_FUNDING", True),
+            startup_parquet_load_open_interest=env_bool("STARTUP_PARQUET_LOAD_OPEN_INTEREST", True),
+            startup_parquet_load_liquidations=env_bool("STARTUP_PARQUET_LOAD_LIQUIDATIONS", True),
             startup_parquet_load_batch_size=max(1, env_int("STARTUP_PARQUET_LOAD_BATCH_SIZE", 1000)),
             startup_parquet_load_evaluate_after_load=env_bool("STARTUP_PARQUET_LOAD_EVALUATE_AFTER_LOAD", True),
 

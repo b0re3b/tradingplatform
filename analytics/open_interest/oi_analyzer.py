@@ -479,13 +479,48 @@ class OIAnalyzer:
         return payload
 
     async def process_market_snapshot(self, snapshot: Any) -> Any | None:
-        """MarketScheduler-compatible evaluator callback."""
+        """MarketScheduler-compatible evaluator callback.
+
+        Prefer the already supplied MarketSnapshot.  Older code re-read the
+        snapshot from an injected state source; when the scheduler passed a
+        snapshot directly but no private state source was injected, the analyzer
+        silently returned None.  This method now consumes the supplied snapshot
+        first and only falls back to process_market_state_snapshot().
+        """
         scope = getattr(snapshot, "scope", None)
+        exchange = getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or getattr(self.config, "default_exchange", "binance")
+        market_type = getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None) or getattr(self.config, "default_market_type", "usdm_futures")
+        symbol = getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None)
+        timeframe = getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or getattr(self.config, "default_timeframe", None)
+
+        domain_value = getattr(snapshot, "open_interest", None)
+        if domain_value is not None:
+            payload = _plain(domain_value)
+            if not isinstance(payload, dict):
+                payload = {"open_interest": payload}
+            payload = {
+                **dict(payload),
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "source_topic": "market_state.snapshot",
+                "source": "market_state_store",
+            }
+            for name in ("_on_open_interest_updated", "_handle_open_interest_updated", "on_open_interest_updated"):
+                method = getattr(self, name, None)
+                if callable(method):
+                    result = method(payload)
+                    if hasattr(result, "__await__"):
+                        result = await result
+                    return result
+            return payload
+
         return await self.process_market_state_snapshot(
-            exchange=getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or getattr(self.config, "default_exchange", "binance"),
-            market_type=getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None) or getattr(self.config, "default_market_type", "usdm_futures"),
-            symbol=getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None),
-            timeframe=getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or getattr(self.config, "default_timeframe", None),
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
         )
 
     # ------------------------------------------------------------------

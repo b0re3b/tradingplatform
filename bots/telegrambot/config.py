@@ -96,6 +96,56 @@ class TelegramRateLimitConfig:
 
 
 @dataclass(slots=True)
+class TelegramQueueConfig:
+    """
+    Async delivery queue config for Telegram notification layer.
+
+    EventBus handlers must not wait for Telegram HTTP, retries, or local
+    rate-limit sleeps. They enqueue work into this bounded queue and return
+    quickly; dedicated workers perform formatting and delivery.
+    """
+
+    enabled: bool = True
+    max_size: int = 1000
+    worker_count: int = 1
+    enqueue_timeout_sec: float = 0.05
+    shutdown_timeout_sec: float = 10.0
+    drain_on_stop: bool = True
+    full_policy: str = "drop_oldest"  # drop_oldest | drop_newest | block
+
+    def validate(self) -> None:
+        if self.max_size <= 0:
+            raise TelegramConfigError(
+                "Telegram queue max_size must be > 0.",
+                details={"max_size": self.max_size},
+            )
+
+        if self.worker_count <= 0:
+            raise TelegramConfigError(
+                "Telegram queue worker_count must be > 0.",
+                details={"worker_count": self.worker_count},
+            )
+
+        if self.enqueue_timeout_sec < 0:
+            raise TelegramConfigError(
+                "Telegram queue enqueue_timeout_sec must be >= 0.",
+                details={"enqueue_timeout_sec": self.enqueue_timeout_sec},
+            )
+
+        if self.shutdown_timeout_sec < 0:
+            raise TelegramConfigError(
+                "Telegram queue shutdown_timeout_sec must be >= 0.",
+                details={"shutdown_timeout_sec": self.shutdown_timeout_sec},
+            )
+
+        if self.full_policy not in {"drop_oldest", "drop_newest", "block"}:
+            raise TelegramConfigError(
+                "Telegram queue full_policy must be one of: drop_oldest, drop_newest, block.",
+                details={"full_policy": self.full_policy},
+            )
+
+
+@dataclass(slots=True)
 class TelegramTopicConfig:
     """
     Конфіг однієї Telegram topic-гілки.
@@ -194,6 +244,7 @@ class TelegramBotConfig:
     # Sub-configs.
     retry: TelegramRetryConfig = field(default_factory=TelegramRetryConfig)
     rate_limit: TelegramRateLimitConfig = field(default_factory=TelegramRateLimitConfig)
+    queue: TelegramQueueConfig = field(default_factory=TelegramQueueConfig)
 
     # Мапінг topic -> message_thread_id.
     topic_ids: dict[TelegramTopic, int] = field(default_factory=dict)
@@ -393,6 +444,33 @@ class TelegramBotConfig:
                     default=0.25,
                 ),
             ),
+            queue=TelegramQueueConfig(
+                enabled=_to_bool(
+                    os.getenv(f"{prefix}QUEUE_ENABLED"),
+                    default=True,
+                ),
+                max_size=_to_int(
+                    os.getenv(f"{prefix}QUEUE_MAX_SIZE"),
+                    default=1000,
+                ),
+                worker_count=_to_int(
+                    os.getenv(f"{prefix}QUEUE_WORKER_COUNT"),
+                    default=1,
+                ),
+                enqueue_timeout_sec=_to_float(
+                    os.getenv(f"{prefix}QUEUE_ENQUEUE_TIMEOUT_SEC"),
+                    default=0.05,
+                ),
+                shutdown_timeout_sec=_to_float(
+                    os.getenv(f"{prefix}QUEUE_SHUTDOWN_TIMEOUT_SEC"),
+                    default=10.0,
+                ),
+                drain_on_stop=_to_bool(
+                    os.getenv(f"{prefix}QUEUE_DRAIN_ON_STOP"),
+                    default=True,
+                ),
+                full_policy=os.getenv(f"{prefix}QUEUE_FULL_POLICY", "drop_oldest"),
+            ),
             topic_ids=cls.default_topic_ids(),
         )
 
@@ -492,6 +570,7 @@ class TelegramBotConfig:
 
         self.retry.validate()
         self.rate_limit.validate()
+        self.queue.validate()
 
         for topic, thread_id in self.topic_ids.items():
             if not isinstance(topic, TelegramTopic):
@@ -590,6 +669,15 @@ class TelegramBotConfig:
                 "min_interval_per_topic_sec": (
                     self.rate_limit.min_interval_per_topic_sec
                 ),
+            },
+            "queue": {
+                "enabled": self.queue.enabled,
+                "max_size": self.queue.max_size,
+                "worker_count": self.queue.worker_count,
+                "enqueue_timeout_sec": self.queue.enqueue_timeout_sec,
+                "shutdown_timeout_sec": self.queue.shutdown_timeout_sec,
+                "drain_on_stop": self.queue.drain_on_stop,
+                "full_policy": self.queue.full_policy,
             },
         }
 

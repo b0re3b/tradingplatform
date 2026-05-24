@@ -823,6 +823,37 @@ class LiquidityTradingStrategy(TradingStrategy):
             return self._unwrap_snapshot_candidate(candidate.value)
 
         if isinstance(candidate, Mapping):
+            # Try to deserialize a plain dict directly into a minimal
+            # LiquidityMapSnapshot.  analytics.liquidity.map.updated publishes a
+            # payload-safe dict, not the dataclass instance, and older code tried
+            # to call a non-existent from_event_payload() constructor here.
+            if candidate.get("current_price") is not None and candidate.get("symbol") is not None:
+                try:
+                    return LiquidityMapSnapshot(
+                        exchange=str(candidate.get("exchange") or "binance"),
+                        market_type=str(candidate.get("market_type") or "usdm_futures"),
+                        symbol=str(candidate.get("symbol") or ""),
+                        timeframe=str(candidate.get("timeframe") or "1m"),
+                        timestamp=parse_datetime(candidate.get("timestamp") or candidate.get("updated_at") or candidate.get("created_at")) or utc_now(),
+                        current_price=float(candidate.get("current_price") or candidate.get("price") or candidate.get("last_price")),
+                        active_levels=list(candidate.get("active_levels") or candidate.get("levels") or []),
+                        equal_levels=list(candidate.get("equal_levels") or []),
+                        stop_clusters=list(candidate.get("stop_clusters") or candidate.get("clusters") or []),
+                        zones=list(candidate.get("zones") or []),
+                        nearest_above_level=candidate.get("nearest_above_level"),
+                        nearest_below_level=candidate.get("nearest_below_level"),
+                        strongest_cluster_above=candidate.get("strongest_cluster_above"),
+                        strongest_cluster_below=candidate.get("strongest_cluster_below"),
+                        above_liquidity_score=float(candidate.get("above_liquidity_score") or 0.0),
+                        below_liquidity_score=float(candidate.get("below_liquidity_score") or 0.0),
+                        liquidity_pressure_score=float(candidate.get("liquidity_pressure_score") or candidate.get("pressure_score") or 0.0),
+                        bias=candidate.get("bias") or "neutral",
+                        signal=candidate.get("signal"),
+                        metadata=dict(candidate.get("metadata") or {}),
+                    )
+                except Exception:
+                    pass
+
             for key in ("snapshot", "value", "data", "payload"):
                 nested = candidate.get(key)
                 snapshot = self._unwrap_snapshot_candidate(nested)

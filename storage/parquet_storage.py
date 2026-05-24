@@ -36,6 +36,8 @@ class ParquetStorageConfig:
     root_dir: str = "data/parquet"
 
     flush_interval_seconds: float = 10.0
+    flush_job_timeout_seconds: float = 60.0
+    flush_lock_timeout_seconds: float = 0.05
     max_records_per_dataset: int = 10_000
     max_total_buffer_records: int = 100_000
 
@@ -74,11 +76,15 @@ class ParquetStorageConfig:
         enabled = bool(getattr(storage, "parquet_enabled", cls.enabled)) if storage is not None else cls.enabled
         flush_interval = float(getattr(storage, "flush_interval_seconds", cls.flush_interval_seconds)) if storage is not None else cls.flush_interval_seconds
         batch_size = int(getattr(storage, "batch_size", cls.max_records_per_dataset)) if storage is not None else cls.max_records_per_dataset
+        flush_job_timeout = float(getattr(storage, "flush_job_timeout_seconds", cls.flush_job_timeout_seconds)) if storage is not None else cls.flush_job_timeout_seconds
+        flush_lock_timeout = float(getattr(storage, "flush_lock_timeout_seconds", cls.flush_lock_timeout_seconds)) if storage is not None else cls.flush_lock_timeout_seconds
 
         return cls(
             root_dir=str(root_dir),
             enabled=enabled,
             flush_interval_seconds=flush_interval,
+            flush_job_timeout_seconds=max(flush_interval, flush_job_timeout),
+            flush_lock_timeout_seconds=max(0.0, flush_lock_timeout),
             max_records_per_dataset=max(1, batch_size),
             store_trades=bool(getattr(storage, "store_trades", cls.store_trades)) if storage is not None else cls.store_trades,
             store_closed_candles=bool(getattr(storage, "store_closed_candles", cls.store_closed_candles)) if storage is not None else cls.store_closed_candles,
@@ -102,6 +108,8 @@ class ParquetStorageMetrics:
     events_dropped: int = 0
     flush_runs: int = 0
     flush_errors: int = 0
+    flush_skipped_locked: int = 0
+    flush_cancelled: int = 0
     records_written: int = 0
     files_written: int = 0
     last_flush_at: float = 0.0
@@ -205,6 +213,8 @@ class ParquetStorage:
 
         if self._storage_config.store_trades:
             self._event_bus.subscribe("market.trade", self._on_trade)
+            self._event_bus.subscribe("market.trades.persistable", self._on_trades_event)
+            self._event_bus.subscribe("market.trades.updated", self._on_trades_event)
 
         if self._storage_config.store_orderbook_snapshots:
             self._event_bus.subscribe(
@@ -222,9 +232,19 @@ class ParquetStorage:
                 "market.open_interest.updated",
                 self._on_open_interest_updated,
             )
+            self._event_bus.subscribe(
+                "market.open_interest.persistable",
+                self._on_open_interest_event,
+            )
+            self._event_bus.subscribe(
+                "market.open_interest.snapshot",
+                self._on_open_interest_event,
+            )
 
         if self._storage_config.store_liquidations:
             self._event_bus.subscribe("market.liquidation", self._on_liquidation)
+            self._event_bus.subscribe("market.liquidations.persistable", self._on_liquidations_event)
+            self._event_bus.subscribe("market.liquidations.updated", self._on_liquidations_event)
 
         if self._storage_config.store_analytics:
             self._event_bus.subscribe("analytics.*", self._on_analytics_event)
@@ -295,7 +315,7 @@ class ParquetStorage:
 
         self._remove_flush_job()
 
-        await self.flush()
+        await self.flush(block=True)
 
         self._logger.info("ParquetStorage stopped")
 
@@ -327,7 +347,11 @@ class ParquetStorage:
             run_immediately=False,
             max_retries=1,
             retry_delay=1.0,
-            timeout=max(self._storage_config.flush_interval_seconds, 5.0),
+            timeout=max(
+                self._storage_config.flush_job_timeout_seconds,
+                self._storage_config.flush_interval_seconds * 3.0,
+                30.0,
+            ),
             allow_overlap=False,
             enabled=True,
         )
@@ -401,6 +425,30 @@ class ParquetStorage:
 
         await self._buffer_record(self.DATASET_TRADES, record)
 
+    async def _on_trades_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="market.trades.persistable")
+
+        trades = self._extract_items(payload, "trades", "items", "data.trades", "data", "snapshot.trades")
+        if not trades:
+            record = self._normalize_trade(payload, topic=topic)
+            if record is None:
+                await self._drop_event(topic, payload, reason="invalid_trades_event")
+                return
+            await self._buffer_record(self.DATASET_TRADES, record)
+            return
+
+        buffered = 0
+        for trade in trades:
+            trade_payload = self._merge_parent_scope(payload, trade)
+            record = self._normalize_trade(trade_payload, topic=topic)
+            if record is not None:
+                await self._buffer_record(self.DATASET_TRADES, record)
+                buffered += 1
+
+        if buffered <= 0:
+            await self._drop_event(topic, payload, reason="invalid_trades_batch")
+
     async def _on_orderbook_snapshot(self, event: Event | Mapping[str, Any]) -> None:
         payload = self._extract_payload(event)
         topic = self._extract_topic(event, default="market.orderbook.snapshot.persistable")
@@ -458,6 +506,38 @@ class ParquetStorage:
 
         await self._buffer_record(self.DATASET_OPEN_INTEREST, record)
 
+    async def _on_open_interest_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="market.open_interest.persistable")
+
+        items = self._extract_items(
+            payload,
+            "open_interest",
+            "open_interest_updates",
+            "items",
+            "data.open_interest",
+            "data",
+            "snapshot.open_interest",
+        )
+        if not items:
+            record = self._normalize_open_interest(payload, topic=topic)
+            if record is None:
+                await self._drop_event(topic, payload, reason="invalid_open_interest_event")
+                return
+            await self._buffer_record(self.DATASET_OPEN_INTEREST, record)
+            return
+
+        buffered = 0
+        for item in items:
+            oi_payload = self._merge_parent_scope(payload, item)
+            record = self._normalize_open_interest(oi_payload, topic=topic)
+            if record is not None:
+                await self._buffer_record(self.DATASET_OPEN_INTEREST, record)
+                buffered += 1
+
+        if buffered <= 0:
+            await self._drop_event(topic, payload, reason="invalid_open_interest_batch")
+
     async def _on_liquidation(self, event: Event | Mapping[str, Any]) -> None:
         payload = self._extract_payload(event)
         topic = self._extract_topic(event, default="market.liquidation")
@@ -468,6 +548,30 @@ class ParquetStorage:
             return
 
         await self._buffer_record(self.DATASET_LIQUIDATIONS, record)
+
+    async def _on_liquidations_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="market.liquidations.persistable")
+
+        items = self._extract_items(payload, "liquidations", "items", "data.liquidations", "data", "snapshot.liquidations")
+        if not items:
+            record = self._normalize_liquidation(payload, topic=topic)
+            if record is None:
+                await self._drop_event(topic, payload, reason="invalid_liquidations_event")
+                return
+            await self._buffer_record(self.DATASET_LIQUIDATIONS, record)
+            return
+
+        buffered = 0
+        for item in items:
+            liquidation_payload = self._merge_parent_scope(payload, item)
+            record = self._normalize_liquidation(liquidation_payload, topic=topic)
+            if record is not None:
+                await self._buffer_record(self.DATASET_LIQUIDATIONS, record)
+                buffered += 1
+
+        if buffered <= 0:
+            await self._drop_event(topic, payload, reason="invalid_liquidations_batch")
 
     async def _on_analytics_event(self, event: Event | Mapping[str, Any]) -> None:
         payload = self._extract_payload(event)
@@ -589,7 +693,7 @@ class ParquetStorage:
     # Flush
     # ------------------------------------------------------------------
 
-    async def flush(self) -> dict[str, Any]:
+    async def flush(self, *, block: bool = False) -> dict[str, Any]:
         if not self._storage_config.enabled:
             return {
                 "enabled": False,
@@ -597,7 +701,11 @@ class ParquetStorage:
                 "files_written": 0,
             }
 
-        async with self._flush_lock:
+        lock_acquired = await self._acquire_flush_lock(block=block)
+        if not lock_acquired:
+            return self._flush_skipped_result(reason="flush_already_running")
+
+        try:
             async with self._buffer_lock:
                 batches = {
                     dataset: records[:]
@@ -608,8 +716,10 @@ class ParquetStorage:
                     self._buffers[dataset].clear()
 
             return await self._write_batches(batches)
+        finally:
+            self._flush_lock.release()
 
-    async def flush_dataset(self, dataset: str) -> dict[str, Any]:
+    async def flush_dataset(self, dataset: str, *, block: bool = False) -> dict[str, Any]:
         if not self._storage_config.enabled:
             return {
                 "enabled": False,
@@ -618,7 +728,13 @@ class ParquetStorage:
                 "files_written": 0,
             }
 
-        async with self._flush_lock:
+        lock_acquired = await self._acquire_flush_lock(block=block)
+        if not lock_acquired:
+            result = self._flush_skipped_result(reason="flush_already_running")
+            result["dataset"] = dataset
+            return result
+
+        try:
             async with self._buffer_lock:
                 records = self._buffers.get(dataset, [])
                 if not records:
@@ -632,6 +748,43 @@ class ParquetStorage:
                 self._buffers[dataset].clear()
 
             return await self._write_batches(batch)
+        finally:
+            self._flush_lock.release()
+
+    async def _acquire_flush_lock(self, *, block: bool) -> bool:
+        if block:
+            await self._flush_lock.acquire()
+            return True
+
+        if self._flush_lock.locked():
+            return False
+
+        timeout = self._storage_config.flush_lock_timeout_seconds
+        if timeout <= 0:
+            # There is no acquire_nowait() for asyncio.Lock on Python 3.10.
+            # The locked() check above handles the common non-overlap path.
+            await self._flush_lock.acquire()
+            return True
+
+        try:
+            await asyncio.wait_for(self._flush_lock.acquire(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        except asyncio.CancelledError:
+            self._metrics.flush_cancelled += 1
+            self._metrics.last_error = "flush_cancelled_while_waiting_for_lock"
+            return False
+
+    def _flush_skipped_result(self, *, reason: str) -> dict[str, Any]:
+        self._metrics.flush_skipped_locked += 1
+        return {
+            "records_written": 0,
+            "files_written": 0,
+            "datasets": {},
+            "skipped": True,
+            "reason": reason,
+        }
 
     async def _write_batches(self, batches: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         if not batches:
@@ -665,6 +818,27 @@ class ParquetStorage:
             )
 
             return result
+
+        except asyncio.CancelledError:
+            self._metrics.flush_cancelled += 1
+            self._metrics.last_error = "flush_cancelled"
+
+            async with self._buffer_lock:
+                for dataset, records in batches.items():
+                    self._buffers[dataset] = records + self._buffers[dataset]
+
+            self._logger.warning(
+                "Parquet flush cancelled, records returned to buffer | datasets=%s",
+                list(batches.keys()),
+            )
+
+            return {
+                "records_written": 0,
+                "files_written": 0,
+                "error": "flush_cancelled",
+                "datasets": list(batches.keys()),
+                "cancelled": True,
+            }
 
         except Exception as exc:
             self._metrics.flush_errors += 1
@@ -1695,6 +1869,8 @@ class ParquetStorage:
             "events_dropped": self._metrics.events_dropped,
             "flush_runs": self._metrics.flush_runs,
             "flush_errors": self._metrics.flush_errors,
+            "flush_skipped_locked": self._metrics.flush_skipped_locked,
+            "flush_cancelled": self._metrics.flush_cancelled,
             "records_written": self._metrics.records_written,
             "files_written": self._metrics.files_written,
             "last_flush_at": self._metrics.last_flush_at,
@@ -1702,7 +1878,7 @@ class ParquetStorage:
         }
 
     async def force_flush(self) -> dict[str, Any]:
-        return await self.flush()
+        return await self.flush(block=True)
 
     # ------------------------------------------------------------------
     # Event helpers

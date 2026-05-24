@@ -22,6 +22,7 @@ Telegram bot notification package.
 from .client import TelegramBotClient
 from .config import (
     TelegramBotConfig,
+    TelegramQueueConfig,
     TelegramRateLimitConfig,
     TelegramRetryConfig,
     TelegramTopicConfig,
@@ -79,6 +80,7 @@ from .service import TelegramBotService
 from .state import (
     TelegramBotState,
     TelegramDeliveryStats,
+    TelegramQueueState,
     TelegramRateLimitState,
     TelegramTopicState,
 )
@@ -93,6 +95,7 @@ __all__ = [
 
     # Config
     "TelegramBotConfig",
+    "TelegramQueueConfig",
     "TelegramRetryConfig",
     "TelegramRateLimitConfig",
     "TelegramTopicConfig",
@@ -154,5 +157,6 @@ __all__ = [
     "TelegramBotState",
     "TelegramTopicState",
     "TelegramDeliveryStats",
+    "TelegramQueueState",
     "TelegramRateLimitState",
 ]

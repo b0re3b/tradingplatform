@@ -371,6 +371,109 @@ class TelegramRateLimitState:
 
 
 @dataclass(slots=True)
+class TelegramQueueState:
+    """Runtime counters for the asynchronous Telegram delivery queue."""
+
+    enabled: bool = True
+    max_size: int = 0
+    current_size: int = 0
+    max_observed_size: int = 0
+    worker_count: int = 0
+    active_workers: int = 0
+    started_at_ms: int | None = None
+    stopped_at_ms: int | None = None
+    last_enqueued_at_ms: int | None = None
+    last_dequeued_at_ms: int | None = None
+    last_dropped_at_ms: int | None = None
+    last_error_at_ms: int | None = None
+    last_error: str | None = None
+    enqueued_events: int = 0
+    dequeued_events: int = 0
+    processed_events: int = 0
+    failed_events: int = 0
+    dropped_events: int = 0
+    dropped_oldest_events: int = 0
+    enqueue_timeout_events: int = 0
+
+    def configure(self, *, enabled: bool, max_size: int, worker_count: int) -> None:
+        self.enabled = enabled
+        self.max_size = max_size
+        self.worker_count = worker_count
+
+    def mark_started(self, *, active_workers: int) -> None:
+        self.started_at_ms = _now_ms()
+        self.stopped_at_ms = None
+        self.active_workers = active_workers
+        self.last_error = None
+
+    def mark_stopped(self) -> None:
+        self.stopped_at_ms = _now_ms()
+        self.active_workers = 0
+
+    def mark_enqueued(self, *, queue_size: int) -> None:
+        self.enqueued_events += 1
+        self.current_size = max(0, queue_size)
+        self.max_observed_size = max(self.max_observed_size, self.current_size)
+        self.last_enqueued_at_ms = _now_ms()
+
+    def mark_dequeued(self, *, queue_size: int) -> None:
+        self.dequeued_events += 1
+        self.current_size = max(0, queue_size)
+        self.last_dequeued_at_ms = _now_ms()
+
+    def mark_processed(self, *, ok: bool) -> None:
+        self.processed_events += 1
+        if not ok:
+            self.failed_events += 1
+
+    def mark_dropped(self, *, reason: str, dropped_oldest: bool = False, timeout: bool = False, queue_size: int | None = None) -> None:
+        self.dropped_events += 1
+        if dropped_oldest:
+            self.dropped_oldest_events += 1
+        if timeout:
+            self.enqueue_timeout_events += 1
+        if queue_size is not None:
+            self.current_size = max(0, queue_size)
+        self.last_dropped_at_ms = _now_ms()
+        self.last_error = reason
+
+    def mark_error(self, *, error: str) -> None:
+        self.last_error = error
+        self.last_error_at_ms = _now_ms()
+
+    @property
+    def pressure(self) -> float:
+        if self.max_size <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self.current_size / self.max_size))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "max_size": self.max_size,
+            "current_size": self.current_size,
+            "max_observed_size": self.max_observed_size,
+            "pressure": self.pressure,
+            "worker_count": self.worker_count,
+            "active_workers": self.active_workers,
+            "started_at_ms": self.started_at_ms,
+            "stopped_at_ms": self.stopped_at_ms,
+            "last_enqueued_at_ms": self.last_enqueued_at_ms,
+            "last_dequeued_at_ms": self.last_dequeued_at_ms,
+            "last_dropped_at_ms": self.last_dropped_at_ms,
+            "last_error_at_ms": self.last_error_at_ms,
+            "last_error": self.last_error,
+            "enqueued_events": self.enqueued_events,
+            "dequeued_events": self.dequeued_events,
+            "processed_events": self.processed_events,
+            "failed_events": self.failed_events,
+            "dropped_events": self.dropped_events,
+            "dropped_oldest_events": self.dropped_oldest_events,
+            "enqueue_timeout_events": self.enqueue_timeout_events,
+        }
+
+
+@dataclass(slots=True)
 class TelegramBotState:
     """
     Центральний runtime state TelegramBotService.
@@ -395,6 +498,7 @@ class TelegramBotState:
     health: TelegramHealthStatus | None = None
     stats: TelegramDeliveryStats = field(default_factory=TelegramDeliveryStats)
     rate_limit: TelegramRateLimitState = field(default_factory=TelegramRateLimitState)
+    queue: TelegramQueueState = field(default_factory=TelegramQueueState)
 
     topics: dict[TelegramTopic, TelegramTopicState] = field(default_factory=dict)
 
@@ -598,6 +702,7 @@ class TelegramBotState:
             "health": self.health.to_dict() if self.health else None,
             "stats": self.stats.to_dict(),
             "rate_limit": self.rate_limit.to_dict(),
+            "queue": self.queue.to_dict(),
             "topics": {
                 topic.value: topic_state.to_dict()
                 for topic, topic_state in self.topics.items()

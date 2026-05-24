@@ -39,7 +39,7 @@ from app.runtime import (
     stop_component,
 )
 from app.universe import discover_exchange_universe
-from storage.parquet_loader import ParquetLoaderConfig, ParquetMarketLoader
+from data.market_restore import MarketRestoreConfig, MarketStateRestorer
 
 
 logger = get_logger(__name__, service="app.main", event_type="bootstrap")
@@ -145,8 +145,20 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "STARTUP_PARQUET_LOAD_REQUIRED",
         "STARTUP_PARQUET_LOAD_DAYS",
         "STARTUP_PARQUET_LOAD_CANDLES",
+        "STARTUP_PARQUET_LOAD_TRADES",
+        "STARTUP_PARQUET_LOAD_ORDERBOOK_SNAPSHOTS",
         "STARTUP_PARQUET_LOAD_FUNDING",
+        "STARTUP_PARQUET_LOAD_OPEN_INTEREST",
+        "STARTUP_PARQUET_LOAD_LIQUIDATIONS",
         "STARTUP_PARQUET_LOAD_BATCH_SIZE",
+        "MARKET_INGESTION_EMIT_PERSISTABLE_EVENTS",
+        "MARKET_INGESTION_PERSIST_TRADES",
+        "MARKET_INGESTION_PERSIST_ORDERBOOK_SNAPSHOTS",
+        "MARKET_INGESTION_SUPPRESS_BATCH_CANDLE_EVENTS",
+        "TELEGRAM_BOT_QUEUE_ENABLED",
+        "TELEGRAM_BOT_QUEUE_MAX_SIZE",
+        "TELEGRAM_BOT_QUEUE_WORKER_COUNT",
+        "TELEGRAM_BOT_QUEUE_FULL_POLICY",
         "STARTUP_PARQUET_LOAD_EVALUATE_AFTER_LOAD",
         "MARKET_STATE_MAX_CANDLES_PER_SCOPE",
         "MARKET_SCHEDULER_INTERVAL_SECONDS",
@@ -712,17 +724,38 @@ class TradingSystemRuntime:
             await asyncio.sleep(settle)
 
     async def _evaluate_market_state_once(self, *, reason: str) -> None:
-        """Run one bounded state-snapshot analytics tick if the state scheduler exists."""
+        """Drain bounded state-snapshot analytics ticks if the state scheduler exists.
+
+        A single MarketScheduler tick is intentionally bounded by batch_size.
+        During startup warmup/restores a REST batch can mark more scopes dirty
+        than that limit, so one tick can leave price_action/orderflow scopes
+        unprocessed.  Drain until the scheduler reports no snapshots or a small
+        safety limit is reached.
+        """
         if self.market_scheduler is None:
             return
         evaluate = getattr(self.market_scheduler, "evaluate_dirty_once", None)
         if not callable(evaluate):
             return
+        max_passes = max(1, int(getattr(self.settings, "startup_market_state_evaluate_max_passes", 25)))
         try:
-            result = evaluate()
-            if inspect.isawaitable(result):
-                result = await result
-            logger.debug("Market state evaluated | reason=%s result=%s", reason, result)
+            for attempt in range(max_passes):
+                result = evaluate()
+                if inspect.isawaitable(result):
+                    result = await result
+                logger.debug(
+                    "Market state evaluated | reason=%s pass=%s/%s result=%s",
+                    reason,
+                    attempt + 1,
+                    max_passes,
+                    result,
+                )
+                if not isinstance(result, dict):
+                    break
+                if result.get("skipped"):
+                    break
+                if int(result.get("snapshots") or 0) <= 0:
+                    break
         except Exception:
             logger.exception("Market state evaluation failed | reason=%s", reason)
 
@@ -762,6 +795,19 @@ class TradingSystemRuntime:
             return amount * 7 * 24 * 60 * 60_000
         return 60_000
 
+
+    def _startup_required_candles_for_timeframe(self, timeframe: str) -> int:
+        days = float(getattr(self.settings, "startup_warmup_days", 0.0) or 0.0)
+        if days <= 0:
+            return max(1, int(getattr(self.settings, "startup_warmup_kline_limit", 1500)))
+        timeframe_ms = max(1, self._timeframe_to_ms(timeframe))
+        window_ms = int(days * 24 * 60 * 60 * 1000)
+        # +2 gives a small edge buffer for inclusive/exclusive REST ranges.
+        return max(1, (window_ms + timeframe_ms - 1) // timeframe_ms + 2)
+
+    def _startup_min_acceptable_candles(self, timeframe: str) -> int:
+        required = self._startup_required_candles_for_timeframe(timeframe)
+        return max(1, int(required * 0.90))
     def _startup_warmup_start_ms(self) -> int | None:
         days = float(getattr(self.settings, "startup_warmup_days", 0.0) or 0.0)
         if days <= 0:
@@ -816,22 +862,28 @@ class TradingSystemRuntime:
         start_ms = end_ms - int(days * 24 * 60 * 60 * 1000) if days > 0 else None
         batch_size = max(1, int(getattr(self.settings, "startup_parquet_load_batch_size", 1000)))
 
-        loader = ParquetMarketLoader(
-            config=ParquetLoaderConfig(
+        restorer = MarketStateRestorer(
+            market_ingestion=self.market_ingestion,
+            market_scheduler=self.market_scheduler,
+            event_bus=self.event_bus,
+            config=MarketRestoreConfig(
                 root_dir=self._parquet_root_dir(),
                 default_exchange=self.settings.startup_warmup_exchange,
                 default_market_type=self.settings.analytics_market_type,
                 batch_size=batch_size,
-                evaluate_after_load=bool(getattr(self.settings, "startup_parquet_load_evaluate_after_load", True)),
-                emit_loader_events=True,
+                evaluate_after_restore=bool(getattr(self.settings, "startup_parquet_load_evaluate_after_load", True)),
+                restore_candles=bool(getattr(self.settings, "startup_parquet_load_candles", True)),
+                restore_trades=bool(getattr(self.settings, "startup_parquet_load_trades", False)),
+                restore_orderbook_snapshots=bool(getattr(self.settings, "startup_parquet_load_orderbook_snapshots", True)),
+                restore_funding=bool(getattr(self.settings, "startup_parquet_load_funding", True)),
+                restore_open_interest=bool(getattr(self.settings, "startup_parquet_load_open_interest", True)),
+                restore_liquidations=bool(getattr(self.settings, "startup_parquet_load_liquidations", True)),
+                suppress_persistable_on_replay=True,
             ),
-            market_ingestion=self.market_ingestion,
-            market_scheduler=self.market_scheduler,
-            event_bus=self.event_bus,
         )
 
         logger.info(
-            "Startup Parquet load started | root_dir=%s exchange=%s symbols=%s timeframes=%s days=%s start_ms=%s end_ms=%s candles=%s funding=%s batch_size=%s",
+            "Startup Parquet restore started | root_dir=%s exchange=%s symbols=%s timeframes=%s days=%s start_ms=%s end_ms=%s candles=%s trades=%s orderbook_snapshots=%s funding=%s open_interest=%s liquidations=%s batch_size=%s",
             self._parquet_root_dir(),
             self.settings.startup_warmup_exchange,
             len(symbols),
@@ -840,36 +892,38 @@ class TradingSystemRuntime:
             start_ms,
             end_ms,
             getattr(self.settings, "startup_parquet_load_candles", True),
+            getattr(self.settings, "startup_parquet_load_trades", False),
+            getattr(self.settings, "startup_parquet_load_orderbook_snapshots", True),
             getattr(self.settings, "startup_parquet_load_funding", True),
+            getattr(self.settings, "startup_parquet_load_open_interest", True),
+            getattr(self.settings, "startup_parquet_load_liquidations", True),
             batch_size,
         )
 
         try:
-            result = await loader.load_market_data_to_ingestion(
+            result = await restorer.restore(
                 exchange=self.settings.startup_warmup_exchange,
                 market_type=self.settings.analytics_market_type,
                 symbols=symbols,
                 timeframes=self._startup_warmup_timeframes(),
                 start_ms=start_ms,
                 end_ms=end_ms,
-                load_candles=bool(getattr(self.settings, "startup_parquet_load_candles", True)),
-                load_funding=bool(getattr(self.settings, "startup_parquet_load_funding", True)),
-                batch_size=batch_size,
-                evaluate_after_load=bool(getattr(self.settings, "startup_parquet_load_evaluate_after_load", True)),
-                source="startup_parquet_loader",
             )
 
-            logger.info("Startup Parquet load completed | result=%s", result)
+            result_dict = result.to_dict() if hasattr(result, "to_dict") else result
+            logger.info("Startup Parquet restore completed | result=%s", result_dict)
 
-            candles = result.get("candles", {}) if isinstance(result, dict) else {}
-            funding = result.get("funding", {}) if isinstance(result, dict) else {}
-            candle_rows = int(candles.get("rows_loaded") or 0) if isinstance(candles, dict) else 0
-            funding_rows = int(funding.get("rows_loaded") or 0) if isinstance(funding, dict) else 0
+            rows_loaded = int(getattr(result, "rows_loaded", 0) or 0)
+            candle_rows = 0
+            if hasattr(result, "datasets") and isinstance(result.datasets, dict):
+                candles = result.datasets.get("candles", {})
+                if isinstance(candles, dict):
+                    candle_rows = int(candles.get("rows_loaded") or 0)
 
             if getattr(self.settings, "startup_parquet_load_required", False) and candle_rows <= 0:
-                raise RuntimeError(f"Startup Parquet load required but no candles were loaded | result={result}")
+                raise RuntimeError(f"Startup Parquet restore required but no candles were loaded | result={result_dict}")
 
-            if candle_rows > 0 or funding_rows > 0:
+            if rows_loaded > 0:
                 await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
 
         except Exception:
@@ -919,8 +973,10 @@ class TradingSystemRuntime:
             return
 
         timeframes = self._startup_warmup_timeframes()
-        kline_limit = max(1, int(self.settings.startup_warmup_kline_limit))
-        klines_per_request = max(1, min(1500, int(getattr(self.settings, "startup_warmup_klines_per_request", kline_limit))))
+        configured_kline_limit = max(1, int(self.settings.startup_warmup_kline_limit))
+        required_kline_limits = {tf: self._startup_required_candles_for_timeframe(tf) for tf in timeframes}
+        effective_kline_limit = max([configured_kline_limit, *required_kline_limits.values()]) if required_kline_limits else configured_kline_limit
+        klines_per_request = max(1, min(1500, int(getattr(self.settings, "startup_warmup_klines_per_request", effective_kline_limit))))
         warmup_start_ms = self._startup_warmup_start_ms()
         warmup_end_ms = int(time.time() * 1000)
         funding_limit = max(1, int(self.settings.startup_warmup_funding_limit))
@@ -928,14 +984,16 @@ class TradingSystemRuntime:
         batch_size = max(1, int(self.settings.startup_warmup_batch_size))
 
         logger.info(
-            "Startup warmup started | exchange=%s symbols=%s timeframes=%s days=%s start_ms=%s end_ms=%s kline_limit=%s klines_per_request=%s funding_limit=%s concurrency=%s batch_size=%s",
+            "Startup warmup started | exchange=%s symbols=%s timeframes=%s days=%s start_ms=%s end_ms=%s configured_kline_limit=%s effective_kline_limit=%s required_by_timeframe=%s klines_per_request=%s funding_limit=%s concurrency=%s batch_size=%s",
             warmup_exchange,
             len(symbols),
             timeframes,
             getattr(self.settings, "startup_warmup_days", None),
             warmup_start_ms,
             warmup_end_ms,
-            kline_limit,
+            configured_kline_limit,
+            effective_kline_limit,
+            required_kline_limits,
             klines_per_request,
             funding_limit,
             concurrency,
@@ -962,13 +1020,14 @@ class TradingSystemRuntime:
                         candles = await rest.get_klines(
                             symbol=symbol,
                             interval=timeframe,
-                            limit=kline_limit,
+                            limit=effective_kline_limit,
                         )
                         return symbol, timeframe, len(candles or []), None
 
                     timeframe_ms = self._timeframe_to_ms(timeframe)
                     cursor_ms = warmup_start_ms
-                    max_pages = max(1, (kline_limit + klines_per_request - 1) // klines_per_request)
+                    target_limit = max(configured_kline_limit, self._startup_required_candles_for_timeframe(timeframe))
+                    max_pages = max(1, (target_limit + klines_per_request - 1) // klines_per_request)
 
                     for _ in range(max_pages):
                         if cursor_ms >= warmup_end_ms:
@@ -1048,10 +1107,12 @@ class TradingSystemRuntime:
                 return_exceptions=False,
             )
             for symbol, timeframe, count, error in results:
-                if count > 0:
+                min_required = self._startup_min_acceptable_candles(timeframe)
+                if count >= min_required:
                     kline_success += 1
                 else:
-                    kline_failed.append(f"{symbol}:{timeframe}:{error or 'empty'}")
+                    reason = error or f"insufficient_history loaded={count} min_required={min_required}"
+                    kline_failed.append(f"{symbol}:{timeframe}:{reason}")
             await self._evaluate_market_state_once(reason="startup_warmup_klines_batch")
             await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
 
@@ -1078,6 +1139,11 @@ class TradingSystemRuntime:
             if kline_jobs and kline_success <= 0:
                 raise RuntimeError(
                     "Startup warmup failed: no historical candles were loaded for price_action/liquidity"
+                )
+            if kline_failed:
+                raise RuntimeError(
+                    "Startup warmup failed: some candle scopes do not have enough history "
+                    f"for price_action/liquidity | failed_count={len(kline_failed)} examples={kline_failed[:20]}"
                 )
 
             if symbols and funding_success <= 0:

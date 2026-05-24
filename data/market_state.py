@@ -288,10 +288,25 @@ class MarketStateStore:
     async def update_open_interest(self, update: OpenInterestUpdate) -> None:
         state = await self._get_or_create_state(update.scope)
         async with self._lock_for(update.scope.symbol_key):
+            # Binance /fapi/v1/openInterest returns only the contract/base-asset
+            # amount.  Downstream OI analytics and parquet diagnostics require
+            # the same price context as funding: mark_price, index_price and an
+            # approximate notional open_interest_value.  Enrich the update from
+            # the latest state when the REST adapter did not provide those
+            # fields yet.  OpenInterestUpdate is intentionally mutable.
+            if update.mark_price is None and state.mark_price is not None:
+                update.mark_price = state.mark_price
+            if update.index_price is None and state.index_price is not None:
+                update.index_price = state.index_price
+
+            price_for_value = update.mark_price or state.mark_price or state.last_price
+            if update.open_interest_value is None and price_for_value is not None and price_for_value > 0:
+                update.open_interest_value = update.open_interest * price_for_value
+
             state.open_interest = update
             self._set_price(
                 state,
-                price=update.mark_price,
+                price=update.mark_price or state.last_price,
                 source="open_interest_mark_price",
                 mark_price=update.mark_price,
                 index_price=update.index_price,

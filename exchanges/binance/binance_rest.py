@@ -571,13 +571,41 @@ class BinanceRestClient:
                 )
                 return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "symbol_unavailable", "code": exc.code}
 
+        mark_price = None
+        index_price = None
+        premium_payload: dict[str, Any] | None = None
+        try:
+            premium_raw = await self.get_premium_index(symbol=symbol)
+            if isinstance(premium_raw, dict):
+                premium_payload = premium_raw
+                mark_price = self._safe_float(premium_raw.get("markPrice"))
+                index_price = self._safe_float(premium_raw.get("indexPrice"))
+        except Exception as exc:
+            self._logger.debug(
+                "Open interest price enrichment skipped | symbol=%s error=%r",
+                symbol,
+                exc,
+            )
+
+        oi_value = self._safe_float(payload.get("openInterest"))
+        oi_notional = oi_value * mark_price if oi_value is not None and mark_price is not None else None
+
         normalized = {
             "exchange": self.EXCHANGE,
             "market_type": "usdm_futures",
             "symbol": payload.get("symbol") or symbol,
-            "open_interest": self._safe_float(payload.get("openInterest")),
+            "open_interest": oi_value,
+            "open_interest_value": oi_notional,
+            "mark_price": mark_price,
+            "index_price": index_price,
             "time": payload.get("time"),
             "snapshot_time": self._current_timestamp_ms(),
+            "metadata": {
+                "source": "binance_futures_rest",
+                "open_interest_raw": payload,
+                "premium_index_raw": premium_payload,
+                "open_interest_value_formula": "open_interest * mark_price",
+            },
         }
 
         if self._market_ingestion is not None:

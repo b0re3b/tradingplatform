@@ -15,6 +15,7 @@ from data.dirty_registry import DirtySymbolRegistry, DirtyItem as DirtyScopeReco
 from data.market_snapshots import MarketSnapshot
 from data.market_state import MarketStateConfig, MarketStateStore
 from data.market_ingestion import MarketIngestionConfig, MarketIngestionService
+from data.market_restore import MarketRestoreConfig, MarketRestoreResult, MarketStateRestorer
 from data.market_scheduler import MarketScheduler, MarketSchedulerConfig
 from data.trades_cache import TradesCache
 from data.candles_cache import CandlesCache
@@ -43,6 +44,9 @@ __all__ = [
     "MarketStateStore",
     "MarketIngestionConfig",
     "MarketIngestionService",
+    "MarketRestoreConfig",
+    "MarketRestoreResult",
+    "MarketStateRestorer",
     "MarketScheduler",
     "MarketSchedulerConfig",
     "TradesCache",

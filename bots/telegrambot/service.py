@@ -292,6 +292,7 @@ class TelegramBotService:
                 await self.register()
 
             await self.client.start()
+            await self.handlers.start_queue_workers()
 
             health = await self.client.health_check()
             self.state.update_health(health)
@@ -353,6 +354,7 @@ class TelegramBotService:
                 priority=EventPriority.LOW,
             )
 
+            await self.handlers.stop_queue_workers()
             await self.client.close()
             self.state.mark_stopped()
 

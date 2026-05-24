@@ -472,6 +472,71 @@ class StrategyRegistry(BaseStrategyComponent):
             "started": self.is_started,
         }
 
+    def explain_selection(
+        self,
+        *,
+        context: StrategyContext,
+        categories: list[StrategyCategory] | set[StrategyCategory] | None = None,
+        changed_features: list[str] | set[str] | None = None,
+        source: FeatureSource | None = None,
+        include_disabled: bool = False,
+    ) -> dict[str, Any]:
+        """Return actionable diagnostics for strategy routing.
+
+        This method intentionally does not make trading decisions.  It mirrors
+        select() filters and explains why each registered strategy was or was
+        not routable for the supplied StrategyContext.
+        """
+        context.validate()
+        category_set = set(categories or [])
+        changed_set = set(changed_features or [])
+        candidate_names = self._candidate_names(
+            context=context,
+            categories=category_set,
+            changed_features=changed_set,
+            source=source,
+        )
+        available_features = set(getattr(context, "features", {}) or {})
+        strategy_reports: dict[str, dict[str, Any]] = {}
+        for name, strategy in sorted(self._strategies.items()):
+            required = set(strategy.required_features())
+            missing = sorted(feature for feature in required if not context.has_feature(feature))
+            reasons: list[str] = []
+            if name not in candidate_names:
+                reasons.append("not_in_candidate_set")
+            if not include_disabled and not strategy.is_enabled():
+                reasons.append("disabled")
+            if not strategy.supports_symbol(context.symbol):
+                reasons.append("symbol_not_supported")
+            if not strategy.supports_timeframe(context.timeframe):
+                reasons.append("timeframe_not_supported")
+            if not strategy.supports_regime(context.current_regime):
+                reasons.append("regime_not_supported")
+            if missing:
+                reasons.append("missing_required_features")
+            strategy_reports[name] = {
+                "category": strategy.category.value,
+                "candidate": name in candidate_names,
+                "selected": not reasons,
+                "reasons": reasons,
+                "required_features": sorted(required),
+                "missing_features": missing,
+                "available_required_features": sorted(required & available_features),
+                "priority": strategy.priority,
+            }
+        return {
+            "symbol": context.symbol,
+            "timeframe": context.timeframe.value,
+            "regime": context.current_regime.value,
+            "source": source.value if source else None,
+            "categories": sorted(category.value for category in category_set),
+            "changed_features": sorted(changed_set),
+            "candidate_count": len(candidate_names),
+            "selected_count": sum(1 for item in strategy_reports.values() if item["selected"]),
+            "available_features": sorted(available_features),
+            "strategies": strategy_reports,
+        }
+
     def _candidate_names(
         self,
         *,

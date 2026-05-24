@@ -219,6 +219,277 @@ def _ensure_scope(payload: dict[str, Any]) -> None:
         payload.setdefault("scope", scope_payload)
 
 
+
+
+# =============================================================================
+# Domain contract adapters
+# =============================================================================
+
+
+def _side_to_strategy(value: Any) -> str | None:
+    if _is_missing(value):
+        return None
+    text = str(getattr(value, "value", value)).strip().lower()
+    if text in {"buy", "long", "bull", "bullish", "up", "bid"}:
+        return "buy"
+    if text in {"sell", "short", "bear", "bearish", "down", "ask"}:
+        return "sell"
+    return text or None
+
+
+def _first_present(payload: Mapping[str, Any], *paths: str) -> Any:
+    for path in paths:
+        value = _nested_get(payload, path)
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _mapping_from(payload: Mapping[str, Any], *paths: str) -> dict[str, Any] | None:
+    for path in paths:
+        value = _nested_get(payload, path)
+        value = _to_plain(value)
+        if isinstance(value, Mapping) and value:
+            return dict(value)
+    return None
+
+
+def _set_feature(feature_map: dict[str, Any], name: str, value: Any) -> None:
+    if _is_missing(value):
+        return
+    feature_map.setdefault(name, value)
+
+
+def _set_alias(payload: dict[str, Any], canonical: str, value: Any, *aliases: str) -> None:
+    if _is_missing(value):
+        return
+    payload.setdefault(canonical, value)
+    for alias in aliases:
+        payload.setdefault(alias, value)
+
+
+def _ensure_orderflow_contract(payload: dict[str, Any]) -> None:
+    feature_map = payload.setdefault("feature_map", {})
+    if not isinstance(feature_map, dict):
+        feature_map = {}
+        payload["feature_map"] = feature_map
+
+    cvd = _mapping_from(payload, "cvd", "cumulative_volume_delta", "stats.cvd", "context.cvd") or {}
+    volume_delta = _mapping_from(payload, "volume_delta", "delta", "stats.volume_delta", "context.volume_delta") or {}
+    aggressive = _mapping_from(payload, "aggressive_trades", "aggressive", "aggression", "context.aggressive_trades") or {}
+    orderbook = _mapping_from(payload, "orderbook_imbalance", "orderbook", "imbalance", "context.orderbook_imbalance") or {}
+    signal = _mapping_from(payload, "signal", "orderflow_signal", "setup") or {}
+
+    delta_value = _first_present(payload, "volume_delta.volume_delta", "volume_delta", "delta", "stats.volume_delta", "context.volume_delta")
+    delta_ratio = _first_present(payload, "volume_delta.delta_ratio", "cvd.delta_ratio", "delta_ratio", "stats.delta_ratio", "context.delta_ratio")
+    cvd_value = _first_present(payload, "cvd.value", "cvd", "cumulative_volume_delta", "stats.cvd", "context.cvd")
+    buy_volume = _first_present(payload, "buy_volume", "stats.buy_volume", "context.buy_volume")
+    sell_volume = _first_present(payload, "sell_volume", "stats.sell_volume", "context.sell_volume")
+    total_volume = _first_present(payload, "total_volume", "volume", "stats.total_volume", "context.total_volume")
+    trades_count = _first_present(payload, "trades_count", "trades", "trade_count", "stats.trades_count", "context.trades_count")
+    last_price = _first_present(payload, "last_price", "price", "close", "mark_price", "context.last_price", "stats.last_price")
+    side = _side_to_strategy(_first_present(payload, "side", "direction", "bias", "signal.side"))
+    score = _first_present(payload, "score", "strength", "signal.score")
+    confidence = _first_present(payload, "confidence", "strength", "signal.confidence")
+
+    if cvd_value is not None:
+        cvd.setdefault("value", cvd_value)
+    if delta_ratio is not None:
+        cvd.setdefault("delta_ratio", delta_ratio)
+        volume_delta.setdefault("delta_ratio", delta_ratio)
+    if delta_value is not None:
+        volume_delta.setdefault("volume_delta", delta_value)
+        aggressive.setdefault("net_volume_delta", delta_value)
+    if buy_volume is not None:
+        aggressive.setdefault("buy_volume", buy_volume)
+    if sell_volume is not None:
+        aggressive.setdefault("sell_volume", sell_volume)
+    if side is not None:
+        signal.setdefault("side", side)
+    if score is not None:
+        signal.setdefault("score", score)
+    if confidence is not None:
+        signal.setdefault("confidence", confidence)
+    if signal:
+        signal.setdefault("detected", True)
+        signal.setdefault("type", _first_present(payload, "signal_type", "setup_type", "type") or "orderflow_signal")
+        signal.setdefault("origin", "orderflow")
+
+    composite = _mapping_from(payload, "composite", "snapshot", "orderflow_snapshot") or {}
+    if cvd:
+        composite.setdefault("cvd", cvd)
+        _set_alias(payload, "cvd", cvd, "cvd_snapshot", "cvd_metrics")
+    if volume_delta:
+        composite.setdefault("volume_delta", volume_delta)
+        _set_alias(payload, "volume_delta", volume_delta, "delta", "delta_metrics", "volume_delta_snapshot")
+    if aggressive:
+        composite.setdefault("aggressive_trades", aggressive)
+        _set_alias(payload, "aggressive_trades", aggressive, "aggressive", "aggressive_flow", "aggressive_trades_snapshot")
+    if orderbook:
+        composite.setdefault("orderbook_imbalance", orderbook)
+        _set_alias(payload, "orderbook_imbalance", orderbook, "orderbook", "imbalance", "orderbook_snapshot")
+    for key, value in {
+        "trades_count": trades_count,
+        "total_volume": total_volume,
+        "last_price": last_price,
+        "side": side,
+        "score": score,
+        "confidence": confidence,
+    }.items():
+        if value is not None:
+            composite.setdefault(key, value)
+            payload.setdefault(key, value)
+    if composite:
+        _set_alias(payload, "composite", composite, "snapshot", "orderflow_snapshot", "composite_snapshot")
+    if signal:
+        _set_alias(payload, "signal", signal, "orderflow_signal", "analytics_signal", "setup")
+
+    _set_feature(feature_map, "orderflow.composite", composite or None)
+    _set_feature(feature_map, "orderflow.cvd", cvd or None)
+    _set_feature(feature_map, "orderflow.cvd.value", cvd.get("value"))
+    _set_feature(feature_map, "orderflow.cvd.delta_ratio", cvd.get("delta_ratio"))
+    _set_feature(feature_map, "orderflow.volume_delta", volume_delta or None)
+    _set_feature(feature_map, "orderflow.volume_delta.volume_delta", volume_delta.get("volume_delta"))
+    _set_feature(feature_map, "orderflow.volume_delta.delta_ratio", volume_delta.get("delta_ratio"))
+    _set_feature(feature_map, "orderflow.aggressive_trades", aggressive or None)
+    _set_feature(feature_map, "orderflow.aggressive_trades.net_volume_delta", aggressive.get("net_volume_delta"))
+    _set_feature(feature_map, "orderflow.orderbook_imbalance", orderbook or None)
+    _set_feature(feature_map, "orderflow.trades_count", trades_count)
+    _set_feature(feature_map, "orderflow.total_volume", total_volume)
+    _set_feature(feature_map, "orderflow.last_price", last_price)
+    _set_feature(feature_map, "orderflow.signal", signal or None)
+    _set_feature(feature_map, "orderflow.signal.side", signal.get("side"))
+    _set_feature(feature_map, "orderflow.signal.score", signal.get("score"))
+    _set_feature(feature_map, "orderflow.signal.confidence", signal.get("confidence"))
+
+
+def _ensure_funding_contract(payload: dict[str, Any]) -> None:
+    feature_map = payload.setdefault("feature_map", {})
+    if not isinstance(feature_map, dict):
+        feature_map = {}; payload["feature_map"] = feature_map
+    sections = {
+        "snapshot": _mapping_from(payload, "snapshot", "funding_snapshot"),
+        "statistics": _mapping_from(payload, "statistics", "stats", "funding_statistics"),
+        "regime": _mapping_from(payload, "regime", "regime_state", "funding_regime"),
+        "pressure": _mapping_from(payload, "pressure", "pressure_state", "funding_pressure"),
+        "extreme": _mapping_from(payload, "extreme", "extreme_event", "funding_extreme"),
+        "divergence": _mapping_from(payload, "divergence", "divergence_event", "funding_divergence"),
+        "flip": _mapping_from(payload, "flip", "flip_event", "funding_flip"),
+        "signal": _mapping_from(payload, "signal", "funding_signal", "setup"),
+    }
+    if sections["snapshot"] is None:
+        flat = {k: _first_present(payload, k) for k in ("funding_rate","current_rate","next_funding_rate","predicted_rate","annualized_rate","premium_index","mark_price","index_price","next_funding_time") if _first_present(payload,k) is not None}
+        sections["snapshot"] = flat or None
+    aliases = {
+        "snapshot": ("funding_snapshot",), "statistics": ("stats","funding_statistics"), "regime": ("regime_state","funding_regime"),
+        "pressure": ("pressure_state","funding_pressure"), "extreme": ("extreme_event","funding_extreme"),
+        "divergence": ("divergence_event","funding_divergence"), "flip": ("flip_event","funding_flip"), "signal": ("funding_signal","setup"),
+    }
+    for name, section in sections.items():
+        if section:
+            if name in {"extreme","divergence","flip","signal"}:
+                section.setdefault("detected", True)
+            _set_alias(payload, name, section, *aliases[name])
+            _set_feature(feature_map, f"funding.{name}", section)
+            for field in ("type","score","confidence","bias","direction","level","severity"):
+                _set_feature(feature_map, f"funding.{name}.{field}", section.get(field))
+
+
+def _ensure_open_interest_contract(payload: dict[str, Any]) -> None:
+    feature_map = payload.setdefault("feature_map", {})
+    if not isinstance(feature_map, dict):
+        feature_map = {}; payload["feature_map"] = feature_map
+    sections = {
+        "analysis": _mapping_from(payload, "analysis", "oi_analysis", "open_interest_analysis", "result"),
+        "snapshot": _mapping_from(payload, "snapshot", "oi_snapshot", "open_interest_snapshot"),
+        "market_context": _mapping_from(payload, "market_context", "context", "oi_context", "open_interest_context"),
+        "features": _mapping_from(payload, "features", "oi_features", "open_interest_features"),
+        "regime": _mapping_from(payload, "regime", "regime_result", "oi_regime", "open_interest_regime"),
+        "divergence": _mapping_from(payload, "divergence", "divergence_result", "oi_divergence", "open_interest_divergence"),
+        "anomaly": _mapping_from(payload, "anomaly", "anomaly_result", "oi_anomaly", "open_interest_anomaly"),
+    }
+    if sections["features"] is None:
+        flat = {k: _first_present(payload, k) for k in ("oi_delta","oi_delta_pct","open_interest","open_interest_value","price_delta_pct","oi_pressure_score","volume_delta","long_short_ratio") if _first_present(payload,k) is not None}
+        sections["features"] = flat or None
+    aliases = {
+        "analysis": ("oi_analysis","open_interest_analysis","result"), "snapshot": ("oi_snapshot","open_interest_snapshot"),
+        "market_context": ("context","oi_context","open_interest_context"), "features": ("oi_features","open_interest_features"),
+        "regime": ("regime_result","oi_regime","open_interest_regime"), "divergence": ("divergence_result","oi_divergence","open_interest_divergence"),
+        "anomaly": ("anomaly_result","oi_anomaly","open_interest_anomaly"),
+    }
+    for name, section in sections.items():
+        if section:
+            if name in {"divergence","anomaly"}:
+                section.setdefault("detected", True)
+            _set_alias(payload, name, section, *aliases[name])
+            feature_prefix = "open_interest.context" if name == "market_context" else f"open_interest.{name}"
+            _set_feature(feature_map, feature_prefix, section)
+            for field in ("type","score","confidence","detected","oi_delta_pct","price_delta_pct","oi_pressure_score"):
+                _set_feature(feature_map, f"{feature_prefix}.{field}", section.get(field))
+
+
+def _ensure_liquidations_contract(payload: dict[str, Any]) -> None:
+    feature_map = payload.setdefault("feature_map", {})
+    if not isinstance(feature_map, dict):
+        feature_map = {}; payload["feature_map"] = feature_map
+    for name, aliases in {
+        "cascade": ("cascade_result", "liquidation_cascade"),
+        "exhaustion": ("exhaustion_result",),
+        "squeeze": ("squeeze_result",),
+        "cluster": ("liquidation_cluster",),
+        "signal": ("liquidation_signal", "setup"),
+    }.items():
+        section = _mapping_from(payload, name, *aliases)
+        if section is None and name in {"cascade","signal"}:
+            flat = {k: _first_present(payload, k) for k in ("confidence","intensity_score","direction","side","severity","continuation_bias","exhaustion_bias","total_notional_usd","event_count","score","confirmed") if _first_present(payload,k) is not None}
+            section = flat or None
+        if section:
+            section.setdefault("detected", True)
+            _set_alias(payload, name, section, *aliases)
+            _set_feature(feature_map, f"liquidations.{name}", section)
+            for field in ("confidence","intensity_score","direction","side","severity","continuation_bias","exhaustion_bias","score","confirmed"):
+                _set_feature(feature_map, f"liquidations.{name}.{field}", section.get(field))
+
+
+def _ensure_whales_contract(payload: dict[str, Any]) -> None:
+    feature_map = payload.setdefault("feature_map", {})
+    if not isinstance(feature_map, dict):
+        feature_map = {}; payload["feature_map"] = feature_map
+    for name, aliases in {
+        "large_trade": ("large_trade_signal", "whale_large_trade"),
+        "activity": ("whale_activity", "whale_activity_signal"),
+        "pressure": ("whale_pressure", "whale_pressure_signal"),
+        "cluster": ("whale_cluster", "whale_cluster_signal"),
+        "cluster_update": ("whale_cluster_update",),
+        "cluster_exhaustion": ("whale_cluster_exhaustion",),
+        "liquidation_context": ("whale_liquidation_context",),
+    }.items():
+        section = _mapping_from(payload, name, *aliases)
+        if section is None and name == "large_trade":
+            flat = {k: _first_present(payload, k) for k in ("side","whale_side","price","notional","total_notional","trade_count","zscore","confidence","score","reference_price") if _first_present(payload,k) is not None}
+            section = flat or None
+        if section:
+            section.setdefault("detected", True)
+            _set_alias(payload, name, section, *aliases)
+            _set_feature(feature_map, f"whales.{name}", section)
+            for field in ("side","whale_side","liquidation_side","pressure_score","context_strength","cluster_score","continuation_probability","exhaustion_probability","total_notional","trade_count","notional","zscore","reference_price","confidence","score"):
+                _set_feature(feature_map, f"whales.{field}", section.get(field))
+                _set_feature(feature_map, f"whales.{name}.{field}", section.get(field))
+
+
+def ensure_domain_strategy_contract(payload: dict[str, Any], *, topic: str | None = None, source: str | None = None, domain: str | None = None) -> None:
+    resolved = domain or _infer_domain(topic, source, payload)
+    if resolved == "orderflow":
+        _ensure_orderflow_contract(payload)
+    elif resolved == "funding":
+        _ensure_funding_contract(payload)
+    elif resolved == "open_interest":
+        _ensure_open_interest_contract(payload)
+    elif resolved == "liquidations":
+        _ensure_liquidations_contract(payload)
+    elif resolved == "whales":
+        _ensure_whales_contract(payload)
+
 def ensure_strategy_payload_contract(
     payload: Any,
     *,
@@ -240,6 +511,8 @@ def ensure_strategy_payload_contract(
     resolved_domain = domain or _infer_domain(topic, source, result)
     price, price_source = _extract_price(result)
     price_timestamp = _extract_timestamp(result)
+
+    ensure_domain_strategy_contract(result, topic=topic, source=source, domain=resolved_domain)
 
     if price is not None:
         result.setdefault("current_price", price)

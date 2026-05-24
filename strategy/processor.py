@@ -1352,6 +1352,8 @@ class SignalNormalizer(BaseStrategyComponent):
         if snapshot:
             domain_data["snapshot"] = snapshot
             domain_data.setdefault("map", snapshot)
+            domain_data.setdefault("map_snapshot", snapshot)
+            domain_data.setdefault("liquidity_map", snapshot)
         if active_levels is not None:
             domain_data.setdefault("active_levels", active_levels)
         if stop_clusters is not None:
@@ -1441,6 +1443,10 @@ class SignalNormalizer(BaseStrategyComponent):
                 ("orderflow.total_notional", "total_notional"),
                 ("orderflow.last_price", "last_price"),
                 ("orderflow.price_change_pct", "price_change_pct"),
+                ("orderflow.signal", "signal"),
+                ("orderflow.signal.side", "signal.side"),
+                ("orderflow.signal.score", "signal.score"),
+                ("orderflow.signal.confidence", "signal.confidence"),
             ),
             FeatureSource.FUNDING: (
                 ("funding.snapshot", "snapshot"),
@@ -12762,14 +12768,27 @@ class SignalRouter(BaseStrategyComponent):
         selected: list[BaseStrategy] = []
         skipped: dict[str, str] = {}
 
+        routing_diagnostics: dict[str, Any] | None = None
         if hasattr(self.registry, "select"):
             candidates = self.registry.select(
                 context=context,
                 categories=categories or None,
                 changed_features=changed_features or None,
+                source=source,
             )
         else:
             candidates = self.registry.list_all()
+
+        if not candidates and hasattr(self.registry, "explain_selection"):
+            try:
+                routing_diagnostics = self.registry.explain_selection(
+                    context=context,
+                    categories=categories or None,
+                    changed_features=changed_features or None,
+                    source=source,
+                )
+            except Exception as exc:
+                routing_diagnostics = {"error": str(exc)}
 
         for strategy in candidates:
             try:
@@ -12782,6 +12801,10 @@ class SignalRouter(BaseStrategyComponent):
 
         selected.sort(key=lambda item: (item.priority, item.strategy_name))
 
+        route_metadata = dict(metadata or {})
+        if routing_diagnostics is not None:
+            route_metadata["routing_diagnostics"] = routing_diagnostics
+
         return RouteDecision(
             event_name=event_name,
             symbol=context.symbol,
@@ -12791,7 +12814,7 @@ class SignalRouter(BaseStrategyComponent):
             skipped=skipped,
             categories_used=categories,
             matched_features=list(changed_features or []),
-            metadata=dict(metadata or {}),
+            metadata=route_metadata,
         )
 
     async def emit_signal_generated(

@@ -499,6 +499,15 @@ class LiquidationStream:
             processed += await self.process_market_state_snapshot(snapshot=snapshot)
         return processed
 
+    async def process_market_snapshot(self, snapshot: Any) -> int:
+        """MarketScheduler-compatible state-driven entrypoint.
+
+        MarketScheduler registers callbacks named process_market_snapshot().
+        LiquidationStream already had process_market_state_snapshot(), but without
+        this adapter it was easy for wiring code to skip liquidations entirely.
+        """
+        return await self.process_market_state_snapshot(snapshot=snapshot)
+
     async def process_market_state_snapshot(
         self,
         snapshot: Any | None = None,

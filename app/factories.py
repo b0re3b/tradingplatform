@@ -14,6 +14,7 @@ from data.market_state import MarketStateConfig, MarketStateStore
 from data.market_ingestion import MarketIngestionConfig, MarketIngestionService
 from data.market_scheduler import MarketScheduler, MarketSchedulerConfig
 from data.open_interest_cache import OpenInterestCache
+from data.liquidations_cache import LiquidationsCache
 from data.orderbook_cache import OrderBookCache
 from data.trades_cache import TradesCache
 from storage.parquet_storage import ParquetStorage, ParquetStorageConfig
@@ -142,13 +143,17 @@ def build_market_ingestion_service(
 ) -> MarketIngestionService:
     """Build the single write boundary for WS/REST/warmup market data."""
     ingestion_config = MarketIngestionConfig(
-        default_exchange=getattr(settings, "default_exchange", "binance") if settings is not None else "binance",
-        default_market_type=getattr(settings, "default_market_type", "usdm_futures") if settings is not None else "usdm_futures",
+        default_exchange=getattr(settings, "analytics_exchange", "binance") if settings is not None else "binance",
+        default_market_type=getattr(settings, "analytics_market_type", "usdm_futures") if settings is not None else "usdm_futures",
         default_timeframe=(
             str(getattr(settings, "timeframes", ["1m"])[0])
             if settings is not None and getattr(settings, "timeframes", None)
             else "1m"
         ),
+        emit_persistable_events=bool(getattr(settings, "market_ingestion_emit_persistable_events", True)) if settings is not None else True,
+        emit_trade_persistable_events=bool(getattr(settings, "market_ingestion_persist_trades", False)) if settings is not None else False,
+        emit_orderbook_snapshot_persistable_events=bool(getattr(settings, "market_ingestion_persist_orderbook_snapshots", True)) if settings is not None else True,
+        suppress_batch_candle_events=bool(getattr(settings, "market_ingestion_suppress_batch_candle_events", True)) if settings is not None else True,
     )
     return MarketIngestionService(
         state_store=market_state_store,
@@ -431,6 +436,7 @@ def build_data_caches(
         "candles": _construct(CandlesCache, **common),
         "funding": _construct(FundingCache, **common),
         "open_interest": _construct(OpenInterestCache, **common),
+        "liquidations": _construct(LiquidationsCache, **common),
     }
 
 
@@ -527,13 +533,22 @@ def build_analytics_components(
 
     components: list[Any] = []
 
-    def add_component(component: Any, *, evaluator_name: str | None = None) -> Any:
+    def add_component(
+        component: Any,
+        *,
+        evaluator_name: str | None = None,
+        evaluator_kwargs: dict[str, Any] | None = None,
+    ) -> Any:
         components.append(component)
         if market_scheduler is not None:
             callback = getattr(component, "process_market_snapshot", None)
             if callable(callback):
                 name = evaluator_name or f"{component.__class__.__name__}:{len(components)}"
-                market_scheduler.register_evaluator(name=name, callback=callback)
+                market_scheduler.register_evaluator(
+                    name=name,
+                    callback=callback,
+                    **(evaluator_kwargs or {}),
+                )
         return component
 
     add_component(
@@ -549,15 +564,33 @@ def build_analytics_components(
             default_timeframe=settings.orderflow_default_timeframe,
         ),
         evaluator_name="analytics.orderflow",
+        evaluator_kwargs={
+            "exchange": settings.orderflow_default_exchange,
+            "market_type": settings.orderflow_default_market_type,
+            # Trades/orderbook updates are symbol-level and usually have no
+            # candle timeframe.  OrderFlowAnalyzer still uses its default
+            # timeframe internally for rolling-window semantics.
+            "dirty_reasons": {"trade", "trades_batch", "orderbook", "orderbook_resync_required", "rest_snapshot"},
+        },
     )
 
     add_component(
         _construct(OIAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
         evaluator_name="analytics.open_interest",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"open_interest"},
+        },
     )
     add_component(
         _construct(FundingAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
         evaluator_name="analytics.funding",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"funding"},
+        },
     )
     add_component(
         _construct(
@@ -568,6 +601,11 @@ def build_analytics_components(
             market_state_store=market_state_store,
         ),
         evaluator_name="analytics.liquidations.stream",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"liquidation"},
+        },
     )
     add_component(
         _construct(
@@ -579,6 +617,11 @@ def build_analytics_components(
             market_state_store=market_state_store,
         ),
         evaluator_name="analytics.liquidity",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"candle", "candle_closed", "trade", "trades_batch", "orderbook", "orderbook_resync_required", "rest_snapshot", "warmup"},
+        },
     )
 
     for symbol in price_action_symbols:
@@ -595,6 +638,14 @@ def build_analytics_components(
                     market_state_store=market_state_store,
                 ),
                 evaluator_name=f"analytics.price_action:{symbol}:{timeframe}",
+                evaluator_kwargs={
+                    "exchange": settings.price_action_exchange,
+                    "market_type": settings.price_action_market_type,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "dirty_reasons": {"candle", "candle_closed", "warmup"},
+                    "max_snapshots_per_tick": 1,
+                },
             )
 
     add_component(
@@ -607,9 +658,30 @@ def build_analytics_components(
             market_state_store=market_state_store,
         ),
         evaluator_name="analytics.spoofing",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"orderbook", "orderbook_resync_required", "rest_snapshot"},
+        },
     )
-    add_component(_construct(SpreadAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store), evaluator_name="analytics.spreads")
-    add_component(_construct(WhaleAnalyzer, config=WhalesConfig(), event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store), evaluator_name="analytics.whales")
+    add_component(
+        _construct(SpreadAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
+        evaluator_name="analytics.spreads",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"price", "funding", "open_interest"},
+        },
+    )
+    add_component(
+        _construct(WhaleAnalyzer, config=WhalesConfig(), event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
+        evaluator_name="analytics.whales",
+        evaluator_kwargs={
+            "exchange": settings.analytics_exchange,
+            "market_type": settings.analytics_market_type,
+            "dirty_reasons": {"trade", "trades_batch", "liquidation"},
+        },
+    )
 
     return components
 

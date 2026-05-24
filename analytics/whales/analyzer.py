@@ -1,7 +1,7 @@
 from __future__ import annotations
 from core.logger import get_logger
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from core.event_bus import EventBus
@@ -783,6 +783,172 @@ class WhaleAnalyzer(BaseWhaleAnalyzerComponent):
     # =========================================================================
     # Direct input API
     # =========================================================================
+
+    async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        """MarketScheduler-compatible whale pipeline input.
+
+        Reads already-ingested trades/liquidations from MarketSnapshot and feeds
+        the existing detector/tracker direct processing APIs.  This keeps raw WS
+        data off EventBus while still allowing whales to run in the state-driven
+        scheduler path.
+        """
+        scope = getattr(snapshot, "scope", None)
+        exchange = getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or self.default_exchange
+        market_type = getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None) or self.default_market_type
+        symbol = getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None)
+        timeframe = getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or self.default_timeframe
+        exchange_symbol = getattr(scope, "exchange_symbol", None) or symbol
+
+        trades = self._market_snapshot_items(snapshot, "trades", fallback_attr="recent_trades")
+        liquidations = self._market_snapshot_items(snapshot, "liquidations")
+        result: dict[str, Any] = {
+            "trades_seen": len(trades),
+            "liquidations_seen": len(liquidations),
+            "large_trade_signals": 0,
+            "liquidation_context_signals": 0,
+        }
+
+        if trades:
+            trade_payload = {
+                "exchange": exchange,
+                "market_type": market_type,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "exchange_symbol": exchange_symbol,
+                "trades": [self._plain_market_item(item) for item in trades],
+                "source_topic": "market_state.trades",
+                "source": "market_state_store",
+            }
+            signals = await self.large_trade_detector.process_trades_payload(
+                trade_payload,
+                source_topic="market_state.trades",
+                allow_raw_payload=True,
+            )
+            result["large_trade_signals"] = len(signals or [])
+            # Feed generated large-trade signals into tracker directly as a
+            # fallback for setups where EventBus loopback is disabled/throttled.
+            for signal in signals or []:
+                payload = self._plain_market_item(signal)
+                if isinstance(payload, dict):
+                    await self.whale_tracker.process_large_trade_payload(
+                        payload,
+                        source_topic="market_state.large_trade_detector",
+                    )
+
+        for item in liquidations:
+            liq_payload = self._plain_market_item(item)
+            if not isinstance(liq_payload, dict):
+                continue
+            metadata = dict(liq_payload.get("metadata") or {})
+            liq_payload.setdefault("exchange", metadata.get("exchange") or exchange)
+            liq_payload.setdefault("market_type", metadata.get("market_type") or market_type)
+            liq_payload.setdefault("symbol", metadata.get("symbol") or symbol)
+            liq_payload.setdefault("timeframe", metadata.get("timeframe") or timeframe)
+            liq_payload.setdefault("exchange_symbol", metadata.get("exchange_symbol") or exchange_symbol)
+            liq_payload.setdefault("source_topic", "market_state.liquidations")
+            signal = await self.whale_tracker.process_liquidation_payload(
+                liq_payload,
+                source_topic="market_state.liquidations",
+                allow_raw_payload=True,
+            )
+            if signal is not None:
+                result["liquidation_context_signals"] += 1
+
+        return result
+
+
+    @staticmethod
+    def _market_snapshot_items(snapshot: Any, attr: str, *, fallback_attr: str | None = None) -> list[Any]:
+        """Return event items from MarketSnapshot-compatible containers.
+
+        MarketSnapshot.trades is a TradesWindowSnapshot, not an iterable.  The
+        actual iterable lives under `.trades`.  Other state/cache snapshots can
+        expose `.items`, `.events`, `.liquidations`, `.data`, or a `to_dict()`
+        payload.  This helper keeps the whale state-driven path compatible with
+        both dataclass snapshots and plain dict payloads.
+        """
+        candidates: list[Any] = []
+        if isinstance(snapshot, Mapping):
+            candidates.append(snapshot.get(attr))
+            if fallback_attr:
+                candidates.append(snapshot.get(fallback_attr))
+        else:
+            candidates.append(getattr(snapshot, attr, None))
+            if fallback_attr:
+                candidates.append(getattr(snapshot, fallback_attr, None))
+
+        for candidate in candidates:
+            items = WhaleAnalyzer._coerce_market_items(candidate, preferred_attr=attr)
+            if items:
+                return items
+        return []
+
+    @staticmethod
+    def _coerce_market_items(value: Any, *, preferred_attr: str | None = None) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, Mapping):
+            for key in (preferred_attr, "trades", "recent_trades", "liquidations", "items", "events", "data", "records"):
+                if not key:
+                    continue
+                if key in value:
+                    items = WhaleAnalyzer._coerce_market_items(value.get(key), preferred_attr=preferred_attr)
+                    if items:
+                        return items
+            return [dict(value)]
+
+        for key in (preferred_attr, "trades", "recent_trades", "liquidations", "items", "events", "data", "records"):
+            if not key:
+                continue
+            nested = getattr(value, key, None)
+            if nested is value:
+                continue
+            if nested is not None:
+                items = WhaleAnalyzer._coerce_market_items(nested, preferred_attr=preferred_attr)
+                if items:
+                    return items
+
+        if isinstance(value, (str, bytes, bytearray)):
+            return []
+        if isinstance(value, Iterable):
+            return list(value)
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                mapped = to_dict()
+            except Exception:
+                mapped = None
+            if mapped is not None and mapped is not value:
+                items = WhaleAnalyzer._coerce_market_items(mapped, preferred_attr=preferred_attr)
+                if items:
+                    return items
+
+        return [value]
+
+    @staticmethod
+    def _plain_market_item(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return dict(item)
+        to_dict = getattr(item, "to_dict", None)
+        if callable(to_dict):
+            try:
+                value = to_dict()
+                if isinstance(value, Mapping):
+                    return dict(value)
+                return value
+            except Exception:
+                pass
+        return {
+            "price": getattr(item, "price", None),
+            "quantity": getattr(item, "quantity", getattr(item, "qty", None)),
+            "qty": getattr(item, "qty", getattr(item, "quantity", None)),
+            "side": getattr(item, "side", None),
+            "timestamp_ms": getattr(item, "timestamp_ms", None),
+            "trade_id": getattr(item, "trade_id", None),
+            "order_id": getattr(item, "order_id", None),
+            "metadata": dict(getattr(item, "metadata", {}) or {}),
+        }
 
     async def process_trade(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from time import time
 from typing import Any
@@ -62,6 +63,16 @@ class TelegramHandlerResult:
         }
 
 
+@dataclass(slots=True, frozen=True)
+class TelegramQueuedEvent:
+    """EventBus event queued for asynchronous Telegram delivery."""
+
+    sequence: int
+    event: Event
+    event_name: str
+    enqueued_at_ms: int
+
+
 class TelegramEventHandlers:
     """
     Набір EventBus handlers для TelegramBotService.
@@ -87,6 +98,20 @@ class TelegramEventHandlers:
         self.state = state
         self._logger = get_logger(__name__)
 
+        self._queue: asyncio.Queue[TelegramQueuedEvent | None] | None = (
+            asyncio.Queue(maxsize=config.queue.max_size)
+            if config.queue.enabled
+            else None
+        )
+        self._queue_workers: list[asyncio.Task[None]] = []
+        self._queue_running: bool = False
+        self._queue_sequence: int = 0
+        self.state.queue.configure(
+            enabled=config.queue.enabled,
+            max_size=config.queue.max_size,
+            worker_count=config.queue.worker_count,
+        )
+
     async def handle_analytics_event(self, event: Event) -> None:
         await self.handle_event(event)
 
@@ -111,13 +136,88 @@ class TelegramEventHandlers:
     async def handle_system_event(self, event: Event) -> None:
         await self.handle_event(event)
 
+    async def start_queue_workers(self) -> None:
+        """Start controlled async workers used for Telegram delivery."""
+
+        if not self.config.queue.enabled or self._queue is None:
+            return
+
+        if self._queue_workers:
+            return
+
+        self._queue_running = True
+        self._queue_workers = [
+            asyncio.create_task(
+                self._queue_worker(worker_id=worker_id),
+                name=f"telegram_delivery_worker_{worker_id}",
+            )
+            for worker_id in range(self.config.queue.worker_count)
+        ]
+        self.state.queue.mark_started(active_workers=len(self._queue_workers))
+
+    async def stop_queue_workers(self) -> None:
+        """Drain or cancel Telegram delivery workers during service shutdown."""
+
+        if not self._queue_workers:
+            self.state.queue.mark_stopped()
+            return
+
+        queue = self._queue
+        self._queue_running = False
+
+        if queue is not None and self.config.queue.drain_on_stop:
+            try:
+                await asyncio.wait_for(
+                    queue.join(),
+                    timeout=self.config.queue.shutdown_timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                self.state.queue.mark_error(
+                    error="telegram queue drain timed out during shutdown",
+                )
+
+        if queue is not None and not self.config.queue.drain_on_stop:
+            while True:
+                try:
+                    dropped = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if dropped is not None:
+                    self.state.queue.mark_dropped(
+                        reason="telegram queue dropped during shutdown",
+                        queue_size=queue.qsize(),
+                    )
+                queue.task_done()
+
+        if queue is not None:
+            for _ in self._queue_workers:
+                await queue.put(None)
+
+        await asyncio.gather(*self._queue_workers, return_exceptions=True)
+        self._queue_workers.clear()
+        self.state.queue.mark_stopped()
+
     async def handle_event(self, event: Event) -> TelegramHandlerResult:
         """
-        Універсальний handler для будь-якої EventBus-події.
+        Універсальний EventBus handler.
+
+        In async-queue mode this method does not call Telegram HTTP and does not
+        sleep for rate limits. It only enqueues the event and returns quickly,
+        keeping EventBus/analytics/risk/execution workers unblocked.
         """
 
         event_name = self._event_name(event)
         self.state.mark_event_received()
+
+        if self.config.queue.enabled and self._queue is not None:
+            return await self._enqueue_event(event=event, event_name=event_name)
+
+        return await self._process_event_now(event)
+
+    async def _process_event_now(self, event: Event) -> TelegramHandlerResult:
+        """Route, format and deliver one EventBus event to Telegram."""
+
+        event_name = self._event_name(event)
 
         if not self.config.enabled:
             return self._record_skipped(
@@ -224,6 +324,136 @@ class TelegramEventHandlers:
                 topic=TelegramTopic.SYSTEM,
                 status=TelegramDeliveryStatus.FAILED,
             )
+
+    async def _enqueue_event(
+        self,
+        *,
+        event: Event,
+        event_name: str,
+    ) -> TelegramHandlerResult:
+        queue = self._queue
+        if queue is None:
+            return await self._process_event_now(event)
+
+        self._queue_sequence += 1
+        item = TelegramQueuedEvent(
+            sequence=self._queue_sequence,
+            event=event,
+            event_name=event_name,
+            enqueued_at_ms=int(time() * 1000),
+        )
+
+        try:
+            if not queue.full():
+                queue.put_nowait(item)
+                self.state.queue.mark_enqueued(queue_size=queue.qsize())
+                return self._record_queued(event_name=event_name)
+
+            policy = self.config.queue.full_policy
+
+            if policy == "drop_newest":
+                self.state.queue.mark_dropped(
+                    reason="telegram queue is full; newest event dropped",
+                    queue_size=queue.qsize(),
+                )
+                return TelegramHandlerResult(
+                    ok=False,
+                    event_name=event_name,
+                    status=TelegramDeliveryStatus.RATE_LIMITED,
+                    message_type=TelegramMessageType.SYSTEM_WARNING,
+                    topic=TelegramTopic.SYSTEM,
+                    failed_count=1,
+                    error="telegram queue is full; newest event dropped",
+                )
+
+            if policy == "drop_oldest":
+                try:
+                    dropped = queue.get_nowait()
+                    if dropped is not None:
+                        self.state.queue.mark_dropped(
+                            reason="telegram queue is full; oldest event dropped",
+                            dropped_oldest=True,
+                            queue_size=queue.qsize(),
+                        )
+                    queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+
+                queue.put_nowait(item)
+                self.state.queue.mark_enqueued(queue_size=queue.qsize())
+                return self._record_queued(event_name=event_name)
+
+            try:
+                await asyncio.wait_for(
+                    queue.put(item),
+                    timeout=self.config.queue.enqueue_timeout_sec,
+                )
+                self.state.queue.mark_enqueued(queue_size=queue.qsize())
+                return self._record_queued(event_name=event_name)
+            except asyncio.TimeoutError:
+                self.state.queue.mark_dropped(
+                    reason="telegram queue enqueue timed out",
+                    timeout=True,
+                    queue_size=queue.qsize(),
+                )
+                return TelegramHandlerResult(
+                    ok=False,
+                    event_name=event_name,
+                    status=TelegramDeliveryStatus.RATE_LIMITED,
+                    message_type=TelegramMessageType.SYSTEM_WARNING,
+                    topic=TelegramTopic.SYSTEM,
+                    failed_count=1,
+                    error="telegram queue enqueue timed out",
+                )
+
+        except Exception as exc:
+            self.state.queue.mark_error(error=str(exc))
+            self._logger.exception(
+                "Failed to enqueue Telegram event.",
+                extra={"event_name": event_name},
+            )
+            return TelegramHandlerResult(
+                ok=False,
+                event_name=event_name,
+                status=TelegramDeliveryStatus.FAILED,
+                message_type=TelegramMessageType.SYSTEM_ERROR,
+                topic=TelegramTopic.SYSTEM,
+                failed_count=1,
+                error=str(exc),
+            )
+
+    def _record_queued(self, *, event_name: str) -> TelegramHandlerResult:
+        return TelegramHandlerResult(
+            ok=True,
+            event_name=event_name,
+            status=TelegramDeliveryStatus.PENDING,
+        )
+
+    async def _queue_worker(self, *, worker_id: int) -> None:
+        queue = self._queue
+        if queue is None:
+            return
+
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    return
+
+                self.state.queue.mark_dequeued(queue_size=queue.qsize())
+                result = await self._process_event_now(item.event)
+                self.state.queue.mark_processed(ok=result.ok)
+
+            except Exception as exc:
+                self.state.queue.mark_processed(ok=False)
+                self.state.queue.mark_error(error=str(exc))
+                self._logger.exception(
+                    "Unexpected Telegram queue worker error.",
+                    extra={"worker_id": worker_id},
+                )
+            finally:
+                queue.task_done()
+
 
     async def publish_test_message(
         self,
