@@ -10,7 +10,7 @@ from core.scheduler import Scheduler
 from data.candles_cache import CandlesCache
 from data.funding_cache import FundingCache
 from data.market_stream import MarketStream
-from data.market_state import MarketStateStore
+from data.market_state import MarketStateConfig, MarketStateStore
 from data.market_ingestion import MarketIngestionConfig, MarketIngestionService
 from data.market_scheduler import MarketScheduler, MarketSchedulerConfig
 from data.open_interest_cache import OpenInterestCache
@@ -18,7 +18,7 @@ from data.orderbook_cache import OrderBookCache
 from data.trades_cache import TradesCache
 from storage.parquet_storage import ParquetStorage, ParquetStorageConfig
 
-from exchanges.binance.binance_rest import BinanceRestClient
+from exchanges.binance.binance_rest import BinanceFuturesRestClientConfig, BinanceRestClient
 from exchanges.binance.binance_ws import BinanceWebSocketClient, BinanceWebSocketClientConfig
 from exchanges.bybit.bybit_rest import BybitRestClient
 from exchanges.bybit.bybit_ws import BybitWebSocketClient
@@ -113,8 +113,23 @@ def build_market_state_store(
     scheduler: Scheduler | None = None,
     settings: RuntimeSettings | None = None,
 ) -> MarketStateStore:
-    """Build the central state-driven market data store."""
-    return MarketStateStore()
+    """Build the central state-driven market data store.
+
+    Price-action warmup can require far more than the default 2_000 candles
+    when 1m history is loaded for multiple days. Keep the state store large
+    enough for the configured startup warmup horizon.
+    """
+    max_candles = int(getattr(settings, "market_state_max_candles_per_scope", 12_000)) if settings is not None else 12_000
+    return MarketStateStore(
+        config=MarketStateConfig(
+            max_candles_per_scope=max(1, max_candles),
+            default_market_type=(
+                getattr(settings, "analytics_market_type", "usdm_futures")
+                if settings is not None
+                else "usdm_futures"
+            ),
+        )
+    )
 
 
 def build_market_ingestion_service(
@@ -155,6 +170,7 @@ def build_market_scheduler(
         enabled=True,
         interval_seconds=float(getattr(settings, "market_scheduler_interval_seconds", 1.0)) if settings is not None else 1.0,
         batch_size=int(getattr(settings, "market_scheduler_batch_size", 100)) if settings is not None else 100,
+        snapshot_depth=int(getattr(settings, "market_scheduler_snapshot_depth", 50)) if settings is not None else 50,
         run_immediately=False,
         emit_snapshot_ready_events=False,
     )
@@ -166,6 +182,54 @@ def build_market_scheduler(
     )
 
 
+def _build_binance_market_data_rest_config(
+    config: Config,
+    settings: RuntimeSettings | None,
+) -> BinanceFuturesRestClientConfig:
+    """
+    Production Binance USD-M Futures REST config for public market-data flows.
+
+    This client is used for symbol discovery, startup historical candles,
+    funding/open-interest snapshots and Parquet backfill.  It must not inherit
+    the execution/testnet REST URL, because execution may intentionally run on
+    a Binance demo/testnet account while market data must remain production.
+    """
+    rest_config = BinanceFuturesRestClientConfig.from_core_config(config)
+    rest_config.rest_url = (
+        str(getattr(settings, "binance_rest_url", "") or "https://fapi.binance.com").rstrip("/")
+        if settings is not None
+        else "https://fapi.binance.com"
+    )
+    rest_config.emit_success_events = False
+    rest_config.allow_private_read_without_credentials = True
+
+    if settings is not None:
+        rest_config.derivative_snapshot_poll_concurrency = max(
+            1,
+            int(getattr(settings, "derivative_snapshot_poll_concurrency", rest_config.derivative_snapshot_poll_concurrency)),
+        )
+        rest_config.derivative_snapshot_poll_batch_size = max(
+            1,
+            int(getattr(settings, "derivative_snapshot_poll_batch_size", rest_config.derivative_snapshot_poll_batch_size)),
+        )
+        rest_config.derivative_snapshot_poll_interval_seconds = max(
+            1.0,
+            float(getattr(settings, "derivative_snapshot_poll_interval_seconds", rest_config.derivative_snapshot_poll_interval_seconds)),
+        )
+
+    return rest_config
+
+
+def _build_binance_execution_rest_config(config: Config) -> BinanceFuturesRestClientConfig:
+    """
+    Execution Binance USD-M Futures REST config.
+
+    This intentionally follows core Config / EXCHANGE_TESTNET / credentials.
+    It is the only Binance REST client passed to execution services.
+    """
+    return BinanceFuturesRestClientConfig.from_core_config(config)
+
+
 def build_rest_clients(
     config: Config,
     event_bus: EventBus,
@@ -174,25 +238,52 @@ def build_rest_clients(
     market_ingestion: MarketIngestionService | None = None,
 ) -> dict[str, Any]:
     """
-    Build only REST clients that are enabled through RuntimeSettings/.env.
+    Build REST clients with separated responsibilities.
 
-    Market-data discovery clients follow MARKET_DATA_EXCHANGES.
-    Binance REST is also added when execution is enabled, because execution is
-    Binance USD-M Futures only in this project.
+    Binance is intentionally split into two clients:
+    - ``binance`` / ``binance_market_data``: production public market-data REST;
+    - ``binance_execution``: execution/demo/testnet REST from core Config.
+
+    This lets the system fetch real historical/live market data while keeping
+    order/account/position execution isolated on paper/demo/testnet.
     """
-    enabled = set(settings.market_data_exchanges if settings is not None else ["binance", "bybit", "okx", "mexc"])
-    if settings is not None and settings.execution_exchange == "binance":
-        enabled.add("binance")
+    enabled_market_data = set(
+        settings.market_data_exchanges
+        if settings is not None
+        else ["binance", "bybit", "okx", "mexc"]
+    )
 
     clients: dict[str, Any] = {}
-    if "binance" in enabled:
-        clients["binance"] = _construct(BinanceRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
-    if "bybit" in enabled:
+
+    if "binance" in enabled_market_data:
+        binance_market_data = _construct(
+            BinanceRestClient,
+            config=config,
+            event_bus=event_bus,
+            rest_config=_build_binance_market_data_rest_config(config, settings),
+            market_ingestion=market_ingestion,
+        )
+        # Backward-compatible canonical key used by universe discovery and warmup.
+        clients["binance"] = binance_market_data
+        clients["binance_market_data"] = binance_market_data
+
+    if settings is not None and settings.execution_exchange == "binance":
+        clients["binance_execution"] = _construct(
+            BinanceRestClient,
+            config=config,
+            event_bus=event_bus,
+            rest_config=_build_binance_execution_rest_config(config),
+            # Execution client must not write market snapshots into state.
+            market_ingestion=None,
+        )
+
+    if "bybit" in enabled_market_data:
         clients["bybit"] = _construct(BybitRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
-    if "okx" in enabled:
+    if "okx" in enabled_market_data:
         clients["okx"] = _construct(OkxRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
-    if "mexc" in enabled:
+    if "mexc" in enabled_market_data:
         clients["mexc"] = _construct(MexcRestClient, config=config, event_bus=event_bus, market_ingestion=market_ingestion)
+
     return clients
 
 

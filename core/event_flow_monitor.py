@@ -113,6 +113,8 @@ class EventFlowMonitor:
         self._counts: Counter[str] = Counter()
         self._last_counts: Counter[str] = Counter()
         self._started_at = time.time()
+        self._rejection_reasons: Counter[str] = Counter()
+        self._last_rejection_reasons: Counter[str] = Counter()
 
     async def start(self) -> None:
         if not self.config.enabled:
@@ -161,6 +163,32 @@ class EventFlowMonitor:
 
     async def _on_event(self, event: Event) -> None:
         self._counts[event.topic] += 1
+        if event.topic == "signal.rejected":
+            payload = getattr(event, "payload", None)
+            reason = "unknown"
+            if isinstance(payload, dict):
+                reason = str(payload.get("reason") or payload.get("rejection_reason") or "unknown")
+                metadata = payload.get("metadata")
+                if reason == "unknown" and isinstance(metadata, dict):
+                    reason = str(metadata.get("reason") or metadata.get("failure_stage") or "unknown")
+            self._rejection_reasons[reason] += 1
+
+    @staticmethod
+    def _topic_matches(pattern: str, topic: str) -> bool:
+        pattern = str(pattern or "").strip()
+        topic = str(topic or "").strip()
+        if not pattern:
+            return False
+        if pattern == topic:
+            return True
+        if pattern.endswith("*"):
+            return topic.startswith(pattern[:-1])
+        return False
+
+    def _count_for_pattern(self, pattern: str, counts: Counter[str]) -> int:
+        if "*" not in pattern:
+            return counts.get(pattern, 0)
+        return sum(value for topic, value in counts.items() if self._topic_matches(pattern, topic))
 
     async def _report_loop(self) -> None:
         try:
@@ -172,12 +200,26 @@ class EventFlowMonitor:
 
     async def report(self) -> dict[str, Any]:
         stats = self.event_bus.stats()
-        counts = {topic: self._counts.get(topic, 0) for topic in self.config.topics}
+        counts = {topic: self._count_for_pattern(topic, self._counts) for topic in self.config.topics}
         deltas = {
-            topic: self._counts.get(topic, 0) - self._last_counts.get(topic, 0)
+            topic: (
+                self._count_for_pattern(topic, self._counts)
+                - self._count_for_pattern(topic, self._last_counts)
+            )
             for topic in self.config.topics
         }
+        rejection_reason_counts = dict(self._rejection_reasons.most_common(20))
+        rejection_reason_deltas = {
+            reason: count - self._last_rejection_reasons.get(reason, 0)
+            for reason, count in self._rejection_reasons.items()
+        }
+        rejection_reason_deltas = {
+            reason: delta
+            for reason, delta in sorted(rejection_reason_deltas.items(), key=lambda kv: kv[1], reverse=True)[:20]
+            if delta
+        }
         self._last_counts = Counter(self._counts)
+        self._last_rejection_reasons = Counter(self._rejection_reasons)
 
         # Top-20 most-published topics from EventBus internal counters.
         # This reveals what is actually flooding the queue, even if the topic
@@ -211,6 +253,8 @@ class EventFlowMonitor:
                 "handler_errors": stats.get("handler_errors", {}),
                 "top_published": top_published,
                 "top_dropped": top_dropped,
+                "rejection_reasons": rejection_reason_counts,
+                "rejection_reason_deltas": rejection_reason_deltas,
             },
         }
 
@@ -220,7 +264,7 @@ class EventFlowMonitor:
 
         self.logger.warning(
             "Event flow monitor | queue_size=%s queue_utilization=%.2f dropped=%s failed=%s"
-            " interval_counts=%s total_counts=%s drop_reasons=%s top_published=%s top_dropped=%s handler_errors=%s",
+            " interval_counts=%s total_counts=%s drop_reasons=%s top_published=%s top_dropped=%s rejection_reason_deltas=%s handler_errors=%s",
             payload["eventbus"]["queue_size"],
             payload["eventbus"]["queue_utilization"],
             payload["eventbus"]["dropped"],
@@ -230,6 +274,7 @@ class EventFlowMonitor:
             payload["eventbus"]["drop_reasons"],
             top_published,
             top_dropped,
+            rejection_reason_deltas,
             payload["eventbus"]["handler_errors"],
         )
 

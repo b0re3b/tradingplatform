@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from collections import deque
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from core.logger import get_logger
@@ -319,33 +318,33 @@ class MarketStateStore:
     # ------------------------------------------------------------------
 
     async def snapshot(self, scope: MarketScope, *, depth: int | None = None) -> MarketSnapshot:
+        """Return a copy-on-read snapshot for the requested scope.
+
+        Internally SymbolMarketState is keyed by exchange/market_type/symbol and
+        intentionally stores ``state.scope`` without timeframe so one symbol can
+        hold several candle windows.  The returned MarketSnapshot, however, must
+        preserve the caller's requested timeframe.  MarketScheduler and analytics
+        evaluators use ``snapshot.scope.timeframe`` to decide which candle window
+        to process; returning the timeframe-less internal scope causes false
+        scope_mismatch / default-timeframe processing.
+        """
         state = await self._get_or_create_state(scope)
         async with self._lock_for(scope.symbol_key):
             snapshot = self._build_snapshot_locked(state, depth=depth)
             self._stats.snapshots_created += 1
-            return snapshot
+            return replace(snapshot, scope=scope)
 
     async def snapshots_for_dirty(self, *, limit: int | None = None, depth: int | None = None) -> list[MarketSnapshot]:
         dirty_items = await self.dirty_registry.pop_dirty(limit=limit)
         snapshots: list[MarketSnapshot] = []
         for item in dirty_items:
+            # snapshot(item.scope) now preserves the dirty scope, including
+            # timeframe for candle-driven dirty items such as 1m/15m.
             snapshot = await self.snapshot(item.scope, depth=depth)
             snapshots.append(
-                MarketSnapshot(
-                    scope=snapshot.scope,
-                    last_price=snapshot.last_price,
-                    mark_price=snapshot.mark_price,
-                    index_price=snapshot.index_price,
-                    reference_price=snapshot.reference_price,
-                    price_source=snapshot.price_source,
-                    trades=snapshot.trades,
-                    candles=snapshot.candles,
-                    orderbook=snapshot.orderbook,
-                    funding=snapshot.funding,
-                    open_interest=snapshot.open_interest,
-                    liquidations=snapshot.liquidations,
+                replace(
+                    snapshot,
                     dirty_reasons=tuple(sorted(item.reasons or snapshot.dirty_reasons)),
-                    updated_at_ms=snapshot.updated_at_ms,
                     metadata={**snapshot.metadata, "dirty": item.to_dict()},
                 )
             )

@@ -707,13 +707,20 @@ class BinanceRestClient:
             )
             return []
 
-        payload = await self._request(
-            method="GET",
-            path="/fapi/v2/balance",
-            params={"recvWindow": recv_window or self._rest_config.recv_window},
-            signed=True,
-            auth_required=True,
-        )
+        try:
+            payload = await self._request(
+                method="GET",
+                path="/fapi/v2/balance",
+                params={"recvWindow": recv_window or self._rest_config.recv_window},
+                signed=True,
+                auth_required=True,
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "get_balance timed out — returning empty snapshot | timeout_seconds=%s",
+                self._rest_config.timeout_seconds,
+            )
+            return []
 
         normalized = [
             {
@@ -783,13 +790,45 @@ class BinanceRestClient:
 
             return normalized
 
-        payload = await self._request(
-            method="GET",
-            path="/fapi/v2/account",
-            params={"recvWindow": recv_window or self._rest_config.recv_window},
-            signed=True,
-            auth_required=True,
-        )
+        try:
+            payload = await self._request(
+                method="GET",
+                path="/fapi/v2/account",
+                params={"recvWindow": recv_window or self._rest_config.recv_window},
+                signed=True,
+                auth_required=True,
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "get_account_info timed out — returning empty snapshot | timeout_seconds=%s",
+                self._rest_config.timeout_seconds,
+            )
+            normalized = {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "fee_tier": None,
+                "can_trade": None,
+                "can_deposit": None,
+                "can_withdraw": None,
+                "update_time": None,
+                "total_initial_margin": None,
+                "total_maint_margin": None,
+                "total_wallet_balance": None,
+                "total_unrealized_profit": None,
+                "total_margin_balance": None,
+                "total_position_initial_margin": None,
+                "total_open_order_initial_margin": None,
+                "total_cross_wallet_balance": None,
+                "total_cross_unrealized_pnl": None,
+                "available_balance": None,
+                "max_withdraw_amount": None,
+                "assets": [],
+                "positions": [],
+                "snapshot_time": self._current_timestamp_ms(),
+                "skipped": True,
+                "skip_reason": "timeout",
+            }
+            return normalized
 
         normalized = {
             "exchange": self.EXCHANGE,
@@ -853,13 +892,21 @@ class BinanceRestClient:
         if symbol is not None:
             params["symbol"] = symbol.upper()
 
-        payload = await self._request(
-            method="GET",
-            path="/fapi/v2/positionRisk",
-            params=params,
-            signed=True,
-            auth_required=True,
-        )
+        try:
+            payload = await self._request(
+                method="GET",
+                path="/fapi/v2/positionRisk",
+                params=params,
+                signed=True,
+                auth_required=True,
+            )
+        except asyncio.TimeoutError:
+            self._logger.warning(
+                "get_positions timed out — returning empty snapshot | symbol=%s timeout_seconds=%s",
+                symbol,
+                self._rest_config.timeout_seconds,
+            )
+            return []
 
         normalized = [
             self._normalize_position(item)

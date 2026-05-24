@@ -267,7 +267,7 @@ class LiquidityMapBiasStrategy(LiquidityTradingStrategy):
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering LiquidityMapBiasStrategy.strategy_name")
-        return "liquidity_map_bias_strategy"
+        return "liquidity_map_bias"
 
     def required_features(self) -> set[str]:
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)

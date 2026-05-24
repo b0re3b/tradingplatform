@@ -310,7 +310,7 @@ class EqualHighLowStrategy(LiquidityTradingStrategy):
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering EqualHighLowStrategy.strategy_name")
-        return "equal_high_low_strategy"
+        return "equal_high_low"
 
     def required_features(self) -> set[str]:
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)

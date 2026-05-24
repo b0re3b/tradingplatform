@@ -354,6 +354,20 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
     # -------------------------------------------------------------------------
     # liquidity
     # -------------------------------------------------------------------------
+    "liquidity_map_bias": StrategyCatalogEntry(
+        name="liquidity_map_bias",
+        category=StrategyCategory.LIQUIDITY,
+        default_timeframes=TF_SCALP_INTRADAY,
+        weight=0.96,
+        priority=36,
+        tags=("liquidity", "map", "bias", "continuation", "futures"),
+        feature_hints=(
+            "liquidity.snapshot",
+            "liquidity.map.snapshot",
+            "liquidity.bias",
+            "liquidity.pressure_score",
+        ),
+    ),
     "liquidity_sweep": StrategyCatalogEntry(
         name="liquidity_sweep",
         category=StrategyCategory.LIQUIDITY,
@@ -842,6 +856,7 @@ OPEN_INTEREST_STRATEGIES: StrategyNames = (
 )
 
 LIQUIDITY_STRATEGIES: StrategyNames = (
+    "liquidity_map_bias",
     "liquidity_sweep",
     "stop_hunt_reversal",
     "equal_high_low",
@@ -1406,7 +1421,16 @@ def _definition_from_catalog(
         name=entry.name,
         category=entry.category,
         runtime=runtime,
-        required_features=set(entry.feature_hints) if use_required_features else set(),
+        # Catalog feature_hints are routing/debug hints, not hard gates.
+        # Concrete strategy classes already expose their production required_features()
+        # using normalized StrategyContext feature names (for example
+        # "liquidity.snapshot", "orderflow.volume_delta.delta_ratio").
+        #
+        # Keeping catalog hints as hard required features breaks routing for every
+        # domain when STRATEGY_USE_REQUIRED_FEATURES=true because most catalog
+        # hints are semantic labels ("liquidity_sweep", "funding_rate",
+        # "whale_breakout") rather than normalized FeatureSnapshot keys.
+        required_features=set(),
         weight=entry.weight * weight_multiplier,
         priority=max(0, entry.priority + priority_offset),
         tags=tags,

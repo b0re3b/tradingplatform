@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from app.runtime import (
     stop_component,
 )
 from app.universe import discover_exchange_universe
+from storage.parquet_loader import ParquetLoaderConfig, ParquetMarketLoader
 
 
 logger = get_logger(__name__, service="app.main", event_type="bootstrap")
@@ -139,6 +141,17 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "STARTUP_WARMUP_PERSIST_ENABLED",
         "STARTUP_WARMUP_PERSIST_REQUIRED",
         "STARTUP_WARMUP_FLUSH_STORAGE_BEFORE_TRADING",
+        "STARTUP_PARQUET_LOAD_ENABLED",
+        "STARTUP_PARQUET_LOAD_REQUIRED",
+        "STARTUP_PARQUET_LOAD_DAYS",
+        "STARTUP_PARQUET_LOAD_CANDLES",
+        "STARTUP_PARQUET_LOAD_FUNDING",
+        "STARTUP_PARQUET_LOAD_BATCH_SIZE",
+        "STARTUP_PARQUET_LOAD_EVALUATE_AFTER_LOAD",
+        "MARKET_STATE_MAX_CANDLES_PER_SCOPE",
+        "MARKET_SCHEDULER_INTERVAL_SECONDS",
+        "MARKET_SCHEDULER_BATCH_SIZE",
+        "MARKET_SCHEDULER_SNAPSHOT_DEPTH",
         "STORAGE_PARQUET_ENABLED",
         "STORAGE_PARQUET_DIR",
         "STORAGE_FLUSH_INTERVAL_SECONDS",
@@ -249,43 +262,65 @@ class TradingSystemRuntime:
         await self._event_flow_monitor.start()
         await self.scheduler.start()
 
-        # State-driven market-data foundation. REST/WS adapters write through
-        # MarketIngestionService instead of emitting high-frequency raw market.*
-        # events to EventBus. Analytics reads snapshots via MarketScheduler.
-        self.market_state_store = build_market_state_store(
+        # ------------------------------------------------------------------
+        # State-driven market-data foundation
+        # ------------------------------------------------------------------
+        # Use local non-null variables so type-checkers know these objects exist.
+        # Instance attributes stay Optional because they are lifecycle-managed.
+        market_state_store = build_market_state_store(
             self.config,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
             settings=self.settings,
         )
-        self.market_ingestion = build_market_ingestion_service(
-            config=self.config,
-            event_bus=self.event_bus,
-            scheduler=self.scheduler,
-            market_state_store=self.market_state_store,
-            settings=self.settings,
-        )
-        self.market_scheduler = build_market_scheduler(
-            config=self.config,
-            event_bus=self.event_bus,
-            scheduler=self.scheduler,
-            market_state_store=self.market_state_store,
-            settings=self.settings,
-        )
+        self.market_state_store = market_state_store
 
-        # REST clients first: needed for discovery, warmup and Binance execution.
+        market_ingestion = build_market_ingestion_service(
+            config=self.config,
+            event_bus=self.event_bus,
+            scheduler=self.scheduler,
+            market_state_store=market_state_store,
+            settings=self.settings,
+        )
+        self.market_ingestion = market_ingestion
+
+        market_scheduler = build_market_scheduler(
+            config=self.config,
+            event_bus=self.event_bus,
+            scheduler=self.scheduler,
+            market_state_store=market_state_store,
+            settings=self.settings,
+        )
+        self.market_scheduler = market_scheduler
+
+        # ------------------------------------------------------------------
+        # REST clients
+        # ------------------------------------------------------------------
+        # Needed for:
+        # - production market-data discovery/warmup/derivative snapshots;
+        # - separated Binance execution/testnet client.
         self.rest_clients = build_rest_clients(
             self.config,
             self.event_bus,
             self.scheduler,
             self.settings,
-            market_ingestion=self.market_ingestion,
+            market_ingestion=market_ingestion,
         )
-        for rest in self.rest_clients.values():
+
+        for rest in self._unique_components(self.rest_clients.values()):
             await register_component(rest)
             await start_component(rest)
 
-        universe = await discover_exchange_universe(self.rest_clients, self.settings)
+        # Optional but strongly recommended diagnostic after responsibility split.
+        # Add this helper to TradingSystemRuntime, or comment this call if not added.
+        log_rest_roles = getattr(self, "_log_rest_client_roles", None)
+        if callable(log_rest_roles):
+            log_rest_roles()
+
+        universe = await discover_exchange_universe(
+            self._market_data_rest_clients(),
+            self.settings,
+        )
         logger.info(
             "Universe discovered | binance=%s bybit=%s okx=%s mexc=%s canonical=%s",
             len(universe.binance),
@@ -295,6 +330,9 @@ class TradingSystemRuntime:
             len(universe.all_canonical_symbols()),
         )
 
+        # ------------------------------------------------------------------
+        # Market data infrastructure
+        # ------------------------------------------------------------------
         if self.settings.enable_market_data:
             self.ws_clients = build_exchange_ws_clients(
                 config=self.config,
@@ -302,14 +340,15 @@ class TradingSystemRuntime:
                 scheduler=self.scheduler,
                 universe=universe,
                 settings=self.settings,
-                market_ingestion=self.market_ingestion,
+                market_ingestion=market_ingestion,
             )
+
             self.caches = build_data_caches(
                 self.config,
                 self.event_bus,
                 self.scheduler,
-                market_state_store=self.market_state_store,
-                market_ingestion=self.market_ingestion,
+                market_state_store=market_state_store,
+                market_ingestion=market_ingestion,
             )
 
             if self.settings.startup_warmup_persist_enabled:
@@ -318,12 +357,14 @@ class TradingSystemRuntime:
                     self.event_bus,
                     self.scheduler,
                 )
+
                 # Append storage before market_stream so shutdown happens in reverse:
                 # analytics/execution -> market_stream -> parquet final flush.
                 self.components.append(self.parquet_storage)
                 await register_component(self.parquet_storage)
                 await start_component(self.parquet_storage)
                 self._validate_startup_storage_ready()
+
             elif self.settings.startup_warmup_persist_required and self._startup_warmup_enabled():
                 raise RuntimeError(
                     "STARTUP_WARMUP_PERSIST_REQUIRED=true but STARTUP_WARMUP_PERSIST_ENABLED=false"
@@ -335,20 +376,21 @@ class TradingSystemRuntime:
                 scheduler=self.scheduler,
                 exchange_clients=self.ws_clients,
                 caches=self.caches,
-                market_state_store=self.market_state_store,
-                market_ingestion=self.market_ingestion,
-                market_scheduler=self.market_scheduler,
+                market_state_store=market_state_store,
+                market_ingestion=market_ingestion,
+                market_scheduler=market_scheduler,
             )
             self._market_stream = market_stream
             self.components.append(market_stream)
 
-            # Register caches now, but intentionally do not start WS clients yet.
-            # Historical REST warmup must populate caches/analytics before live
-            # market-data events and before strategy/risk/execution are started.
-            # ParquetStorage is already registered at this point, so every closed
-            # warmup candle emitted by CandlesCache is persisted.
+            # Register market stream now, but intentionally do not start WS clients yet.
+            # Historical REST warmup must populate state/analytics before live market
+            # events and before strategy/risk/execution are started.
             await register_component(market_stream)
 
+        # ------------------------------------------------------------------
+        # Analytics + startup history
+        # ------------------------------------------------------------------
         if self.settings.enable_analytics:
             analytics_components = build_analytics_components(
                 config=self.config,
@@ -357,35 +399,26 @@ class TradingSystemRuntime:
                 caches=self.caches,
                 universe=universe,
                 settings=self.settings,
-                market_state_store=self.market_state_store,
-                market_scheduler=self.market_scheduler,
+                market_state_store=market_state_store,
+                market_scheduler=market_scheduler,
             )
+
             for component in analytics_components:
-                # Components that have start() call register() internally (e.g.
-                # FundingAnalyzer, WhaleAnalyzer, SpreadAnalyzer, LiquidationStream,
-                # LiquidityService, OrderFlowAnalyzer).
-                # Components that only have register() (e.g. OIAnalyzer,
-                # PriceActionAnalyzer, SpoofingAnalyzer) are handled by
-                # _start_analytics_component() which falls back to register()
-                # so they actually subscribe to EventBus topics and start
-                # scheduler jobs instead of silently doing nothing.
                 self.components.append(component)
                 await _start_analytics_component(component)
 
-            # Start snapshot evaluation before warmup so REST warmup data written
-            # into MarketStateStore can immediately feed analytics, while
-            # strategy/risk/execution are still not running.
-            if self.market_scheduler is not None:
-                await start_component(self.market_scheduler)
+            # Start snapshot evaluation before warmup so REST/Parquet data written
+            # into MarketStateStore can immediately feed analytics.
+            await start_component(market_scheduler)
 
+            # Restore local Parquet history first, then REST warmup fills the
+            # missing/fresh tail from Binance before strategy/risk/execution start.
+            await self._load_startup_parquet_history(universe)
             await self._run_startup_warmup(universe)
 
-            # Live market publishers are intentionally started later, after
-            # strategy/risk/execution/Telegram consumers are subscribed. Warmup
-            # can safely run here because it uses REST and cache/analytics state,
-            # while live WS and derivative polling must not race ahead of the
-            # trading pipeline.
-
+        # ------------------------------------------------------------------
+        # Strategy
+        # ------------------------------------------------------------------
         if self.settings.enable_strategy:
             strategy_engine = build_strategy_engine(
                 event_bus=self.event_bus,
@@ -396,22 +429,35 @@ class TradingSystemRuntime:
             self.components.append(strategy_engine)
             await start_component(strategy_engine)
 
+        # ------------------------------------------------------------------
+        # Risk
+        # ------------------------------------------------------------------
         if self.settings.enable_risk:
             risk_manager = build_risk_manager(self.event_bus, self.scheduler)
             self.components.append(risk_manager)
             await start_component(risk_manager)
 
+        # ------------------------------------------------------------------
+        # Execution
+        # ------------------------------------------------------------------
         if self.settings.enable_execution:
+            # Must return binance_execution only. Do not allow fallback to market-data REST.
+            execution_rest = self._execution_rest_client("binance")
+
             execution_components = build_execution_components(
                 event_bus=self.event_bus,
                 scheduler=self.scheduler,
-                binance_rest=self.rest_clients["binance"],
+                binance_rest=execution_rest,
                 settings=self.settings,
             )
+
             for component in execution_components:
                 self.components.append(component)
                 await start_component(component)
 
+        # ------------------------------------------------------------------
+        # Telegram observer
+        # ------------------------------------------------------------------
         if self.settings.enable_telegram:
             self.telegram = build_telegram_service(self.event_bus, self.scheduler)
             if self.telegram is not None:
@@ -425,20 +471,24 @@ class TradingSystemRuntime:
                     ),
                 )
 
-        # Start live market-data publishers only after the consumers that depend
-        # on them are already active: strategy, risk, execution and Telegram.
-        # This prevents live analytics events from being emitted before the
-        # trading pipeline can observe/reject/build them.
+        # ------------------------------------------------------------------
+        # Live market data
+        # ------------------------------------------------------------------
+        # Start live market-data publishers only after consumers are active.
         if self._market_stream is not None:
             await start_component(self._market_stream)
             self._verify_liquidation_ws_capability()
 
-        # Binance USD-M open interest/funding are REST snapshot endpoints. Start
-        # polling after live consumers are subscribed, but before independent
-        # news, so derivative analytics can feed strategy immediately.
+        # ------------------------------------------------------------------
+        # Derivative snapshots
+        # ------------------------------------------------------------------
+        # Binance USD-M open interest/funding are REST snapshot endpoints.
         if self.settings.enable_analytics:
             self._start_derivative_snapshot_polling(universe)
 
+        # ------------------------------------------------------------------
+        # News
+        # ------------------------------------------------------------------
         if self.settings.enable_news:
             self.news_service = build_news_service(self.event_bus, self.scheduler)
             self.components.append(self.news_service)
@@ -455,6 +505,7 @@ class TradingSystemRuntime:
             },
             source="app.main",
         )
+
         self._started = True
 
     def _startup_warmup_enabled(self) -> bool:
@@ -477,6 +528,59 @@ class TradingSystemRuntime:
                 continue
             seen.add(timeframe)
             result.append(timeframe)
+        return result
+
+
+    @staticmethod
+    def _unique_components(components: Any) -> list[Any]:
+        """Return unique object instances while preserving insertion order."""
+        unique: list[Any] = []
+        seen_ids: set[int] = set()
+        for component in components:
+            ident = id(component)
+            if ident in seen_ids:
+                continue
+            seen_ids.add(ident)
+            unique.append(component)
+        return unique
+
+    def _market_data_rest_client(self, exchange: str) -> Any | None:
+        """Return the REST client that is allowed to fetch production market data."""
+        exchange = str(exchange).lower()
+        if exchange == "binance":
+            return self.rest_clients.get("binance_market_data") or self.rest_clients.get("binance")
+        return self.rest_clients.get(exchange)
+
+    def _execution_rest_client(self, exchange: str) -> Any:
+        """Return the REST client that is allowed to touch execution/account endpoints."""
+        exchange = str(exchange).lower()
+
+        if exchange == "binance":
+            client = self.rest_clients.get("binance_execution")
+            if client is None:
+                available = sorted(self.rest_clients.keys())
+                raise RuntimeError(
+                    "Binance execution REST client is missing. "
+                    "Execution must not fall back to market-data REST client. "
+                    f"Available REST clients: {available}"
+                )
+            return client
+
+        client = self.rest_clients.get(exchange)
+        if client is None:
+            available = sorted(self.rest_clients.keys())
+            raise RuntimeError(
+                f"Execution REST client is missing | exchange={exchange} available={available}"
+            )
+        return client
+
+    def _market_data_rest_clients(self) -> dict[str, Any]:
+        """Mapping expected by universe discovery: exchange name -> market-data REST client."""
+        result: dict[str, Any] = {}
+        for exchange in self.settings.market_data_exchanges:
+            client = self._market_data_rest_client(exchange)
+            if client is not None:
+                result[str(exchange).lower()] = client
         return result
 
     def _validate_startup_storage_ready(self) -> None:
@@ -622,6 +726,157 @@ class TradingSystemRuntime:
         except Exception:
             logger.exception("Market state evaluation failed | reason=%s", reason)
 
+    @staticmethod
+    def _timeframe_to_ms(timeframe: str) -> int:
+        value = str(timeframe or "1m").strip().lower()
+        aliases = {
+            "1": "1m",
+            "3": "3m",
+            "5": "5m",
+            "15": "15m",
+            "30": "30m",
+            "60": "1h",
+            "min1": "1m",
+            "min5": "5m",
+            "min15": "15m",
+            "hour1": "1h",
+            "day1": "1d",
+        }
+        value = aliases.get(value, value)
+        if len(value) < 2:
+            return 60_000
+
+        unit = value[-1]
+        try:
+            amount = int(value[:-1])
+        except ValueError:
+            return 60_000
+
+        if unit == "m":
+            return amount * 60_000
+        if unit == "h":
+            return amount * 60 * 60_000
+        if unit == "d":
+            return amount * 24 * 60 * 60_000
+        if unit == "w":
+            return amount * 7 * 24 * 60 * 60_000
+        return 60_000
+
+    def _startup_warmup_start_ms(self) -> int | None:
+        days = float(getattr(self.settings, "startup_warmup_days", 0.0) or 0.0)
+        if days <= 0:
+            return None
+        return int(time.time() * 1000) - int(days * 24 * 60 * 60 * 1000)
+
+    def _startup_parquet_load_enabled(self) -> bool:
+        return (
+            bool(getattr(self.settings, "startup_parquet_load_enabled", True))
+            and self.settings.enable_market_data
+            and self.settings.enable_analytics
+            and self.market_ingestion is not None
+        )
+
+    def _parquet_root_dir(self) -> str:
+        storage = getattr(self.config, "storage", None)
+        root_dir = getattr(storage, "parquet_dir", None)
+        if root_dir is None:
+            root_dir = getattr(storage, "data_dir", None)
+        if root_dir is None:
+            app = getattr(self.config, "app", None)
+            data_dir = getattr(app, "data_dir", None)
+            if data_dir is not None:
+                root_dir = str(Path(data_dir) / "parquet")
+        return str(root_dir or "data/parquet")
+
+    async def _load_startup_parquet_history(self, universe: Any) -> None:
+        """Load persisted candles/funding back into MarketStateStore before REST/live data."""
+        if not self._startup_parquet_load_enabled():
+            logger.info(
+                "Startup Parquet load skipped | enabled=%s market_data=%s analytics=%s ingestion=%s",
+                getattr(self.settings, "startup_parquet_load_enabled", None),
+                self.settings.enable_market_data,
+                self.settings.enable_analytics,
+                self.market_ingestion is not None,
+            )
+            return
+
+        symbols = self._derivative_snapshot_symbols(
+            universe,
+            exchange=self.settings.startup_warmup_exchange,
+        )
+        if not symbols:
+            message = "Startup Parquet load skipped: universe is empty"
+            if getattr(self.settings, "startup_parquet_load_required", False):
+                raise RuntimeError(message)
+            logger.warning(message)
+            return
+
+        days = float(getattr(self.settings, "startup_parquet_load_days", 7.0) or 0.0)
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - int(days * 24 * 60 * 60 * 1000) if days > 0 else None
+        batch_size = max(1, int(getattr(self.settings, "startup_parquet_load_batch_size", 1000)))
+
+        loader = ParquetMarketLoader(
+            config=ParquetLoaderConfig(
+                root_dir=self._parquet_root_dir(),
+                default_exchange=self.settings.startup_warmup_exchange,
+                default_market_type=self.settings.analytics_market_type,
+                batch_size=batch_size,
+                evaluate_after_load=bool(getattr(self.settings, "startup_parquet_load_evaluate_after_load", True)),
+                emit_loader_events=True,
+            ),
+            market_ingestion=self.market_ingestion,
+            market_scheduler=self.market_scheduler,
+            event_bus=self.event_bus,
+        )
+
+        logger.info(
+            "Startup Parquet load started | root_dir=%s exchange=%s symbols=%s timeframes=%s days=%s start_ms=%s end_ms=%s candles=%s funding=%s batch_size=%s",
+            self._parquet_root_dir(),
+            self.settings.startup_warmup_exchange,
+            len(symbols),
+            self._startup_warmup_timeframes(),
+            days,
+            start_ms,
+            end_ms,
+            getattr(self.settings, "startup_parquet_load_candles", True),
+            getattr(self.settings, "startup_parquet_load_funding", True),
+            batch_size,
+        )
+
+        try:
+            result = await loader.load_market_data_to_ingestion(
+                exchange=self.settings.startup_warmup_exchange,
+                market_type=self.settings.analytics_market_type,
+                symbols=symbols,
+                timeframes=self._startup_warmup_timeframes(),
+                start_ms=start_ms,
+                end_ms=end_ms,
+                load_candles=bool(getattr(self.settings, "startup_parquet_load_candles", True)),
+                load_funding=bool(getattr(self.settings, "startup_parquet_load_funding", True)),
+                batch_size=batch_size,
+                evaluate_after_load=bool(getattr(self.settings, "startup_parquet_load_evaluate_after_load", True)),
+                source="startup_parquet_loader",
+            )
+
+            logger.info("Startup Parquet load completed | result=%s", result)
+
+            candles = result.get("candles", {}) if isinstance(result, dict) else {}
+            funding = result.get("funding", {}) if isinstance(result, dict) else {}
+            candle_rows = int(candles.get("rows_loaded") or 0) if isinstance(candles, dict) else 0
+            funding_rows = int(funding.get("rows_loaded") or 0) if isinstance(funding, dict) else 0
+
+            if getattr(self.settings, "startup_parquet_load_required", False) and candle_rows <= 0:
+                raise RuntimeError(f"Startup Parquet load required but no candles were loaded | result={result}")
+
+            if candle_rows > 0 or funding_rows > 0:
+                await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
+
+        except Exception:
+            if getattr(self.settings, "startup_parquet_load_required", False):
+                raise
+            logger.exception("Startup Parquet load failed; continuing with REST warmup")
+
     async def _run_startup_warmup(self, universe: Any) -> None:
         """
         Load the minimum historical context required by analytics before the
@@ -647,7 +902,7 @@ class TradingSystemRuntime:
             return
 
         warmup_exchange = self.settings.startup_warmup_exchange
-        rest = self.rest_clients.get(warmup_exchange)
+        rest = self._market_data_rest_client(warmup_exchange)
         if rest is None:
             message = f"Startup warmup cannot run: {warmup_exchange} REST client is missing"
             if self.settings.startup_warmup_required:
@@ -665,16 +920,23 @@ class TradingSystemRuntime:
 
         timeframes = self._startup_warmup_timeframes()
         kline_limit = max(1, int(self.settings.startup_warmup_kline_limit))
+        klines_per_request = max(1, min(1500, int(getattr(self.settings, "startup_warmup_klines_per_request", kline_limit))))
+        warmup_start_ms = self._startup_warmup_start_ms()
+        warmup_end_ms = int(time.time() * 1000)
         funding_limit = max(1, int(self.settings.startup_warmup_funding_limit))
         concurrency = max(1, int(self.settings.startup_warmup_concurrency))
         batch_size = max(1, int(self.settings.startup_warmup_batch_size))
 
         logger.info(
-            "Startup warmup started | exchange=%s symbols=%s timeframes=%s kline_limit=%s funding_limit=%s concurrency=%s batch_size=%s",
+            "Startup warmup started | exchange=%s symbols=%s timeframes=%s days=%s start_ms=%s end_ms=%s kline_limit=%s klines_per_request=%s funding_limit=%s concurrency=%s batch_size=%s",
             warmup_exchange,
             len(symbols),
             timeframes,
+            getattr(self.settings, "startup_warmup_days", None),
+            warmup_start_ms,
+            warmup_end_ms,
             kline_limit,
+            klines_per_request,
             funding_limit,
             concurrency,
             batch_size,
@@ -689,12 +951,63 @@ class TradingSystemRuntime:
         async def warmup_klines(symbol: str, timeframe: str) -> tuple[str, str, int, str | None]:
             async with sem:
                 try:
-                    candles = await rest.get_klines(
-                        symbol=symbol,
-                        interval=timeframe,
-                        limit=kline_limit,
-                    )
-                    return symbol, timeframe, len(candles or []), None
+                    total = 0
+                    seen_open_times: set[int] = set()
+
+                    # Backward-compatible path: one request when a historical
+                    # horizon is not configured. Otherwise page through the
+                    # requested warmup window because Binance returns max 1500
+                    # klines per request.
+                    if warmup_start_ms is None:
+                        candles = await rest.get_klines(
+                            symbol=symbol,
+                            interval=timeframe,
+                            limit=kline_limit,
+                        )
+                        return symbol, timeframe, len(candles or []), None
+
+                    timeframe_ms = self._timeframe_to_ms(timeframe)
+                    cursor_ms = warmup_start_ms
+                    max_pages = max(1, (kline_limit + klines_per_request - 1) // klines_per_request)
+
+                    for _ in range(max_pages):
+                        if cursor_ms >= warmup_end_ms:
+                            break
+
+                        candles = await rest.get_klines(
+                            symbol=symbol,
+                            interval=timeframe,
+                            limit=klines_per_request,
+                            start_time=cursor_ms,
+                            end_time=warmup_end_ms,
+                        )
+                        if not candles:
+                            break
+
+                        page_new = 0
+                        last_open_ms: int | None = None
+                        for candle in candles:
+                            if not isinstance(candle, dict):
+                                continue
+                            open_time = candle.get("open_time_ms") or candle.get("open_time") or candle.get("timestamp_ms")
+                            try:
+                                open_ms = int(float(open_time))
+                            except (TypeError, ValueError):
+                                continue
+                            last_open_ms = open_ms
+                            if open_ms not in seen_open_times:
+                                seen_open_times.add(open_ms)
+                                page_new += 1
+
+                        total += page_new
+                        if last_open_ms is None or page_new <= 0:
+                            break
+
+                        cursor_ms = last_open_ms + timeframe_ms
+                        if len(candles) < klines_per_request:
+                            break
+
+                    return symbol, timeframe, total, None
                 except Exception as exc:
                     if self._is_derivative_symbol_unavailable_error(exc):
                         self._disable_derivative_snapshot_symbol(symbol, exc)
@@ -759,6 +1072,7 @@ class TradingSystemRuntime:
 
         await self._evaluate_market_state_once(reason="startup_warmup_complete")
         await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
+        await self._flush_startup_warmup_storage()
 
         if self.settings.startup_warmup_required:
             if kline_jobs and kline_success <= 0:
@@ -929,7 +1243,7 @@ class TradingSystemRuntime:
         if snapshot_exchange not in self.settings.market_data_exchanges:
             return
 
-        rest = self.rest_clients.get(snapshot_exchange)
+        rest = self._market_data_rest_client(snapshot_exchange)
         if rest is None:
             logger.warning(
                 "Derivative snapshot polling disabled: %s REST client is missing",
@@ -1094,7 +1408,7 @@ class TradingSystemRuntime:
                     ws.__class__.__name__,
                 )
 
-        for rest in reversed(list(self.rest_clients.values())):
+        for rest in reversed(self._unique_components(self.rest_clients.values())):
             try:
                 await stop_component(rest)
             except Exception:

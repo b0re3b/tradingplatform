@@ -254,7 +254,7 @@ class StopHuntReversalStrategy(LiquidityTradingStrategy):
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering StopHuntReversalStrategy.strategy_name")
-        return "stop_hunt_reversal_strategy"
+        return "stop_hunt_reversal"
 
     def required_features(self) -> set[str]:
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)

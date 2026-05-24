@@ -7,7 +7,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -51,6 +51,11 @@ class ParquetStorageConfig:
     store_open_interest: bool = True
     store_liquidations: bool = True
     store_analytics: bool = True
+    store_strategy_events: bool = True
+    store_signal_events: bool = True
+    store_risk_events: bool = True
+    store_execution_events: bool = True
+    store_position_events: bool = True
 
     emit_storage_events: bool = True
 
@@ -75,6 +80,18 @@ class ParquetStorageConfig:
             enabled=enabled,
             flush_interval_seconds=flush_interval,
             max_records_per_dataset=max(1, batch_size),
+            store_trades=bool(getattr(storage, "store_trades", cls.store_trades)) if storage is not None else cls.store_trades,
+            store_closed_candles=bool(getattr(storage, "store_closed_candles", cls.store_closed_candles)) if storage is not None else cls.store_closed_candles,
+            store_orderbook_snapshots=bool(getattr(storage, "store_orderbook_snapshots", cls.store_orderbook_snapshots)) if storage is not None else cls.store_orderbook_snapshots,
+            store_funding=bool(getattr(storage, "store_funding", cls.store_funding)) if storage is not None else cls.store_funding,
+            store_open_interest=bool(getattr(storage, "store_open_interest", cls.store_open_interest)) if storage is not None else cls.store_open_interest,
+            store_liquidations=bool(getattr(storage, "store_liquidations", cls.store_liquidations)) if storage is not None else cls.store_liquidations,
+            store_analytics=bool(getattr(storage, "store_analytics", cls.store_analytics)) if storage is not None else cls.store_analytics,
+            store_strategy_events=bool(getattr(storage, "store_strategy_events", cls.store_strategy_events)) if storage is not None else cls.store_strategy_events,
+            store_signal_events=bool(getattr(storage, "store_signal_events", cls.store_signal_events)) if storage is not None else cls.store_signal_events,
+            store_risk_events=bool(getattr(storage, "store_risk_events", cls.store_risk_events)) if storage is not None else cls.store_risk_events,
+            store_execution_events=bool(getattr(storage, "store_execution_events", cls.store_execution_events)) if storage is not None else cls.store_execution_events,
+            store_position_events=bool(getattr(storage, "store_position_events", cls.store_position_events)) if storage is not None else cls.store_position_events,
         )
 
 
@@ -122,6 +139,12 @@ class ParquetStorage:
     DATASET_OPEN_INTEREST = "open_interest"
     DATASET_LIQUIDATIONS = "liquidations"
     DATASET_ANALYTICS = "analytics_events"
+    DATASET_STRATEGY_EVENTS = "strategy_events"
+    DATASET_STRATEGY_INPUT_EVENTS = "strategy_input_events"
+    DATASET_SIGNAL_EVENTS = "signal_events"
+    DATASET_RISK_EVENTS = "risk_events"
+    DATASET_EXECUTION_EVENTS = "execution_events"
+    DATASET_POSITION_EVENTS = "position_events"
 
     def __init__(
         self,
@@ -176,6 +199,9 @@ class ParquetStorage:
 
         if self._storage_config.store_closed_candles:
             self._event_bus.subscribe("market.candle.closed", self._on_candle_closed)
+            self._event_bus.subscribe("market.candles.snapshot", self._on_candles_event)
+            self._event_bus.subscribe("market.candles.updated", self._on_candles_event)
+            self._event_bus.subscribe("market.candles.persistable", self._on_candles_event)
 
         if self._storage_config.store_trades:
             self._event_bus.subscribe("market.trade", self._on_trade)
@@ -188,6 +214,8 @@ class ParquetStorage:
 
         if self._storage_config.store_funding:
             self._event_bus.subscribe("market.funding.updated", self._on_funding_updated)
+            self._event_bus.subscribe("market.funding.snapshot", self._on_funding_event)
+            self._event_bus.subscribe("market.funding.persistable", self._on_funding_event)
 
         if self._storage_config.store_open_interest:
             self._event_bus.subscribe(
@@ -200,6 +228,23 @@ class ParquetStorage:
 
         if self._storage_config.store_analytics:
             self._event_bus.subscribe("analytics.*", self._on_analytics_event)
+
+        if self._storage_config.store_strategy_events:
+            self._event_bus.subscribe("strategy.input.normalized", self._on_strategy_input_event)
+            self._event_bus.subscribe("strategy.context.updated", self._on_strategy_input_event)
+            self._event_bus.subscribe("strategy.*", self._on_strategy_event)
+
+        if self._storage_config.store_signal_events:
+            self._event_bus.subscribe("signal.*", self._on_signal_event)
+
+        if self._storage_config.store_risk_events:
+            self._event_bus.subscribe("risk.*", self._on_risk_event)
+
+        if self._storage_config.store_execution_events:
+            self._event_bus.subscribe("execution.*", self._on_execution_event)
+
+        if self._storage_config.store_position_events:
+            self._event_bus.subscribe("position.*", self._on_position_event)
 
         self._registered = True
 
@@ -321,6 +366,30 @@ class ParquetStorage:
 
         await self._buffer_record(self.DATASET_CANDLES, record)
 
+    async def _on_candles_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="market.candles.updated")
+
+        candles = self._extract_items(payload, "candles", "klines", "items", "data.candles", "data", "snapshot.candles")
+        if not candles:
+            record = self._normalize_candle(payload, topic=topic)
+            if record is None:
+                await self._drop_event(topic, payload, reason="invalid_candles_event")
+                return
+            await self._buffer_record(self.DATASET_CANDLES, record)
+            return
+
+        buffered = 0
+        for candle in candles:
+            candle_payload = self._merge_parent_scope(payload, candle)
+            record = self._normalize_candle(candle_payload, topic=topic)
+            if record is not None:
+                await self._buffer_record(self.DATASET_CANDLES, record)
+                buffered += 1
+
+        if buffered <= 0:
+            await self._drop_event(topic, payload, reason="invalid_candles_batch")
+
     async def _on_trade(self, event: Event | Mapping[str, Any]) -> None:
         payload = self._extract_payload(event)
         topic = self._extract_topic(event, default="market.trade")
@@ -354,6 +423,30 @@ class ParquetStorage:
 
         await self._buffer_record(self.DATASET_FUNDING, record)
 
+    async def _on_funding_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="market.funding.snapshot")
+
+        items = self._extract_items(payload, "funding", "funding_rates", "items", "data.funding", "data", "snapshot.funding")
+        if not items:
+            record = self._normalize_funding(payload, topic=topic)
+            if record is None:
+                await self._drop_event(topic, payload, reason="invalid_funding_event")
+                return
+            await self._buffer_record(self.DATASET_FUNDING, record)
+            return
+
+        buffered = 0
+        for item in items:
+            funding_payload = self._merge_parent_scope(payload, item)
+            record = self._normalize_funding(funding_payload, topic=topic)
+            if record is not None:
+                await self._buffer_record(self.DATASET_FUNDING, record)
+                buffered += 1
+
+        if buffered <= 0:
+            await self._drop_event(topic, payload, reason="invalid_funding_batch")
+
     async def _on_open_interest_updated(self, event: Event | Mapping[str, Any]) -> None:
         payload = self._extract_payload(event)
         topic = self._extract_topic(event, default="market.open_interest.updated")
@@ -386,6 +479,74 @@ class ParquetStorage:
             return
 
         await self._buffer_record(self.DATASET_ANALYTICS, record)
+
+    async def _on_strategy_input_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="strategy.input.normalized")
+
+        record = self._normalize_strategy_input_event(payload, topic=topic)
+        if record is None:
+            await self._drop_event(topic, payload, reason="invalid_strategy_input_event")
+            return
+
+        await self._buffer_record(self.DATASET_STRATEGY_INPUT_EVENTS, record)
+
+    async def _on_strategy_event(self, event: Event | Mapping[str, Any]) -> None:
+        topic = self._extract_topic(event, default="strategy.unknown")
+        if topic in {"strategy.input.normalized", "strategy.context.updated"}:
+            return
+
+        payload = self._extract_payload(event)
+        record = self._normalize_strategy_event(payload, topic=topic)
+        if record is None:
+            await self._drop_event(topic, payload, reason="invalid_strategy_event")
+            return
+
+        await self._buffer_record(self.DATASET_STRATEGY_EVENTS, record)
+
+    async def _on_signal_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="signal.unknown")
+
+        record = self._normalize_signal_event(payload, topic=topic)
+        if record is None:
+            await self._drop_event(topic, payload, reason="invalid_signal_event")
+            return
+
+        await self._buffer_record(self.DATASET_SIGNAL_EVENTS, record)
+
+    async def _on_risk_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="risk.unknown")
+
+        record = self._normalize_risk_event(payload, topic=topic)
+        if record is None:
+            await self._drop_event(topic, payload, reason="invalid_risk_event")
+            return
+
+        await self._buffer_record(self.DATASET_RISK_EVENTS, record)
+
+    async def _on_execution_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="execution.unknown")
+
+        record = self._normalize_execution_event(payload, topic=topic)
+        if record is None:
+            await self._drop_event(topic, payload, reason="invalid_execution_event")
+            return
+
+        await self._buffer_record(self.DATASET_EXECUTION_EVENTS, record)
+
+    async def _on_position_event(self, event: Event | Mapping[str, Any]) -> None:
+        payload = self._extract_payload(event)
+        topic = self._extract_topic(event, default="position.unknown")
+
+        record = self._normalize_position_event(payload, topic=topic)
+        if record is None:
+            await self._drop_event(topic, payload, reason="invalid_position_event")
+            return
+
+        await self._buffer_record(self.DATASET_POSITION_EVENTS, record)
 
     # ------------------------------------------------------------------
     # Buffering
@@ -692,6 +853,55 @@ class ParquetStorage:
                 return value
         return None
 
+    def _extract_items(self, payload: Mapping[str, Any], *candidate_paths: str) -> list[Any]:
+        for path in candidate_paths:
+            value = self._get_path(payload, path) if "." in path else payload.get(path)
+            plain = self._plain_value(value)
+            if isinstance(plain, list):
+                return plain
+            if isinstance(plain, tuple):
+                return list(plain)
+        return []
+
+    def _merge_parent_scope(self, parent: Mapping[str, Any], item: Any) -> dict[str, Any]:
+        item_map = self._as_mapping(item)
+        if not item_map:
+            return dict(parent)
+
+        merged: dict[str, Any] = {}
+        for key in (
+            "exchange",
+            "market_type",
+            "symbol",
+            "timeframe",
+            "exchange_symbol",
+            "scope",
+            "scope_key",
+            "source",
+            "received_at",
+            "received_at_ms",
+        ):
+            if key in parent and key not in item_map:
+                merged[key] = parent[key]
+
+        merged.update(item_map)
+        return merged
+
+    def _scope_key(self, payload: Mapping[str, Any]) -> str | None:
+        explicit = self._safe_str(payload.get("scope_key"))
+        if explicit:
+            return explicit
+
+        scope = self._as_mapping(payload.get("scope"))
+        exchange = self._safe_str(payload.get("exchange") or scope.get("exchange"))
+        market_type = self._safe_str(payload.get("market_type") or scope.get("market_type"))
+        symbol = self._safe_str(payload.get("symbol") or scope.get("symbol"))
+        timeframe = self._safe_str(payload.get("timeframe") or scope.get("timeframe"))
+
+        if exchange and market_type and symbol and timeframe:
+            return f"{exchange}:{market_type}:{symbol}:{timeframe}"
+        return None
+
     def _normalize_candle(
         self,
         payload: Mapping[str, Any],
@@ -716,7 +926,7 @@ class ParquetStorage:
         symbol = self._required_str(payload, "symbol")
         timeframe = self._required_str(payload, "timeframe")
 
-        open_time_ms = self._first_int(
+        open_time_ms = self._first_timestamp_ms(
             payload,
             "open_time_ms",
             "open_time",
@@ -727,7 +937,7 @@ class ParquetStorage:
             "event_time",
         )
 
-        close_time_ms = self._first_int(
+        close_time_ms = self._first_timestamp_ms(
             payload,
             "close_time_ms",
             "close_time",
@@ -808,7 +1018,7 @@ class ParquetStorage:
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
-        timestamp_ms = self._first_int(
+        timestamp_ms = self._first_timestamp_ms(
             payload,
             "timestamp_ms",
             "trade_time_ms",
@@ -937,7 +1147,7 @@ class ParquetStorage:
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
-        timestamp_ms = self._first_int(
+        timestamp_ms = self._first_timestamp_ms(
             payload,
             "timestamp_ms",
             "funding_time_ms",
@@ -964,7 +1174,7 @@ class ParquetStorage:
             "received_at_ms": self._received_at(payload),
             "funding_rate": funding_rate,
             "predicted_rate": self._safe_float(payload.get("predicted_rate")),
-            "next_funding_time_ms": self._first_int(
+            "next_funding_time_ms": self._first_timestamp_ms(
                 payload,
                 "next_funding_time_ms",
                 "next_funding_time",
@@ -994,7 +1204,7 @@ class ParquetStorage:
         exchange = self._required_str(payload, "exchange")
         symbol = self._required_str(payload, "symbol")
 
-        timestamp_ms = self._first_int(
+        timestamp_ms = self._first_timestamp_ms(
             payload,
             "timestamp_ms",
             "open_interest_time_ms",
@@ -1095,11 +1305,233 @@ class ParquetStorage:
             "timeframe": self._safe_str(payload.get("timeframe")),
             "timestamp_ms": timestamp_ms or self._now_ms(),
             "received_at_ms": self._received_at(payload),
-            "direction": self._safe_str(payload.get("direction")),
-            "score": self._safe_float(payload.get("score")),
+            "domain": self._safe_str(payload.get("domain")),
+            "scope_key": self._scope_key(payload),
+            "direction": self._safe_str(payload.get("direction") or payload.get("side")),
+            "signal_type": self._safe_str(payload.get("signal_type") or payload.get("setup_type")),
+            "reason": self._safe_str(payload.get("reason")),
+            "score": self._safe_float(payload.get("score") or payload.get("strength")),
+            "strength": self._safe_float(payload.get("strength")),
             "confidence": self._safe_float(payload.get("confidence")),
+            "price": self._first_float(payload, "current_price", "entry_reference_price", "reference_price", "price", "last_price"),
             "features_json": self._json_dumps(payload.get("features", {})),
             "metadata_json": self._json_dumps(payload.get("metadata", {})),
+            "payload_json": self._json_dumps(payload),
+            "source": payload.get("source"),
+            "ingested_at_ms": self._now_ms(),
+        }
+
+    def _normalize_strategy_input_event(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        topic: str,
+    ) -> dict[str, Any] | None:
+        timestamp_ms = self._event_timestamp(payload)
+        context = self._as_mapping(payload.get("context"))
+        normalized_payload = self._as_mapping(payload.get("normalized_payload"))
+
+        exchange = self._safe_str(payload.get("exchange") or context.get("exchange") or normalized_payload.get("exchange"))
+        symbol = self._safe_str(payload.get("symbol") or context.get("symbol") or normalized_payload.get("symbol"))
+        timeframe = self._safe_str(payload.get("timeframe") or context.get("timeframe") or normalized_payload.get("timeframe"))
+
+        return {
+            "topic": topic,
+            "dataset": self.DATASET_STRATEGY_INPUT_EVENTS,
+            "event_type": topic,
+            "source_topic": self._safe_str(payload.get("source_topic") or payload.get("event_name") or payload.get("analytics_topic")),
+            "domain": self._safe_str(payload.get("domain") or normalized_payload.get("domain")),
+            "feature_source": self._safe_str(payload.get("feature_source") or normalized_payload.get("feature_source")),
+            "exchange": exchange,
+            "symbol": symbol,
+            "market_type": self._market_type(payload),
+            "timeframe": timeframe,
+            "scope_key": self._scope_key(payload) or self._scope_key(context) or self._scope_key(normalized_payload),
+            "timestamp_ms": timestamp_ms or self._now_ms(),
+            "received_at_ms": self._received_at(payload),
+            "side": self._safe_str(payload.get("side") or payload.get("direction") or normalized_payload.get("side") or normalized_payload.get("direction")),
+            "signal_type": self._safe_str(payload.get("signal_type") or payload.get("setup_type") or normalized_payload.get("signal_type") or normalized_payload.get("setup_type")),
+            "reason": self._safe_str(payload.get("reason") or normalized_payload.get("reason")),
+            "score": self._first_float(payload, "score", "strength", "confidence"),
+            "strength": self._safe_float(payload.get("strength") or normalized_payload.get("strength")),
+            "confidence": self._safe_float(payload.get("confidence") or normalized_payload.get("confidence")),
+            "price": self._first_float(payload, "current_price", "entry_reference_price", "reference_price", "price", "last_price"),
+            "contract_version": self._safe_str(
+                payload.get("strategy_contract_version")
+                or self._get_path(payload, "strategy_contract.version")
+                or self._get_path(payload, "contract.version")
+            ),
+            "context_json": self._json_dumps(payload.get("context", {})),
+            "features_json": self._json_dumps(payload.get("features", {})),
+            "metadata_json": self._json_dumps(payload.get("metadata", {})),
+            "contract_json": self._json_dumps(payload.get("strategy_contract") or payload.get("contract") or {}),
+            "normalized_payload_json": self._json_dumps(payload.get("normalized_payload", {})),
+            "payload_json": self._json_dumps(payload),
+            "source": payload.get("source"),
+            "ingested_at_ms": self._now_ms(),
+        }
+
+    def _normalize_strategy_event(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        topic: str,
+    ) -> dict[str, Any] | None:
+        timestamp_ms = self._event_timestamp(payload)
+        return {
+            "topic": topic,
+            "dataset": self.DATASET_STRATEGY_EVENTS,
+            "event_type": topic,
+            "exchange": self._safe_str(payload.get("exchange")),
+            "symbol": self._safe_str(payload.get("symbol")),
+            "market_type": self._market_type(payload),
+            "timeframe": self._safe_str(payload.get("timeframe")),
+            "scope_key": self._scope_key(payload),
+            "timestamp_ms": timestamp_ms or self._now_ms(),
+            "received_at_ms": self._received_at(payload),
+            "strategy_name": self._safe_str(payload.get("strategy_name") or payload.get("strategy")),
+            "batch_id": self._safe_str(payload.get("batch_id")),
+            "status": self._safe_str(payload.get("status")),
+            "reason": self._safe_str(payload.get("reason")),
+            "signals_count": self._first_int(payload, "signals_count", "signal_count", "total_signals"),
+            "accepted_count": self._first_int(payload, "accepted_count", "accepted"),
+            "rejected_count": self._first_int(payload, "rejected_count", "rejected"),
+            "payload_json": self._json_dumps(payload),
+            "source": payload.get("source"),
+            "ingested_at_ms": self._now_ms(),
+        }
+
+    def _normalize_signal_event(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        topic: str,
+    ) -> dict[str, Any] | None:
+        timestamp_ms = self._event_timestamp(payload)
+        return {
+            "topic": topic,
+            "dataset": self.DATASET_SIGNAL_EVENTS,
+            "event_type": topic,
+            "exchange": self._safe_str(payload.get("exchange")),
+            "symbol": self._safe_str(payload.get("symbol")),
+            "market_type": self._market_type(payload),
+            "timeframe": self._safe_str(payload.get("timeframe")),
+            "scope_key": self._scope_key(payload),
+            "timestamp_ms": timestamp_ms or self._now_ms(),
+            "received_at_ms": self._received_at(payload),
+            "signal_id": self._safe_str(payload.get("signal_id") or payload.get("id")),
+            "strategy_name": self._safe_str(payload.get("strategy_name") or payload.get("strategy")),
+            "side": self._safe_str(payload.get("side") or payload.get("direction")),
+            "status": self._safe_str(payload.get("status")),
+            "reason": self._safe_str(payload.get("reason")),
+            "confidence": self._safe_float(payload.get("confidence")),
+            "score": self._safe_float(payload.get("score") or payload.get("strength")),
+            "priority": self._safe_str(payload.get("priority")),
+            "entry_price": self._first_float(payload, "entry_price", "current_price", "reference_price", "price"),
+            "stop_loss": self._first_float(payload, "stop_loss", "sl"),
+            "take_profit": self._first_float(payload, "take_profit", "tp"),
+            "payload_json": self._json_dumps(payload),
+            "source": payload.get("source"),
+            "ingested_at_ms": self._now_ms(),
+        }
+
+    def _normalize_risk_event(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        topic: str,
+    ) -> dict[str, Any] | None:
+        timestamp_ms = self._event_timestamp(payload)
+        return {
+            "topic": topic,
+            "dataset": self.DATASET_RISK_EVENTS,
+            "event_type": topic,
+            "exchange": self._safe_str(payload.get("exchange")),
+            "symbol": self._safe_str(payload.get("symbol")),
+            "market_type": self._market_type(payload),
+            "timeframe": self._safe_str(payload.get("timeframe")),
+            "timestamp_ms": timestamp_ms or self._now_ms(),
+            "received_at_ms": self._received_at(payload),
+            "signal_id": self._safe_str(payload.get("signal_id")),
+            "strategy_name": self._safe_str(payload.get("strategy_name") or payload.get("strategy")),
+            "decision": self._safe_str(payload.get("decision") or payload.get("risk_decision") or payload.get("status")),
+            "reason": self._safe_str(payload.get("reason")),
+            "side": self._safe_str(payload.get("side") or payload.get("position_side")),
+            "final_size": self._safe_float(payload.get("final_size") or payload.get("size")),
+            "final_leverage": self._safe_float(payload.get("final_leverage") or payload.get("leverage")),
+            "final_margin": self._safe_float(payload.get("final_margin") or payload.get("margin")),
+            "final_notional": self._safe_float(payload.get("final_notional") or payload.get("notional")),
+            "final_risk_amount": self._safe_float(payload.get("final_risk_amount") or payload.get("risk_amount")),
+            "reservation_id": self._safe_str(payload.get("reservation_id")),
+            "payload_json": self._json_dumps(payload),
+            "source": payload.get("source"),
+            "ingested_at_ms": self._now_ms(),
+        }
+
+    def _normalize_execution_event(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        topic: str,
+    ) -> dict[str, Any] | None:
+        timestamp_ms = self._event_timestamp(payload)
+        return {
+            "topic": topic,
+            "dataset": self.DATASET_EXECUTION_EVENTS,
+            "event_type": topic,
+            "exchange": self._safe_str(payload.get("exchange")),
+            "symbol": self._safe_str(payload.get("symbol")),
+            "market_type": self._market_type(payload),
+            "timestamp_ms": timestamp_ms or self._now_ms(),
+            "received_at_ms": self._received_at(payload),
+            "order_id": self._safe_str(payload.get("order_id") or payload.get("exchange_order_id")),
+            "client_order_id": self._safe_str(payload.get("client_order_id") or payload.get("new_client_order_id")),
+            "position_id": self._safe_str(payload.get("position_id")),
+            "signal_id": self._safe_str(payload.get("signal_id")),
+            "strategy_name": self._safe_str(payload.get("strategy_name") or payload.get("strategy")),
+            "side": self._safe_str(payload.get("side") or payload.get("order_side")),
+            "order_type": self._safe_str(payload.get("order_type") or payload.get("type")),
+            "status": self._safe_str(payload.get("status") or payload.get("order_status")),
+            "price": self._first_float(payload, "price", "avg_price", "average_price"),
+            "quantity": self._first_float(payload, "quantity", "qty", "size", "executed_quantity"),
+            "filled_quantity": self._first_float(payload, "filled_quantity", "filled_qty", "executed_qty"),
+            "notional": self._safe_float(payload.get("notional")),
+            "reason": self._safe_str(payload.get("reason") or payload.get("error")),
+            "payload_json": self._json_dumps(payload),
+            "source": payload.get("source"),
+            "ingested_at_ms": self._now_ms(),
+        }
+
+    def _normalize_position_event(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        topic: str,
+    ) -> dict[str, Any] | None:
+        timestamp_ms = self._event_timestamp(payload)
+        return {
+            "topic": topic,
+            "dataset": self.DATASET_POSITION_EVENTS,
+            "event_type": topic,
+            "exchange": self._safe_str(payload.get("exchange")),
+            "symbol": self._safe_str(payload.get("symbol")),
+            "market_type": self._market_type(payload),
+            "timestamp_ms": timestamp_ms or self._now_ms(),
+            "received_at_ms": self._received_at(payload),
+            "position_id": self._safe_str(payload.get("position_id") or payload.get("id")),
+            "signal_id": self._safe_str(payload.get("signal_id")),
+            "strategy_name": self._safe_str(payload.get("strategy_name") or payload.get("strategy")),
+            "side": self._safe_str(payload.get("side") or payload.get("position_side")),
+            "status": self._safe_str(payload.get("status")),
+            "size": self._first_float(payload, "size", "quantity", "position_amt", "position_amount"),
+            "entry_price": self._safe_float(payload.get("entry_price")),
+            "mark_price": self._safe_float(payload.get("mark_price")),
+            "notional_value": self._safe_float(payload.get("notional_value") or payload.get("notional")),
+            "leverage": self._safe_float(payload.get("leverage")),
+            "margin_used": self._safe_float(payload.get("margin_used") or payload.get("margin")),
+            "risk_amount": self._safe_float(payload.get("risk_amount")),
+            "realized_pnl": self._safe_float(payload.get("realized_pnl")),
+            "unrealized_pnl": self._safe_float(payload.get("unrealized_pnl")),
             "payload_json": self._json_dumps(payload),
             "source": payload.get("source"),
             "ingested_at_ms": self._now_ms(),
@@ -1147,6 +1579,63 @@ class ParquetStorage:
             analytics_type = self._partition_value(record.get("analytics_type"), default="unknown")
             return (
                 ("analytics_type", analytics_type),
+                ("exchange", exchange),
+                ("symbol", symbol),
+                ("date", date),
+            )
+
+        if dataset == self.DATASET_STRATEGY_INPUT_EVENTS:
+            domain = self._partition_value(record.get("domain"), default="unknown")
+            timeframe = self._partition_value(record.get("timeframe"), default="unknown")
+            return (
+                ("domain", domain),
+                ("exchange", exchange),
+                ("symbol", symbol),
+                ("timeframe", timeframe),
+                ("date", date),
+            )
+
+        if dataset == self.DATASET_STRATEGY_EVENTS:
+            event_type = self._partition_value(record.get("event_type"), default="unknown")
+            strategy_name = self._partition_value(record.get("strategy_name"), default="unknown")
+            return (
+                ("event_type", event_type),
+                ("strategy_name", strategy_name),
+                ("symbol", symbol),
+                ("date", date),
+            )
+
+        if dataset == self.DATASET_SIGNAL_EVENTS:
+            event_type = self._partition_value(record.get("event_type"), default="unknown")
+            strategy_name = self._partition_value(record.get("strategy_name"), default="unknown")
+            return (
+                ("event_type", event_type),
+                ("strategy_name", strategy_name),
+                ("symbol", symbol),
+                ("date", date),
+            )
+
+        if dataset == self.DATASET_RISK_EVENTS:
+            event_type = self._partition_value(record.get("event_type"), default="unknown")
+            return (
+                ("event_type", event_type),
+                ("symbol", symbol),
+                ("date", date),
+            )
+
+        if dataset == self.DATASET_EXECUTION_EVENTS:
+            event_type = self._partition_value(record.get("event_type"), default="unknown")
+            return (
+                ("event_type", event_type),
+                ("exchange", exchange),
+                ("symbol", symbol),
+                ("date", date),
+            )
+
+        if dataset == self.DATASET_POSITION_EVENTS:
+            event_type = self._partition_value(record.get("event_type"), default="unknown")
+            return (
+                ("event_type", event_type),
                 ("exchange", exchange),
                 ("symbol", symbol),
                 ("date", date),
@@ -1319,7 +1808,7 @@ class ParquetStorage:
         *,
         fallback: int | None = None,
     ) -> int | None:
-        return self._first_int(
+        return self._first_timestamp_ms(
             payload,
             "timestamp_ms",
             "timestamp",
@@ -1332,7 +1821,7 @@ class ParquetStorage:
 
     def _received_at(self, payload: Mapping[str, Any]) -> int:
         return (
-            self._first_int(payload, "received_at_ms", "received_at")
+            self._first_timestamp_ms(payload, "received_at_ms", "received_at")
             or self._now_ms()
         )
 
@@ -1383,6 +1872,46 @@ class ParquetStorage:
         except (TypeError, ValueError):
             return None
 
+    def _normalize_timestamp_ms(self, value: Any) -> int | None:
+        """
+        Normalize external timestamps to milliseconds.
+
+        Exchange, analytics and storage DTOs in this project can carry time as:
+        - seconds, e.g. 1760000000;
+        - milliseconds, e.g. 1760000000000;
+        - microseconds, e.g. 1760000000000000;
+        - nanoseconds, e.g. 1760000000000000000;
+        - datetime / ISO strings, which _safe_int already converts to ms.
+
+        Returning a single millisecond representation prevents Parquet partitions
+        such as date=1970-01-21 when a seconds timestamp is divided by 1000 again.
+        """
+        timestamp = self._safe_int(value)
+        if timestamp is None:
+            return None
+
+        absolute = abs(timestamp)
+
+        # Zero is technically valid but useless for live market data; keep it as
+        # epoch ms rather than treating it as missing.
+        if absolute == 0:
+            return 0
+
+        # Seconds: current timestamps are around 1.7e9.
+        if absolute < 10_000_000_000:
+            return timestamp * 1000
+
+        # Milliseconds: current timestamps are around 1.7e12.
+        if absolute < 10_000_000_000_000:
+            return timestamp
+
+        # Microseconds: current timestamps are around 1.7e15.
+        if absolute < 10_000_000_000_000_000:
+            return timestamp // 1000
+
+        # Nanoseconds or larger precision.
+        return timestamp // 1_000_000
+
     def _safe_float(self, value: Any) -> float | None:
         if value is None:
             return None
@@ -1416,6 +1945,18 @@ class ParquetStorage:
             if value is not None:
                 return value
         return fallback
+
+    def _first_timestamp_ms(
+        self,
+        payload: Mapping[str, Any],
+        *keys: str,
+        fallback: int | None = None,
+    ) -> int | None:
+        for key in keys:
+            value = self._normalize_timestamp_ms(payload.get(key))
+            if value is not None:
+                return value
+        return self._normalize_timestamp_ms(fallback)
 
     def _first_float(self, payload: Mapping[str, Any], *keys: str) -> float | None:
         for key in keys:
@@ -1499,7 +2040,7 @@ class ParquetStorage:
         return 60_000
 
     def _partition_date(self, timestamp_ms: Any) -> str:
-        timestamp = self._safe_int(timestamp_ms) or self._now_ms()
+        timestamp = self._normalize_timestamp_ms(timestamp_ms) or self._now_ms()
         dt = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d")
 

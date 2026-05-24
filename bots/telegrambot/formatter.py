@@ -969,6 +969,8 @@ class TelegramFormatter:
             formatted = self._format_bool(value, default="")
         elif formatter == "list":
             formatted = self._format_list(value, default="")
+        elif formatter == "liquidity_level":
+            formatted = self._format_liquidity_level(value, default="")
         elif formatter == "number_or_text":
             formatted = self._format_number(value, default="")
             if not formatted:
@@ -1054,8 +1056,8 @@ class TelegramFormatter:
             ("Sweep Risk Down", ("sweep_risk_down", "down_sweep_risk", "sweep_risk.down"), "number"),
             ("Magnet Up", ("magnet_score_up", "up_magnet_score", "magnet_score.up"), "number"),
             ("Magnet Down", ("magnet_score_down", "down_magnet_score", "magnet_score.down"), "number"),
-            ("Nearest Buy-Side", ("nearest_buy_side_liquidity",), "price"),
-            ("Nearest Sell-Side", ("nearest_sell_side_liquidity",), "price"),
+            ("Nearest Buy-Side", ("nearest_buy_side_liquidity",), "liquidity_level"),
+            ("Nearest Sell-Side", ("nearest_sell_side_liquidity",), "liquidity_level"),
             ("Liquidity", ("liquidity", "liquidity_score", "liquidity_volume", "volume"), "number"),
             ("Stop Cluster", ("stop_cluster", "stop_cluster_price", "cluster_price"), "price"),
             ("Distance", ("distance", "distance_to_level", "distance_pct"), "number_or_text"),
@@ -1309,10 +1311,14 @@ class TelegramFormatter:
         if value is None or value == "":
             return default
 
+        extracted = self._extract_price_value(value)
+        if extracted is None:
+            return default if isinstance(value, (dict, list, tuple, set)) else self._safe(value, default=default)
+
         try:
-            number = float(value)
+            number = float(extracted)
         except (TypeError, ValueError):
-            return self._safe(value, default=default)
+            return self._safe(extracted, default=default)
 
         if abs(number) >= 100:
             return f"{number:.2f}"
@@ -1321,6 +1327,77 @@ class TelegramFormatter:
             return f"{number:.4f}".rstrip("0").rstrip(".")
 
         return f"{number:.8f}".rstrip("0").rstrip(".")
+
+    def _extract_price_value(self, value: Any) -> Any:
+        """
+        Extracts a numeric price from nested analytics objects.
+
+        Liquidity analytics can publish full level objects under fields such as
+        ``nearest_sell_side_liquidity``. Telegram messages should show the
+        tradable price, not the whole serialized dictionary.
+        """
+        if value is None or value == "":
+            return None
+
+        if isinstance(value, dict):
+            for key in (
+                "price",
+                "level",
+                "price_level",
+                "liquidity_level",
+                "cluster_midpoint",
+                "cluster_price",
+                "midpoint",
+            ):
+                nested = value.get(key)
+                if nested is not None and nested != "":
+                    return self._extract_price_value(nested)
+            return None
+
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return None
+            # Exchange levels often arrive as [price, size]. Full liquidity
+            # level lists can also arrive; in both cases the first extractable
+            # price is the most useful compact representation.
+            for item in value:
+                extracted = self._extract_price_value(item)
+                if extracted is not None:
+                    return extracted
+            return None
+
+        return value
+
+    def _format_liquidity_level(self, value: Any, *, default: str = "n/a") -> str:
+        """Format a liquidity level object without dumping its full payload."""
+        if value is None or value == "":
+            return default
+
+        if not isinstance(value, dict):
+            return self._format_price(value, default=default)
+
+        price = self._format_price(value, default="")
+        if not price:
+            return default
+
+        level_type = self._safe_plain(value.get("level_type"), default="").replace("_", " ")
+        side = self._safe_plain(value.get("side"), default="").replace("_", "-")
+        status = self._safe_plain(value.get("sweep_status") or value.get("status"), default="").replace("_", " ")
+        confidence = self._format_number(value.get("confidence"), default="")
+
+        prefix_parts = [part for part in (level_type, side) if part]
+        text = f"{' '.join(prefix_parts)} @ {price}" if prefix_parts else price
+
+        suffix_parts = []
+        if status:
+            suffix_parts.append(status)
+        if confidence:
+            suffix_parts.append(f"conf {confidence}")
+
+        if suffix_parts:
+            text = f"{text} ({', '.join(suffix_parts)})"
+
+        return escape(text, quote=True)
 
     def _format_pct(self, value: Any, *, default: str = "n/a") -> str:
         if value is None or value == "":

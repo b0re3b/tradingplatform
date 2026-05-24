@@ -125,7 +125,7 @@ class LoggingConfig:
 
 @dataclass(slots=True)
 class EventBusConfig:
-    max_queue_size: int = 100000
+    max_queue_size: int = 10000
     worker_count: int = 12
     queue_full_policy: str = "drop_oldest"
     max_retries: int = 1
@@ -272,7 +272,7 @@ class Config:
                 backup_count=_to_int(_get_env("LOG_BACKUP_COUNT"), 5),
             ),
             event_bus=EventBusConfig(
-                max_queue_size=_to_int(_get_env("EVENT_BUS_MAX_QUEUE_SIZE"), 100000),
+                max_queue_size=_to_int(_get_env("EVENT_BUS_MAX_QUEUE_SIZE"), 10000),
                 worker_count=_to_int(_get_env("EVENT_BUS_WORKER_COUNT"), 12),
                 queue_full_policy=_get_env("EVENT_BUS_QUEUE_FULL_POLICY", "drop_oldest") or "drop_oldest",
                 max_retries=_to_int(_get_env("EVENT_BUS_MAX_RETRIES"), 1),

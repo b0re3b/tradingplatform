@@ -214,6 +214,7 @@ class TradeExecutor:
             self._logger.warning("TradeExecutor already stopped")
             return
 
+        self._cancel_scheduler_jobs()
         self.unregister()
 
         await self._emit_event(
@@ -227,6 +228,17 @@ class TradeExecutor:
 
         self._running = False
         self._logger.info("TradeExecutor stopped")
+
+    def _cancel_scheduler_jobs(self) -> None:
+        if self._scheduler is None:
+            self._scheduler_jobs.clear()
+            return
+        for job_id in list(self._scheduler_jobs):
+            try:
+                self._scheduler.remove_job(job_id)
+            except Exception:
+                pass
+        self._scheduler_jobs.clear()
 
     def register(self) -> None:
         """

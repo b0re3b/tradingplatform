@@ -48,10 +48,10 @@ class BinancePositionClientProtocol(Protocol):
     """
 
     async def get_positions(
-        self,
-        *,
-        symbol: str | None = None,
-        recv_window: int | None = None,
+            self,
+            *,
+            symbol: str | None = None,
+            recv_window: int | None = None,
     ) -> list[dict[str, Any]]:
         ...
 
@@ -80,15 +80,15 @@ class PositionManager:
     """
 
     def __init__(
-        self,
-        config: PositionManagerConfig,
-        *,
-        event_bus: EventBus | None = None,
-        scheduler: Scheduler | None = None,
-        exchange_clients: Mapping[str, BinancePositionClientProtocol] | None = None,
-        service_name: str = "execution.position_manager",
-        auto_subscribe: bool = True,
-        register_scheduler_jobs: bool = True,
+            self,
+            config: PositionManagerConfig,
+            *,
+            event_bus: EventBus | None = None,
+            scheduler: Scheduler | None = None,
+            exchange_clients: Mapping[str, BinancePositionClientProtocol] | None = None,
+            service_name: str = "execution.position_manager",
+            auto_subscribe: bool = True,
+            register_scheduler_jobs: bool = True,
     ) -> None:
         self._config = config
         self._config.validate()
@@ -169,6 +169,7 @@ class PositionManager:
             self._logger.warning("PositionManager already stopped")
             return
 
+        self._cancel_scheduler_jobs()
         self.unregister()
 
         await self._emit_event(
@@ -182,6 +183,17 @@ class PositionManager:
 
         self._running = False
         self._logger.info("PositionManager stopped")
+
+    def _cancel_scheduler_jobs(self) -> None:
+        if self._scheduler is None:
+            self._scheduler_jobs.clear()
+            return
+        for job_id in list(self._scheduler_jobs):
+            try:
+                self._scheduler.remove_job(job_id)
+            except Exception:
+                pass
+        self._scheduler_jobs.clear()
 
     def register(self) -> None:
         if self._event_bus is None:
@@ -280,6 +292,7 @@ class PositionManager:
                     "Failed to register PositionManager scheduler job | name=%s",
                     name,
                 )
+
     async def apply_fill(self, fill: OrderFill) -> PositionUpdate | None:
         """
         Apply normalized fill to local position state.
@@ -313,10 +326,6 @@ class PositionManager:
 
             state_key, state, effective_fill_side = self._resolve_position_state_for_fill(fill)
 
-            # PositionState.apply_fill() treats fill.position_side as the
-            # effective fill direction:
-            # - same as current position side => increase;
-            # - opposite to current position side => reduce/close/reverse.
             fill.position_side = effective_fill_side
 
             if state is None:
@@ -328,9 +337,6 @@ class PositionManager:
             previous_key = state_key
             update = state.apply_fill(fill)
 
-            # If a fill reverses the position, the runtime key must move from
-            # old side to new side. Closed positions intentionally remain under
-            # their previous side key for audit/readback compatibility.
             if update.update_type == "reversed" and state.side is not None:
                 new_key = self._position_key(state.symbol, state.side)
                 if new_key != previous_key:
@@ -344,10 +350,10 @@ class PositionManager:
         return update
 
     async def apply_position_snapshot(
-        self,
-        snapshot: PositionSnapshot,
-        *,
-        emit_unchanged: bool | None = None,
+            self,
+            snapshot: PositionSnapshot,
+            *,
+            emit_unchanged: bool | None = None,
     ) -> PositionUpdate | None:
         """
         Apply one exchange position snapshot.
@@ -374,9 +380,9 @@ class PositionManager:
             update = state.apply_snapshot(snapshot)
 
             unchanged = (
-                abs(previous_size - state.size) <= self._config.min_position_size_epsilon
-                and previous_side is state.side
-                and update.update_type == "updated"
+                    abs(previous_size - state.size) <= self._config.min_position_size_epsilon
+                    and previous_side is state.side
+                    and update.update_type == "updated"
             )
 
             if unchanged and not emit_unchanged:
@@ -432,6 +438,36 @@ class PositionManager:
 
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+
+            self._stats.reconciliation_failures += 1
+            self._stats.register_failure("timeout")
+            timeout_seconds = getattr(
+                getattr(client, "_rest_config", None),
+                "timeout_seconds",
+                "?",
+            )
+            self._logger.warning(
+                "Position sync timed out — will retry next tick | symbol=%s timeout_seconds=%s",
+                symbol_n,
+                timeout_seconds,
+            )
+
+            await self._emit_event(
+                "position.sync_skipped",
+                {
+                    **base_execution_payload(
+                        exchange=exchange,
+                        market_type=self._config.default_market_type,
+                        symbol=symbol_n,
+                    ),
+                    "reason": "exchange_timeout",
+                    "timeout_seconds": timeout_seconds,
+                },
+                priority=EventPriority.LOW,
+            )
+
+            return []
         except Exception as exc:
             self._stats.reconciliation_failures += 1
             self._stats.register_failure(str(exc))
@@ -480,10 +516,10 @@ class PositionManager:
             self._logger.exception("Position reconciliation failed")
 
     def get_position(
-        self,
-        *,
-        symbol: str,
-        side: PositionSide | str | None = None,
+            self,
+            *,
+            symbol: str,
+            side: PositionSide | str | None = None,
     ) -> PositionState | None:
         symbol_n = normalize_symbol(symbol)
         side_n = self._position_side_from_raw(side)
@@ -499,10 +535,10 @@ class PositionManager:
         return self._positions.get(self._position_key(symbol_n, None))
 
     def list_positions(
-        self,
-        *,
-        symbol: str | None = None,
-        include_closed: bool = False,
+            self,
+            *,
+            symbol: str | None = None,
+            include_closed: bool = False,
     ) -> list[PositionState]:
         symbol_n = normalize_symbol(symbol) if symbol else None
 
@@ -517,10 +553,10 @@ class PositionManager:
         return positions
 
     def has_open_position(
-        self,
-        *,
-        symbol: str,
-        side: PositionSide | str | None = None,
+            self,
+            *,
+            symbol: str,
+            side: PositionSide | str | None = None,
     ) -> bool:
         position = self.get_position(symbol=symbol, side=side)
         return bool(position and position.is_open)
@@ -793,9 +829,10 @@ class PositionManager:
             ),
             raw=dict(payload),
         )
+
     def _resolve_position_state_for_fill(
-        self,
-        fill: OrderFill,
+            self,
+            fill: OrderFill,
     ) -> tuple[str, PositionState | None, PositionSide]:
         """
         Resolve target position state and effective fill direction.
@@ -836,6 +873,7 @@ class PositionManager:
             return long_key, None, PositionSide.LONG
 
         raise PositionError(f"Unsupported fill side: {fill.side!r}")
+
     def _new_position_state_from_fill(self, fill: OrderFill) -> PositionState:
         leverage = safe_float(fill.metadata.get("final_leverage"))
         margin_used = safe_float(fill.metadata.get("final_margin"), 0.0) or 0.0
@@ -1016,11 +1054,12 @@ class PositionManager:
             return PositionSide.SHORT
 
         return None
+
     @staticmethod
     def _payload_or_metadata(
-        payload: Mapping[str, Any],
-        key: str,
-        default: Any = None,
+            payload: Mapping[str, Any],
+            key: str,
+            default: Any = None,
     ) -> Any:
         """
         Read value from top-level payload first, then from payload["metadata"].
@@ -1042,6 +1081,7 @@ class PositionManager:
                 return value
 
         return default
+
     @staticmethod
     def _trade_tier_from_raw(value: Any) -> TradeTier | None:
         if value is None:
@@ -1060,10 +1100,10 @@ class PositionManager:
 
     @staticmethod
     def _infer_position_side_from_order_side(
-        *,
-        order_side: OrderSide,
-        reduce_only: bool,
-        close_position: bool,
+            *,
+            order_side: OrderSide,
+            reduce_only: bool,
+            close_position: bool,
     ) -> PositionSide:
         """
         Best-effort fallback when Binance positionSide is absent.
@@ -1136,11 +1176,11 @@ class PositionManager:
         return {}
 
     async def _emit_event(
-        self,
-        topic: str,
-        payload: dict[str, Any],
-        *,
-        priority: EventPriority = EventPriority.NORMAL,
+            self,
+            topic: str,
+            payload: dict[str, Any],
+            *,
+            priority: EventPriority = EventPriority.NORMAL,
     ) -> None:
         if self._event_bus is None:
             return

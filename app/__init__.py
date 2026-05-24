@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Any
 __version__ = "0.1.0"
 
 _FACTORY_EXPORTS = {
+    "build_market_state_store": ".factories",
+    "build_market_ingestion_service": ".factories",
+    "build_market_scheduler": ".factories",
     "build_rest_clients": ".factories",
     "build_exchange_ws_clients": ".factories",
     "build_data_caches": ".factories",
@@ -88,6 +91,9 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:
     from .factories import (
         build_analytics_components,
+        build_market_state_store,
+        build_market_ingestion_service,
+        build_market_scheduler,
         build_data_caches,
         build_exchange_ws_clients,
         build_execution_components,
