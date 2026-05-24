@@ -1000,6 +1000,173 @@ class BaseSpreadAnalyzer(ABC):
             pass
         return self.normalize_funding_payload(getattr(event, "payload", None))
 
+
+    # ------------------------------------------------------------------
+    # State-driven MarketScheduler adapters
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _level_payload_from_state(level: Any) -> dict[str, Any] | list[Any] | tuple[Any, ...] | None:
+        if level is None:
+            return None
+        if isinstance(level, Mapping):
+            return dict(level)
+        to_dict = getattr(level, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+            if isinstance(value, dict):
+                return value
+        price = getattr(level, "price", None)
+        quantity = getattr(level, "quantity", getattr(level, "qty", getattr(level, "size", None)))
+        if price is not None and quantity is not None:
+            return {"price": price, "quantity": quantity, "size": quantity}
+        return None
+
+    def _scope_dict_from_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        if isinstance(snapshot, Mapping):
+            raw_scope = snapshot.get("scope")
+            if isinstance(raw_scope, Mapping):
+                return dict(raw_scope)
+            return {
+                "exchange": snapshot.get("exchange"),
+                "market_type": snapshot.get("market_type"),
+                "symbol": snapshot.get("symbol"),
+                "timeframe": snapshot.get("timeframe") or self._config.default_timeframe,
+                "exchange_symbol": snapshot.get("exchange_symbol"),
+            }
+
+        scope = getattr(snapshot, "scope", None)
+        if hasattr(scope, "to_dict"):
+            value = scope.to_dict()
+            if isinstance(value, dict):
+                value.setdefault("timeframe", self._config.default_timeframe)
+                return value
+        return {
+            "exchange": getattr(scope, "exchange", None),
+            "market_type": getattr(scope, "market_type", None),
+            "symbol": getattr(scope, "symbol", None),
+            "timeframe": getattr(scope, "timeframe", None) or self._config.default_timeframe,
+            "exchange_symbol": getattr(scope, "exchange_symbol", None),
+        }
+
+    def orderbook_payload_from_market_snapshot(self, snapshot: Any) -> dict[str, Any] | None:
+        if snapshot is None:
+            return None
+
+        if isinstance(snapshot, Mapping):
+            raw = dict(snapshot)
+            orderbook = raw.get("orderbook") or raw.get("book") or raw.get("depth")
+        else:
+            raw = snapshot.to_dict() if hasattr(snapshot, "to_dict") else {}
+            orderbook = getattr(snapshot, "orderbook", None)
+
+        if orderbook is None:
+            return None
+
+        if isinstance(orderbook, Mapping):
+            book = dict(orderbook)
+        elif hasattr(orderbook, "to_dict"):
+            book = orderbook.to_dict()
+        else:
+            book = {
+                "bids": getattr(orderbook, "bids", ()),
+                "asks": getattr(orderbook, "asks", ()),
+                "best_bid": getattr(orderbook, "best_bid", None),
+                "best_ask": getattr(orderbook, "best_ask", None),
+                "mid_price": getattr(orderbook, "mid_price", None),
+                "spread": getattr(orderbook, "spread", None),
+                "sequence": getattr(orderbook, "sequence", None),
+                "last_update_ms": getattr(orderbook, "last_update_ms", None),
+            }
+
+        scope = self._scope_dict_from_market_snapshot(snapshot)
+        bids = [item for item in (self._level_payload_from_state(level) for level in (book.get("bids") or ())) if item is not None]
+        asks = [item for item in (self._level_payload_from_state(level) for level in (book.get("asks") or ())) if item is not None]
+
+        best_bid = book.get("best_bid") or book.get("bid") or book.get("bid_price")
+        best_ask = book.get("best_ask") or book.get("ask") or book.get("ask_price")
+        if not bids and best_bid is not None:
+            bids = [{"price": best_bid, "quantity": book.get("best_bid_size") or book.get("bid_size") or 0}]
+        if not asks and best_ask is not None:
+            asks = [{"price": best_ask, "quantity": book.get("best_ask_size") or book.get("ask_size") or 0}]
+
+        if not bids and not asks and best_bid is None and best_ask is None:
+            return None
+
+        payload = {
+            **scope,
+            "exchange": scope.get("exchange") or raw.get("exchange"),
+            "market_type": scope.get("market_type") or raw.get("market_type"),
+            "symbol": scope.get("symbol") or raw.get("symbol"),
+            "timeframe": scope.get("timeframe") or raw.get("timeframe") or self._config.default_timeframe,
+            "exchange_symbol": scope.get("exchange_symbol") or raw.get("exchange_symbol") or scope.get("symbol") or raw.get("symbol"),
+            "bids": bids,
+            "asks": asks,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid_price": book.get("mid_price") or raw.get("current_price") or raw.get("reference_price"),
+            "last_price": raw.get("last_price") or raw.get("price") or raw.get("reference_price"),
+            "mark_price": raw.get("mark_price"),
+            "index_price": raw.get("index_price"),
+            "spread": book.get("spread"),
+            "sequence_id": book.get("sequence") or book.get("sequence_id") or book.get("last_update_id"),
+            "updated_at_ms": raw.get("updated_at_ms") or book.get("last_update_ms"),
+            "timestamp_ms": raw.get("updated_at_ms") or book.get("last_update_ms"),
+            "metadata": {
+                "source": "market_scheduler",
+                "source_topic": "market.state.snapshot",
+                "dirty_reasons": raw.get("dirty_reasons") or [],
+            },
+        }
+        return payload if payload.get("exchange") and payload.get("symbol") else None
+
+    def funding_payload_from_market_snapshot(self, snapshot: Any) -> dict[str, Any] | None:
+        if snapshot is None:
+            return None
+
+        if isinstance(snapshot, Mapping):
+            raw = dict(snapshot)
+            funding = raw.get("funding")
+        else:
+            raw = snapshot.to_dict() if hasattr(snapshot, "to_dict") else {}
+            funding = getattr(snapshot, "funding", None)
+
+        if funding is None:
+            return None
+
+        if isinstance(funding, Mapping):
+            data = dict(funding)
+        elif hasattr(funding, "to_dict"):
+            data = funding.to_dict()
+        else:
+            data = {
+                "funding_rate": getattr(funding, "funding_rate", None),
+                "next_funding_time_ms": getattr(funding, "next_funding_time_ms", None),
+                "mark_price": getattr(funding, "mark_price", None),
+                "index_price": getattr(funding, "index_price", None),
+                "timestamp_ms": getattr(funding, "timestamp_ms", None),
+                "metadata": getattr(funding, "metadata", {}),
+            }
+
+        scope = self._scope_dict_from_market_snapshot(snapshot)
+        payload = {
+            **data,
+            **scope,
+            "exchange": scope.get("exchange") or raw.get("exchange"),
+            "market_type": scope.get("market_type") or raw.get("market_type"),
+            "symbol": scope.get("symbol") or raw.get("symbol"),
+            "timeframe": scope.get("timeframe") or raw.get("timeframe") or self._config.default_timeframe,
+            "exchange_symbol": scope.get("exchange_symbol") or raw.get("exchange_symbol") or scope.get("symbol") or raw.get("symbol"),
+            "timestamp_ms": data.get("timestamp_ms") or raw.get("updated_at_ms"),
+            "metadata": {
+                **dict(data.get("metadata") or {}),
+                "source": "market_scheduler",
+                "source_topic": "market.state.snapshot",
+                "dirty_reasons": raw.get("dirty_reasons") or [],
+            },
+        }
+        return payload if payload.get("exchange") and payload.get("symbol") and payload.get("funding_rate") is not None else None
+
     @staticmethod
     def _looks_like_orderbook_payload(payload: Mapping[str, Any]) -> bool:
         """

@@ -1274,13 +1274,34 @@ class WhalesTradingStrategy(TradingStrategy):
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering WhalesTradingStrategy._resolve_feature_payload")
+        domain = self.whales_domain(context)
+        event_name = str(domain.get("event_name") or domain.get("topic") or domain.get("source_topic") or "")
+
         candidate = (
             self.whales_item(context, key)
             or self.whales_path(context, key, None)
             or self._feature_value(context, feature_name)
         )
 
+        # Some normalized whale analytics events are themselves the canonical
+        # section payload, e.g. analytics.whales.large_trade has side/notional/
+        # zscore at the domain top-level rather than under domain["large_trade"].
+        # Use the full domain only for section-compatible event types. Do not
+        # synthesize liquidation_context/cluster from plain large-trade events.
+        if candidate is None:
+            normalized_event = event_name.lower()
+            if key == "large_trade" and "large_trade" in normalized_event:
+                candidate = domain
+            elif key == "pressure" and "pressure" in normalized_event:
+                candidate = domain
+            elif key == "activity" and "activity" in normalized_event:
+                candidate = domain
+
         payload = extractor(candidate) if candidate is not None else {}
+
+        if not payload and isinstance(candidate, Mapping):
+            payload = dict(candidate)
+
         event_time = extract_event_time(payload)
 
         validation_reason = whale_payload_validation_reason(

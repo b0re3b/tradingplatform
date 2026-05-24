@@ -394,6 +394,7 @@ class TelegramQueueState:
     dropped_events: int = 0
     dropped_oldest_events: int = 0
     enqueue_timeout_events: int = 0
+    stale_dropped_events: int = 0
 
     def configure(self, *, enabled: bool, max_size: int, worker_count: int) -> None:
         self.enabled = enabled
@@ -426,12 +427,22 @@ class TelegramQueueState:
         if not ok:
             self.failed_events += 1
 
-    def mark_dropped(self, *, reason: str, dropped_oldest: bool = False, timeout: bool = False, queue_size: int | None = None) -> None:
+    def mark_dropped(
+        self,
+        *,
+        reason: str,
+        dropped_oldest: bool = False,
+        timeout: bool = False,
+        stale: bool = False,
+        queue_size: int | None = None,
+    ) -> None:
         self.dropped_events += 1
         if dropped_oldest:
             self.dropped_oldest_events += 1
         if timeout:
             self.enqueue_timeout_events += 1
+        if stale:
+            self.stale_dropped_events += 1
         if queue_size is not None:
             self.current_size = max(0, queue_size)
         self.last_dropped_at_ms = _now_ms()
@@ -470,6 +481,7 @@ class TelegramQueueState:
             "dropped_events": self.dropped_events,
             "dropped_oldest_events": self.dropped_oldest_events,
             "enqueue_timeout_events": self.enqueue_timeout_events,
+            "stale_dropped_events": self.stale_dropped_events,
         }
 
 

@@ -67,9 +67,10 @@ class TelegramRateLimitConfig:
 
     enabled: bool = True
     max_messages_per_second: float = 20.0
-    max_messages_per_topic_per_minute: int = 60
-    drop_when_limited: bool = False
-    min_interval_per_topic_sec: float = 0.25
+    max_messages_per_topic_per_minute: int = 240
+    drop_when_limited: bool = True
+    min_interval_per_topic_sec: float = 0.05
+    max_wait_sec: float = 0.20
 
     def validate(self) -> None:
         if self.max_messages_per_second <= 0:
@@ -94,6 +95,12 @@ class TelegramRateLimitConfig:
                 details={"min_interval_per_topic_sec": self.min_interval_per_topic_sec},
             )
 
+        if self.max_wait_sec < 0:
+            raise TelegramConfigError(
+                "Telegram max_wait_sec must be >= 0.",
+                details={"max_wait_sec": self.max_wait_sec},
+            )
+
 
 @dataclass(slots=True)
 class TelegramQueueConfig:
@@ -106,12 +113,13 @@ class TelegramQueueConfig:
     """
 
     enabled: bool = True
-    max_size: int = 1000
-    worker_count: int = 1
+    max_size: int = 5000
+    worker_count: int = 3
     enqueue_timeout_sec: float = 0.05
     shutdown_timeout_sec: float = 10.0
     drain_on_stop: bool = True
     full_policy: str = "drop_oldest"  # drop_oldest | drop_newest | block
+    max_event_age_sec: float = 15.0
 
     def validate(self) -> None:
         if self.max_size <= 0:
@@ -142,6 +150,76 @@ class TelegramQueueConfig:
             raise TelegramConfigError(
                 "Telegram queue full_policy must be one of: drop_oldest, drop_newest, block.",
                 details={"full_policy": self.full_policy},
+            )
+
+        if self.max_event_age_sec < 0:
+            raise TelegramConfigError(
+                "Telegram queue max_event_age_sec must be >= 0.",
+                details={"max_event_age_sec": self.max_event_age_sec},
+            )
+
+
+@dataclass(slots=True)
+class TelegramDeliveryPolicyConfig:
+    """
+    Per-topic delivery policy for high-volume Telegram analytics notifications.
+
+    Immediate topics should be delivered with only TTL/rate-limit checks.
+    Coalesced topics are grouped by topic+exchange+symbol+timeframe and only
+    the latest event in a short window is delivered, preventing visible
+    "silence -> burst" behaviour during analytics spikes.
+    """
+
+    enabled: bool = True
+    coalescing_enabled: bool = True
+    default_coalesce_window_sec: float = 3.0
+    liquidity_map_updated_window_sec: float = 5.0
+    liquidity_signal_updated_window_sec: float = 3.0
+    orderflow_cvd_updated_window_sec: float = 3.0
+    max_pending_coalesced: int = 1000
+
+    # Stop-cluster alerts are useful only when they are strong or genuinely new.
+    stop_cluster_min_score: float = 0.60
+    stop_cluster_dedup_ttl_sec: float = 180.0
+
+    # Orderflow signals are actionable but can burst per symbol; throttle them by
+    # symbol/timeframe instead of blocking the whole Telegram worker.
+    orderflow_cvd_signal_min_interval_sec: float = 5.0
+
+    # Whale large trades should remain immediate, but stale queued whale events
+    # should not be delivered as a delayed batch.
+    whale_large_trade_max_age_sec: float = 10.0
+
+    def validate(self) -> None:
+        if self.default_coalesce_window_sec < 0:
+            raise TelegramConfigError(
+                "Telegram default coalesce window must be >= 0.",
+                details={"default_coalesce_window_sec": self.default_coalesce_window_sec},
+            )
+        if self.max_pending_coalesced <= 0:
+            raise TelegramConfigError(
+                "Telegram max_pending_coalesced must be > 0.",
+                details={"max_pending_coalesced": self.max_pending_coalesced},
+            )
+        if self.stop_cluster_min_score < 0:
+            raise TelegramConfigError(
+                "Telegram stop_cluster_min_score must be >= 0.",
+                details={"stop_cluster_min_score": self.stop_cluster_min_score},
+            )
+        if self.stop_cluster_dedup_ttl_sec < 0:
+            raise TelegramConfigError(
+                "Telegram stop_cluster_dedup_ttl_sec must be >= 0.",
+                details={"stop_cluster_dedup_ttl_sec": self.stop_cluster_dedup_ttl_sec},
+            )
+        if self.orderflow_cvd_signal_min_interval_sec < 0:
+            raise TelegramConfigError(
+                "Telegram orderflow_cvd_signal_min_interval_sec must be >= 0.",
+                details={"orderflow_cvd_signal_min_interval_sec": self.orderflow_cvd_signal_min_interval_sec},
+            )
+        if self.whale_large_trade_max_age_sec < 0:
+            raise TelegramConfigError(
+                "Telegram whale_large_trade_max_age_sec must be >= 0.",
+                details={"whale_large_trade_max_age_sec": self.whale_large_trade_max_age_sec},
             )
 
 
@@ -245,6 +323,7 @@ class TelegramBotConfig:
     retry: TelegramRetryConfig = field(default_factory=TelegramRetryConfig)
     rate_limit: TelegramRateLimitConfig = field(default_factory=TelegramRateLimitConfig)
     queue: TelegramQueueConfig = field(default_factory=TelegramQueueConfig)
+    delivery_policy: TelegramDeliveryPolicyConfig = field(default_factory=TelegramDeliveryPolicyConfig)
 
     # Мапінг topic -> message_thread_id.
     topic_ids: dict[TelegramTopic, int] = field(default_factory=dict)
@@ -407,7 +486,7 @@ class TelegramBotConfig:
                 ),
                 retry_on_rate_limit=_to_bool(
                     os.getenv(f"{prefix}RETRY_ON_RATE_LIMIT"),
-                    default=True,
+                    default=False,
                 ),
                 retry_on_timeout=_to_bool(
                     os.getenv(f"{prefix}RETRY_ON_TIMEOUT"),
@@ -433,15 +512,20 @@ class TelegramBotConfig:
                 ),
                 max_messages_per_topic_per_minute=_to_int(
                     os.getenv(f"{prefix}MAX_MESSAGES_PER_TOPIC_PER_MINUTE"),
-                    default=60,
+                    default=240,
                 ),
                 drop_when_limited=_to_bool(
                     os.getenv(f"{prefix}DROP_WHEN_LIMITED"),
-                    default=False,
+                    default=True,
                 ),
                 min_interval_per_topic_sec=_to_float(
                     os.getenv(f"{prefix}MIN_INTERVAL_PER_TOPIC_SEC"),
-                    default=0.25,
+                    default=0.05,
+                ),
+                max_wait_sec=_to_float(
+                    os.getenv(f"{prefix}RATE_LIMIT_MAX_WAIT_SEC")
+                    or os.getenv(f"{prefix}MAX_RATE_LIMIT_WAIT_SEC"),
+                    default=0.20,
                 ),
             ),
             queue=TelegramQueueConfig(
@@ -451,11 +535,11 @@ class TelegramBotConfig:
                 ),
                 max_size=_to_int(
                     os.getenv(f"{prefix}QUEUE_MAX_SIZE"),
-                    default=1000,
+                    default=5000,
                 ),
                 worker_count=_to_int(
                     os.getenv(f"{prefix}QUEUE_WORKER_COUNT"),
-                    default=1,
+                    default=3,
                 ),
                 enqueue_timeout_sec=_to_float(
                     os.getenv(f"{prefix}QUEUE_ENQUEUE_TIMEOUT_SEC"),
@@ -470,6 +554,56 @@ class TelegramBotConfig:
                     default=True,
                 ),
                 full_policy=os.getenv(f"{prefix}QUEUE_FULL_POLICY", "drop_oldest"),
+                max_event_age_sec=_to_float(
+                    os.getenv(f"{prefix}QUEUE_MAX_EVENT_AGE_SEC"),
+                    default=15.0,
+                ),
+            ),
+            delivery_policy=TelegramDeliveryPolicyConfig(
+                enabled=_to_bool(
+                    os.getenv(f"{prefix}DELIVERY_POLICY_ENABLED"),
+                    default=True,
+                ),
+                coalescing_enabled=_to_bool(
+                    os.getenv(f"{prefix}COALESCING_ENABLED"),
+                    default=True,
+                ),
+                default_coalesce_window_sec=_to_float(
+                    os.getenv(f"{prefix}COALESCE_WINDOW_SEC"),
+                    default=3.0,
+                ),
+                liquidity_map_updated_window_sec=_to_float(
+                    os.getenv(f"{prefix}LIQUIDITY_MAP_UPDATED_COALESCE_SEC"),
+                    default=5.0,
+                ),
+                liquidity_signal_updated_window_sec=_to_float(
+                    os.getenv(f"{prefix}LIQUIDITY_SIGNAL_UPDATED_COALESCE_SEC"),
+                    default=3.0,
+                ),
+                orderflow_cvd_updated_window_sec=_to_float(
+                    os.getenv(f"{prefix}ORDERFLOW_CVD_UPDATED_COALESCE_SEC"),
+                    default=3.0,
+                ),
+                max_pending_coalesced=_to_int(
+                    os.getenv(f"{prefix}MAX_PENDING_COALESCED"),
+                    default=1000,
+                ),
+                stop_cluster_min_score=_to_float(
+                    os.getenv(f"{prefix}STOP_CLUSTER_MIN_SCORE"),
+                    default=0.60,
+                ),
+                stop_cluster_dedup_ttl_sec=_to_float(
+                    os.getenv(f"{prefix}STOP_CLUSTER_DEDUP_TTL_SEC"),
+                    default=180.0,
+                ),
+                orderflow_cvd_signal_min_interval_sec=_to_float(
+                    os.getenv(f"{prefix}ORDERFLOW_CVD_SIGNAL_MIN_INTERVAL_SEC"),
+                    default=5.0,
+                ),
+                whale_large_trade_max_age_sec=_to_float(
+                    os.getenv(f"{prefix}WHALE_LARGE_TRADE_MAX_AGE_SEC"),
+                    default=10.0,
+                ),
             ),
             topic_ids=cls.default_topic_ids(),
         )
@@ -571,6 +705,7 @@ class TelegramBotConfig:
         self.retry.validate()
         self.rate_limit.validate()
         self.queue.validate()
+        self.delivery_policy.validate()
 
         for topic, thread_id in self.topic_ids.items():
             if not isinstance(topic, TelegramTopic):
@@ -669,6 +804,7 @@ class TelegramBotConfig:
                 "min_interval_per_topic_sec": (
                     self.rate_limit.min_interval_per_topic_sec
                 ),
+                "max_wait_sec": self.rate_limit.max_wait_sec,
             },
             "queue": {
                 "enabled": self.queue.enabled,
@@ -678,6 +814,20 @@ class TelegramBotConfig:
                 "shutdown_timeout_sec": self.queue.shutdown_timeout_sec,
                 "drain_on_stop": self.queue.drain_on_stop,
                 "full_policy": self.queue.full_policy,
+                "max_event_age_sec": self.queue.max_event_age_sec,
+            },
+            "delivery_policy": {
+                "enabled": self.delivery_policy.enabled,
+                "coalescing_enabled": self.delivery_policy.coalescing_enabled,
+                "default_coalesce_window_sec": self.delivery_policy.default_coalesce_window_sec,
+                "liquidity_map_updated_window_sec": self.delivery_policy.liquidity_map_updated_window_sec,
+                "liquidity_signal_updated_window_sec": self.delivery_policy.liquidity_signal_updated_window_sec,
+                "orderflow_cvd_updated_window_sec": self.delivery_policy.orderflow_cvd_updated_window_sec,
+                "max_pending_coalesced": self.delivery_policy.max_pending_coalesced,
+                "stop_cluster_min_score": self.delivery_policy.stop_cluster_min_score,
+                "stop_cluster_dedup_ttl_sec": self.delivery_policy.stop_cluster_dedup_ttl_sec,
+                "orderflow_cvd_signal_min_interval_sec": self.delivery_policy.orderflow_cvd_signal_min_interval_sec,
+                "whale_large_trade_max_age_sec": self.delivery_policy.whale_large_trade_max_age_sec,
             },
         }
 

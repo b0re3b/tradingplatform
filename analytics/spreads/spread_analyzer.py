@@ -587,6 +587,62 @@ class SpreadAnalyzer:
     # Stats
     # ------------------------------------------------------------------
 
+
+    async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        """
+        State-driven MarketScheduler entrypoint for the spreads facade.
+
+        This method must be compatible with both the current facade attributes
+        (``_spot_futures_analyzer`` / ``_cross_exchange_analyzer``) and older
+        hotfix attribute names.  It deliberately uses ``getattr`` so a disabled
+        child analyzer does not crash the whole MarketScheduler evaluation.
+        """
+        result: dict[str, Any] = {
+            "processed": False,
+            "spot_futures": None,
+            "cross_exchange": None,
+            "skipped": {},
+        }
+
+        async def _call_child(name: str, child: Any) -> dict[str, Any]:
+            if child is None:
+                return {"processed": False, "reason": f"{name}_child_not_configured"}
+
+            callback = getattr(child, "process_market_snapshot", None)
+            if not callable(callback):
+                return {"processed": False, "reason": f"{name}_child_missing_process_market_snapshot"}
+
+            child_result = await callback(snapshot)
+            if isinstance(child_result, dict):
+                return child_result
+            return {"processed": bool(child_result), "result": child_result}
+
+        spot_futures = (
+            getattr(self, "_spot_futures_analyzer", None)
+            or getattr(self, "_spot_futures", None)
+        )
+        cross_exchange = (
+            getattr(self, "_cross_exchange_analyzer", None)
+            or getattr(self, "_cross_exchange", None)
+        )
+
+        result["spot_futures"] = await _call_child("spot_futures", spot_futures)
+        if result["spot_futures"].get("processed"):
+            result["processed"] = True
+        else:
+            result["skipped"]["spot_futures"] = result["spot_futures"].get("reason")
+
+        result["cross_exchange"] = await _call_child("cross_exchange", cross_exchange)
+        if result["cross_exchange"].get("processed"):
+            result["processed"] = True
+        else:
+            result["skipped"]["cross_exchange"] = result["cross_exchange"].get("reason")
+
+        if not result["processed"]:
+            result["reason"] = "no_child_analyzer_processed_snapshot"
+
+        return result
+
     def get_stats(self) -> dict[str, Any]:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)

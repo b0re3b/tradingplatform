@@ -153,18 +153,38 @@ def get_attr_or_key(value: Any, key: str, default: Any = None) -> Any:
 
 
 def get_path(value: Any, path: str, default: Any = None) -> Any:
+    """
+    Read dotted path from dict-like/object-like data.
+
+    Supports both nested data and literal dotted feature-map keys, e.g.
+    ``{"liquidity.snapshot": {...}}``.  This mirrors the normalized
+    StrategyContext shape produced by SignalNormalizer.
+    """
     if not isinstance(path, str) or not path.strip():
         return default
 
+    normalized = path.strip()
+    mapping = as_mapping(value)
+    if mapping is not None and normalized in mapping:
+        item = mapping.get(normalized)
+        return default if item is None else item
+
     current = value
 
-    for part in path.split("."):
+    for index, part in enumerate(normalized.split(".")):
         if current is None:
             return default
 
         part = part.strip()
         if not part:
             return default
+
+        current_mapping = as_mapping(current)
+        if current_mapping is not None:
+            remainder = ".".join(normalized.split(".")[index:])
+            if remainder in current_mapping:
+                item = current_mapping.get(remainder)
+                return default if item is None else item
 
         current = get_attr_or_key(current, part, default=None)
 
@@ -382,8 +402,13 @@ def abs_score(value: Any, default: float = 0.0) -> float:
 LIQUIDITY_DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
     "snapshot": (
         "snapshot",
+        "liquidity_snapshot",
         "liquidity_map_snapshot",
+        "liquidity.map.snapshot",
+        "liquidity.snapshot",
         "map_snapshot",
+        "map",
+        "liquidity_map",
         "last_snapshot",
     ),
     "current_price": (
@@ -420,6 +445,7 @@ SNAPSHOT_FEATURE_KEYS: tuple[str, ...] = (
     "liquidity.snapshot",
     "liquidity_snapshot",
     "liquidity.map.snapshot",
+    "liquidity.map.updated",
     "analytics.liquidity.map.snapshot",
     "analytics.liquidity.map.updated",
 )

@@ -145,26 +145,43 @@ def get_path(value: Any, path: str, default: Any = None) -> Any:
     """
     Read dotted path from dict-like or object-like nested data.
 
-    Examples:
-        cvd.delta_ratio
-        volume_delta.delta_ratio
-        aggressive_trades.buy_ratio
-        orderbook_imbalance.imbalance_diff
+    Supports both nested dictionaries and literal dotted keys. This is important
+    for StrategyContext domain payloads where the normalizer may contain both
+    forms at the same time, for example::
+
+        {"orderflow.cvd.delta_ratio": 0.8}
+        {"orderflow": {"cvd": {"delta_ratio": 0.8}}}
     """
     if not isinstance(path, str) or not path.strip():
         return default
 
-    current = value
+    normalized_path = path.strip()
+    root_mapping = as_mapping(value)
+    if root_mapping is not None and normalized_path in root_mapping:
+        item = root_mapping.get(normalized_path)
+        return default if item is None else item
 
-    for part in path.split("."):
+    current = value
+    parts = [part.strip() for part in normalized_path.split(".") if part.strip()]
+
+    for index, part in enumerate(parts):
         if current is None:
             return default
 
-        part = part.strip()
-        if not part:
+        current_mapping = as_mapping(current)
+        if current_mapping is not None:
+            remaining = ".".join(parts[index:])
+            if remaining in current_mapping:
+                item = current_mapping.get(remaining)
+                return default if item is None else item
+
+            if part in current_mapping:
+                current = current_mapping.get(part)
+                continue
+
             return default
 
-        current = get_attr_or_key(current, part, default=None)
+        current = getattr(current, part, None)
 
     return default if current is None else current
 

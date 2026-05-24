@@ -74,12 +74,14 @@ class TelegramBotService:
     # consumer. Non-actionable updates are still filtered again by TelegramRouter.
     ANALYTICS_SIGNAL_EVENTS: tuple[str, ...] = (
         # Orderflow
+        "analytics.orderflow.cvd.updated",
         "analytics.orderflow.cvd.signal",
         "analytics.orderflow.volume_delta.signal",
         "analytics.orderflow.aggressive_trades.signal",
         "analytics.orderflow.orderbook_imbalance.signal",
 
         # Liquidity
+        "analytics.liquidity.map.updated",
         "analytics.liquidity.signal.updated",
         "analytics.liquidity.level.detected",
         "analytics.liquidity.level.swept",
@@ -90,6 +92,7 @@ class TelegramBotService:
         "analytics.liquidations.exhaustion_detected",
 
         # Whales
+        "analytics.whales.large_trade",
         "analytics.whales.whale_activity",
         "analytics.whales.whale_pressure",
         "analytics.whales.whale_liquidation_context",

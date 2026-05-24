@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import inspect
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -32,6 +33,46 @@ class QueueFullPolicy(str, Enum):
 class HandlerDispatchMode(str, Enum):
     SEQUENTIAL = "sequential"
     CONCURRENT = "concurrent"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True, slots=True)
+class NoiseRule:
+    """Topic-level publish suppression rule for diagnostic/noisy events.
+
+    sample_rate semantics:
+    - >= 1.0: keep every matching event;
+    - 0.1: keep approximately every 10th matching event;
+    - <= 0.0: drop every matching event.
+
+    This is intentionally applied only to diagnostic topics. Trading-critical
+    events are protected before noise filtering.
+    """
+
+    pattern: str
+    sample_rate: float = 1.0
+    reason: str = "noise_filter"
 
 
 @dataclass(slots=True)
@@ -142,6 +183,18 @@ class EventBus:
         "system.startup",
     )
 
+    # Proactive noise filtering.  These events are diagnostics/telemetry and
+    # should never compete with analytics, strategy signals, risk, execution,
+    # or position events.  The bus still tracks suppressed counts in stats().
+    DEFAULT_NOISE_RULES: tuple[NoiseRule, ...] = (
+        NoiseRule("system.scheduler.job_started", 0.0, "scheduler_job_started_suppressed"),
+        NoiseRule("system.scheduler.job_completed", 0.0, "scheduler_job_completed_suppressed"),
+        NoiseRule("system.scheduler.job_skipped", 0.10, "scheduler_job_skipped_sampled"),
+        NoiseRule("strategy.engine.batch_processed", 0.05, "strategy_batch_processed_sampled"),
+        NoiseRule("signal.rejected", 0.05, "signal_rejected_sampled"),
+        NoiseRule("news.scored", 0.02, "news_scored_sampled"),
+    )
+
     def __init__(
         self,
         *,
@@ -154,6 +207,8 @@ class EventBus:
         handler_dispatch_mode: HandlerDispatchMode | str = HandlerDispatchMode.CONCURRENT,
         handler_timeout: float | None = None,
         service_name: str = "event_bus",
+        noise_filter_enabled: bool | None = None,
+        noise_rules: tuple[NoiseRule, ...] | None = None,
     ) -> None:
         self._max_queue_size = max_queue_size
         self._worker_count = worker_count
@@ -164,6 +219,13 @@ class EventBus:
         self._handler_dispatch_mode = self._coerce_dispatch_mode(handler_dispatch_mode)
         self._handler_timeout = handler_timeout
         self._service_name = service_name
+        self._noise_filter_enabled = (
+            _env_bool("EVENT_BUS_NOISE_FILTER_ENABLED", True)
+            if noise_filter_enabled is None
+            else bool(noise_filter_enabled)
+        )
+        self._noise_rules = self._build_noise_rules(noise_rules)
+        self._noise_counters: dict[str, int] = {}
 
         self._logger = get_logger(
             __name__,
@@ -203,6 +265,10 @@ class EventBus:
             "protected_enqueue_waits": 0,
             "handler_errors": {},
             "handler_dispatch_mode": self._handler_dispatch_mode.value,
+            "noise_filter_enabled": self._noise_filter_enabled,
+            "noise_suppressed": 0,
+            "topic_suppressed": {},
+            "suppression_reasons": {},
         }
 
     # ---------------------------------------------------------------------
@@ -361,6 +427,9 @@ class EventBus:
             )
             return False
 
+        if self._should_suppress_event(event):
+            return False
+
         event = await self._apply_middlewares(event)
         if event is None:
             self._inc_metric("dropped")
@@ -379,6 +448,9 @@ class EventBus:
             raise RuntimeError("EventBus is not started")
 
         if self._stopping:
+            return False
+
+        if self._should_suppress_event(event):
             return False
 
         event = await self._apply_middlewares(event)
@@ -520,6 +592,99 @@ class EventBus:
     # ---------------------------------------------------------------------
     # Queue / middleware / matching
     # ---------------------------------------------------------------------
+
+    def _build_noise_rules(self, explicit_rules: tuple[NoiseRule, ...] | None) -> tuple[NoiseRule, ...]:
+        if explicit_rules is not None:
+            return explicit_rules
+
+        return (
+            NoiseRule(
+                "system.scheduler.job_started",
+                0.0 if _env_bool("EVENT_BUS_SUPPRESS_SCHEDULER_JOB_STARTED", True) else 1.0,
+                "scheduler_job_started_suppressed",
+            ),
+            NoiseRule(
+                "system.scheduler.job_completed",
+                0.0 if _env_bool("EVENT_BUS_SUPPRESS_SCHEDULER_JOB_COMPLETED", True) else 1.0,
+                "scheduler_job_completed_suppressed",
+            ),
+            NoiseRule(
+                "system.scheduler.job_skipped",
+                _env_float("EVENT_BUS_SCHEDULER_JOB_SKIPPED_SAMPLE_RATE", 0.10),
+                "scheduler_job_skipped_sampled",
+            ),
+            NoiseRule(
+                "strategy.engine.batch_processed",
+                _env_float("EVENT_BUS_STRATEGY_BATCH_PROCESSED_SAMPLE_RATE", 0.05),
+                "strategy_batch_processed_sampled",
+            ),
+            NoiseRule(
+                "signal.rejected",
+                _env_float("EVENT_BUS_SIGNAL_REJECTED_SAMPLE_RATE", 0.05),
+                "signal_rejected_sampled",
+            ),
+            NoiseRule(
+                "news.scored",
+                _env_float("EVENT_BUS_NEWS_SCORED_SAMPLE_RATE", 0.02),
+                "news_scored_sampled",
+            ),
+        )
+
+    def _should_suppress_event(self, event: Event) -> bool:
+        if not self._noise_filter_enabled:
+            return False
+
+        if event.headers.get("bypass_noise_filter") is True:
+            return False
+
+        # Never suppress trading-critical/protected events.
+        if self._is_protected_topic(event.topic):
+            return False
+
+        # Keep explicitly high-priority non-diagnostic events untouched.
+        if event.priority in {EventPriority.CRITICAL, EventPriority.HIGH} and not self._is_known_diagnostic_topic(event.topic):
+            return False
+
+        for rule in self._noise_rules:
+            if not fnmatch.fnmatch(event.topic, rule.pattern):
+                continue
+
+            if self._keep_sampled_event(event.topic, rule.sample_rate):
+                return False
+
+            self._record_suppressed_event(event, reason=rule.reason)
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_known_diagnostic_topic(topic: str) -> bool:
+        return (
+            topic.startswith("system.scheduler.")
+            or topic == "strategy.engine.batch_processed"
+            or topic == "signal.rejected"
+            or topic == "news.scored"
+        )
+
+    def _keep_sampled_event(self, topic: str, sample_rate: float) -> bool:
+        if sample_rate >= 1.0:
+            return True
+        if sample_rate <= 0.0:
+            return False
+
+        counter = self._noise_counters.get(topic, 0) + 1
+        self._noise_counters[topic] = counter
+        keep_every = max(int(round(1.0 / sample_rate)), 1)
+        return counter % keep_every == 0
+
+    def _record_suppressed_event(self, event: Event, *, reason: str) -> None:
+        self._inc_metric("dropped")
+        self._inc_metric("noise_suppressed")
+        self._inc_nested_metric("topic_dropped", event.topic)
+        self._inc_nested_metric("topic_suppressed", event.topic)
+        self._inc_nested_metric("drop_reasons", reason)
+        self._inc_nested_metric("suppression_reasons", reason)
+        self._metrics["queue_size"] = self._queue.qsize()
 
     @staticmethod
     def _coerce_dispatch_mode(value: HandlerDispatchMode | str) -> HandlerDispatchMode:
@@ -837,6 +1002,10 @@ class EventBus:
             "drop_reasons": dict(self._metrics["drop_reasons"]),
             "protected_enqueue_waits": self._metrics["protected_enqueue_waits"],
             "handler_errors": dict(self._metrics["handler_errors"]),
+            "noise_filter_enabled": self._metrics.get("noise_filter_enabled", False),
+            "noise_suppressed": self._metrics.get("noise_suppressed", 0),
+            "topic_suppressed": dict(self._metrics.get("topic_suppressed", {})),
+            "suppression_reasons": dict(self._metrics.get("suppression_reasons", {})),
         }
 
     def _inc_metric(self, key: str, amount: int = 1) -> None:

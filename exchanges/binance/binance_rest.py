@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -40,7 +41,19 @@ class BinanceFuturesRestClientConfig:
     It uses /fapi/* endpoints, not spot /api/v3/* endpoints.
     """
 
-    rest_url: str = "https://testnet.binancefuture.com"
+    # Public market-data REST base URL.  Keep this on production for real
+    # analytics even when execution is paper/demo/testnet.
+    market_data_rest_url: str = "https://fapi.binance.com"
+
+    # Private execution/account REST base URL.  Keep this on demo/testnet/paper
+    # until live trading is explicitly enabled.
+    execution_rest_url: str = "https://testnet.binancefuture.com"
+
+    # Backward-compatible alias used only by legacy callers/logs.  New request
+    # routing uses market_data_rest_url for public endpoints and
+    # execution_rest_url for signed/auth/private endpoints.
+    rest_url: str = "https://fapi.binance.com"
+
     timeout_seconds: float = 10.0
 
     recv_window: int = 10000
@@ -59,6 +72,14 @@ class BinanceFuturesRestClientConfig:
     # sync failures while keeping all trading/write endpoints strictly protected.
     allow_private_read_without_credentials: bool = True
 
+    # Private REST guard.  In paper/demo mode execution services may exist, but
+    # this REST client must not keep calling Binance private endpoints such as
+    # /fapi/v2/positionRisk or /fapi/v1/openOrders.  Read-only private methods
+    # return empty skipped snapshots when this flag is false; write/trading
+    # methods fail fast before any HTTP request.
+    execution_env: str = "testnet"
+    execution_private_rest_enabled: bool = True
+
     # ---------------------------------------------------------------------------
     # Derivative snapshot polling throttle
     # ---------------------------------------------------------------------------
@@ -69,6 +90,12 @@ class BinanceFuturesRestClientConfig:
     derivative_snapshot_poll_batch_size: int = 2
     # Minimum seconds between derivative snapshot poll ticks.
     derivative_snapshot_poll_interval_seconds: float = 180.0
+    # OI/funding use their own cheaper retry/timeout policy so a slow public
+    # endpoint cannot block the scheduler for 3x generic REST timeouts.
+    derivative_snapshot_timeout_seconds: float = 20.0
+    derivative_snapshot_request_retries: int = 1
+    derivative_snapshot_retry_delay_seconds: float = 0.10
+    emit_derivative_poll_events: bool = True
 
     # ---------------------------------------------------------------------------
     # Symbol availability management
@@ -87,14 +114,185 @@ class BinanceFuturesRestClientConfig:
     @classmethod
     def from_core_config(cls, config: Config) -> "BinanceFuturesRestClientConfig":
         defaults = cls()
-        return cls(
-            rest_url=config.exchange.rest_url or defaults.rest_url,
-            timeout_seconds=config.exchange.timeout_seconds,
-            recv_window=defaults.recv_window,
-            max_recv_window=defaults.max_recv_window,
-            time_sync_on_start=defaults.time_sync_on_start,
-            resync_time_error_codes=defaults.resync_time_error_codes,
+
+        exchange_cfg = getattr(config, "exchange", None)
+        market_data_env = (
+            os.getenv("BINANCE_MARKET_DATA_ENV")
+            or os.getenv("MARKET_DATA_ENV")
+            or getattr(exchange_cfg, "market_data_env", None)
         )
+        execution_env = (
+            os.getenv("BINANCE_EXECUTION_ENV")
+            or os.getenv("EXECUTION_ENV")
+            or getattr(exchange_cfg, "execution_env", None)
+            or defaults.execution_env
+        )
+
+        market_data_rest_url = cls._resolve_rest_url_from_env(
+            prefix="BINANCE_MARKET_DATA",
+            env_name=market_data_env,
+            explicit=(
+                os.getenv("BINANCE_MARKET_DATA_REST_URL")
+                or os.getenv("MARKET_DATA_REST_URL")
+                or getattr(exchange_cfg, "market_data_rest_url", None)
+            ),
+            default=defaults.market_data_rest_url,
+        )
+
+        execution_rest_url = cls._resolve_rest_url_from_env(
+            prefix="BINANCE_EXECUTION",
+            env_name=execution_env,
+            explicit=(
+                os.getenv("BINANCE_EXECUTION_REST_URL")
+                or os.getenv("EXECUTION_REST_URL")
+                or getattr(exchange_cfg, "execution_rest_url", None)
+            ),
+            # Legacy config.exchange.rest_url is treated as execution/private URL,
+            # so old testnet setups stay safe while market data can be real.
+            default=(getattr(exchange_cfg, "rest_url", None) or defaults.execution_rest_url),
+        )
+
+        timeout = float(getattr(exchange_cfg, "timeout_seconds", defaults.timeout_seconds) or defaults.timeout_seconds)
+        execution_env_n = str(execution_env or defaults.execution_env).strip().lower()
+        private_rest_default = execution_env_n not in {"paper", "disabled", "off", "false", "none"}
+
+        return cls(
+            market_data_rest_url=market_data_rest_url,
+            execution_rest_url=execution_rest_url,
+            rest_url=market_data_rest_url,
+            timeout_seconds=cls._env_float("BINANCE_TIMEOUT_SECONDS", "BINANCE_MARKET_DATA_TIMEOUT_SECONDS", "EXCHANGE_TIMEOUT_SECONDS", default=timeout),
+            recv_window=cls._env_int("BINANCE_RECV_WINDOW", "EXCHANGE_RECV_WINDOW", default=defaults.recv_window),
+            max_recv_window=cls._env_int("BINANCE_MAX_RECV_WINDOW", default=defaults.max_recv_window),
+            time_sync_on_start=cls._env_bool("BINANCE_TIME_SYNC_ON_START", default=defaults.time_sync_on_start),
+            resync_time_error_codes=defaults.resync_time_error_codes,
+            request_retries=cls._env_int("BINANCE_REQUEST_RETRIES", "EXCHANGE_REQUEST_RETRIES", default=defaults.request_retries),
+            retry_delay_seconds=cls._env_float("BINANCE_RETRY_DELAY_SECONDS", "EXCHANGE_RETRY_DELAY_SECONDS", default=defaults.retry_delay_seconds),
+            emit_success_events=cls._env_bool("BINANCE_EMIT_SUCCESS_EVENTS", default=defaults.emit_success_events),
+            emit_error_events=cls._env_bool("BINANCE_EMIT_ERROR_EVENTS", default=defaults.emit_error_events),
+            allow_private_read_without_credentials=cls._env_bool(
+                "BINANCE_ALLOW_PRIVATE_READ_WITHOUT_CREDENTIALS",
+                "EXECUTION_ALLOW_PRIVATE_READ_WITHOUT_CREDENTIALS",
+                default=defaults.allow_private_read_without_credentials,
+            ),
+            execution_env=execution_env_n,
+            execution_private_rest_enabled=cls._env_bool(
+                "EXECUTION_PRIVATE_REST_ENABLED",
+                "BINANCE_EXECUTION_PRIVATE_REST_ENABLED",
+                default=private_rest_default,
+            ),
+            derivative_snapshot_poll_concurrency=cls._env_int(
+                "DERIVATIVE_SNAPSHOT_POLL_CONCURRENCY",
+                "BINANCE_DERIVATIVE_POLL_CONCURRENCY",
+                default=defaults.derivative_snapshot_poll_concurrency,
+            ),
+            derivative_snapshot_poll_batch_size=cls._env_int(
+                "DERIVATIVE_SNAPSHOT_POLL_BATCH_SIZE",
+                "BINANCE_DERIVATIVE_POLL_BATCH_SIZE",
+                default=defaults.derivative_snapshot_poll_batch_size,
+            ),
+            derivative_snapshot_poll_interval_seconds=cls._env_float(
+                "DERIVATIVE_SNAPSHOT_POLL_INTERVAL_SECONDS",
+                "BINANCE_DERIVATIVE_POLL_INTERVAL_SECONDS",
+                default=defaults.derivative_snapshot_poll_interval_seconds,
+            ),
+            derivative_snapshot_timeout_seconds=cls._env_float(
+                "DERIVATIVE_SNAPSHOT_TIMEOUT_SECONDS",
+                "DERIVATIVE_SNAPSHOT_REQUEST_TIMEOUT_SECONDS",
+                "BINANCE_DERIVATIVE_TIMEOUT_SECONDS",
+                default=defaults.derivative_snapshot_timeout_seconds,
+            ),
+            derivative_snapshot_request_retries=cls._env_int(
+                "DERIVATIVE_SNAPSHOT_REQUEST_RETRIES",
+                "BINANCE_DERIVATIVE_REQUEST_RETRIES",
+                default=defaults.derivative_snapshot_request_retries,
+            ),
+            derivative_snapshot_retry_delay_seconds=cls._env_float(
+                "DERIVATIVE_SNAPSHOT_RETRY_DELAY_SECONDS",
+                "BINANCE_DERIVATIVE_RETRY_DELAY_SECONDS",
+                default=defaults.derivative_snapshot_retry_delay_seconds,
+            ),
+            emit_derivative_poll_events=cls._env_bool(
+                "DERIVATIVE_SNAPSHOT_EMIT_EVENTS",
+                "BINANCE_DERIVATIVE_EMIT_EVENTS",
+                default=defaults.emit_derivative_poll_events,
+            ),
+            derivative_symbol_blocklist=cls._env_tuple(
+                "DERIVATIVE_SYMBOL_BLOCKLIST",
+                "BINANCE_DERIVATIVE_SYMBOL_BLOCKLIST",
+                default=defaults.derivative_symbol_blocklist,
+            ),
+        )
+
+    @staticmethod
+    def _env_bool(*keys: str, default: bool = False) -> bool:
+        for key in keys:
+            value = os.getenv(key)
+            if value is None or value.strip() == "":
+                continue
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _env_int(*keys: str, default: int) -> int:
+        for key in keys:
+            value = os.getenv(key)
+            if value is None or value.strip() == "":
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return default
+
+    @staticmethod
+    def _env_float(*keys: str, default: float) -> float:
+        for key in keys:
+            value = os.getenv(key)
+            if value is None or value.strip() == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return default
+
+    @staticmethod
+    def _env_tuple(*keys: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+        for key in keys:
+            value = os.getenv(key)
+            if value is None or value.strip() == "":
+                continue
+            return tuple(item.strip().upper() for item in value.split(",") if item.strip())
+        return default
+
+    @staticmethod
+    def _resolve_rest_url_from_env(
+        *,
+        prefix: str,
+        env_name: str | None,
+        explicit: str | None,
+        default: str,
+    ) -> str:
+        if explicit and explicit.strip():
+            return explicit.strip().rstrip("/")
+
+        mode = (env_name or "").strip().lower()
+        if mode in {"real", "prod", "production", "live"}:
+            return "https://fapi.binance.com"
+        if mode in {"demo"}:
+            return "https://demo-fapi.binance.com"
+        if mode in {"test", "testnet", "sandbox", "paper"}:
+            return "https://testnet.binancefuture.com"
+
+        prefixed = os.getenv(f"{prefix}_REST_URL")
+        if prefixed and prefixed.strip():
+            return prefixed.strip().rstrip("/")
+
+        return default.rstrip("/")
 
 
 class BinanceRestClient:
@@ -184,15 +382,16 @@ class BinanceRestClient:
         self._started = True
 
         self._logger.info(
-            "Binance Futures REST client started | base_url=%s timeout=%s recv_window=%s",
-            self._rest_config.rest_url,
+            "Binance Futures REST client started | market_data_url=%s execution_url=%s timeout=%s recv_window=%s",
+            self._rest_config.market_data_rest_url,
+            self._rest_config.execution_rest_url,
             self._rest_config.timeout_seconds,
             self._rest_config.recv_window,
         )
 
         if self._rest_config.time_sync_on_start:
             try:
-                await self.sync_time()
+                await self.sync_time(endpoint_scope="execution")
             except Exception:
                 self._logger.warning(
                     "Initial Binance Futures server time sync failed; will retry before signed requests",
@@ -204,7 +403,8 @@ class BinanceRestClient:
             {
                 "exchange": self.EXCHANGE,
                 "market_type": "usdm_futures",
-                "rest_url": self._rest_config.rest_url,
+                "market_data_rest_url": self._rest_config.market_data_rest_url,
+                "execution_rest_url": self._rest_config.execution_rest_url,
             },
             priority=EventPriority.LOW,
         )
@@ -240,15 +440,16 @@ class BinanceRestClient:
             path="/fapi/v1/ping",
         )
 
-    async def get_server_time(self) -> dict[str, Any]:
+    async def get_server_time(self, *, endpoint_scope: str = "market_data") -> dict[str, Any]:
         return await self._request(
             method="GET",
             path="/fapi/v1/time",
+            endpoint_scope=endpoint_scope,
         )
 
-    async def sync_time(self) -> int:
+    async def sync_time(self, *, endpoint_scope: str = "market_data") -> int:
         local_before = self._current_timestamp_ms()
-        payload = await self.get_server_time()
+        payload = await self.get_server_time(endpoint_scope=endpoint_scope)
         local_after = self._current_timestamp_ms()
 
         server_time = int(payload["serverTime"])
@@ -268,6 +469,7 @@ class BinanceRestClient:
                 "market_type": "usdm_futures",
                 "server_time": server_time,
                 "offset_ms": self._time_offset_ms,
+                "endpoint_scope": endpoint_scope,
             },
             priority=EventPriority.LOW,
         )
@@ -486,6 +688,14 @@ class BinanceRestClient:
     ) -> list[dict[str, Any]]:
         symbol = symbol.upper()
 
+        if symbol in self._derivative_symbol_blocklist:
+            await self._emit_derivative_poll_event(
+                "system.derivatives.funding_poll.skipped",
+                symbol=symbol,
+                reason="blocklisted",
+            )
+            return []
+
         params: dict[str, Any] = {
             "symbol": symbol,
             "limit": limit,
@@ -496,11 +706,55 @@ class BinanceRestClient:
         if end_time is not None:
             params["endTime"] = end_time
 
-        payload = await self._request(
-            method="GET",
-            path="/fapi/v1/fundingRate",
-            params=params,
+        await self._emit_derivative_poll_event(
+            "system.derivatives.funding_poll.started",
+            symbol=symbol,
         )
+
+        async with self._derivative_poll_semaphore:
+            try:
+                payload = await self._request(
+                    method="GET",
+                    path="/fapi/v1/fundingRate",
+                    params=params,
+                    timeout_seconds=self._rest_config.derivative_snapshot_timeout_seconds,
+                    request_retries=self._rest_config.derivative_snapshot_request_retries,
+                    retry_delay_seconds=self._rest_config.derivative_snapshot_retry_delay_seconds,
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning(
+                    "Funding poll timed out — will retry next tick | symbol=%s timeout_seconds=%s",
+                    symbol,
+                    self._rest_config.derivative_snapshot_timeout_seconds,
+                )
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.funding_poll.timeout",
+                    symbol=symbol,
+                    reason="timeout",
+                )
+                return []
+            except BinanceSymbolUnavailableError as exc:
+                self._derivative_symbol_blocklist.add(symbol)
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.funding_poll.skipped",
+                    symbol=symbol,
+                    reason="symbol_unavailable",
+                    code=exc.code,
+                )
+                return []
+            except Exception as exc:
+                self._logger.warning(
+                    "Funding poll failed — will retry next tick | symbol=%s error=%r",
+                    symbol,
+                    exc,
+                )
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.funding_poll.failed",
+                    symbol=symbol,
+                    reason="request_failed",
+                    error=str(exc),
+                )
+                return []
 
         normalized = [
             {
@@ -509,19 +763,26 @@ class BinanceRestClient:
                 "symbol": item.get("symbol") or symbol,
                 "funding_rate": self._safe_float(item.get("fundingRate")),
                 "funding_time": item.get("fundingTime"),
+                "mark_price": self._safe_float(item.get("markPrice")),
+                "index_price": self._safe_float(item.get("indexPrice")),
+                "snapshot_time": self._current_timestamp_ms(),
+                "metadata": {
+                    "source": "binance_futures_rest",
+                    "raw": item,
+                },
             }
             for item in payload
             if isinstance(item, dict)
         ]
 
         funding_snapshot_payload = {
-                "exchange": self.EXCHANGE,
-                "market_type": "usdm_futures",
-                "symbol": symbol,
-                "count": len(normalized),
-                "items": normalized,
-                "snapshot_time": self._current_timestamp_ms(),
-            }
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol,
+            "count": len(normalized),
+            "items": normalized,
+            "snapshot_time": self._current_timestamp_ms(),
+        }
         if self._market_ingestion is not None:
             for item in normalized:
                 await self._market_ingestion.ingest_funding(item)
@@ -531,6 +792,12 @@ class BinanceRestClient:
                 funding_snapshot_payload,
                 priority=EventPriority.NORMAL,
             )
+
+        await self._emit_derivative_poll_event(
+            "system.derivatives.funding_poll.success",
+            symbol=symbol,
+            count=len(normalized),
+        )
 
         return normalized
 
@@ -546,7 +813,17 @@ class BinanceRestClient:
                 "Skipping open interest poll — symbol in blocklist | symbol=%s",
                 symbol,
             )
-            return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "blocklisted"}
+            await self._emit_derivative_poll_event(
+                "system.derivatives.oi_poll.skipped",
+                symbol=symbol,
+                reason="blocklisted",
+            )
+            return self._derivative_skipped_payload(symbol=symbol, reason="blocklisted")
+
+        await self._emit_derivative_poll_event(
+            "system.derivatives.oi_poll.started",
+            symbol=symbol,
+        )
 
         async with self._derivative_poll_semaphore:
             try:
@@ -554,14 +831,22 @@ class BinanceRestClient:
                     method="GET",
                     path="/fapi/v1/openInterest",
                     params={"symbol": symbol},
+                    timeout_seconds=self._rest_config.derivative_snapshot_timeout_seconds,
+                    request_retries=self._rest_config.derivative_snapshot_request_retries,
+                    retry_delay_seconds=self._rest_config.derivative_snapshot_retry_delay_seconds,
                 )
-            except asyncio.TimeoutError as exc:
+            except asyncio.TimeoutError:
                 self._logger.warning(
                     "Open interest poll timed out — will retry next tick | symbol=%s timeout_seconds=%s",
                     symbol,
-                    self._rest_config.timeout_seconds,
+                    self._rest_config.derivative_snapshot_timeout_seconds,
                 )
-                return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "timeout"}
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.oi_poll.timeout",
+                    symbol=symbol,
+                    reason="timeout",
+                )
+                return self._derivative_skipped_payload(symbol=symbol, reason="timeout")
             except BinanceSymbolUnavailableError as exc:
                 self._derivative_symbol_blocklist.add(symbol)
                 self._logger.warning(
@@ -569,42 +854,75 @@ class BinanceRestClient:
                     symbol,
                     exc.code,
                 )
-                return {"exchange": self.EXCHANGE, "market_type": "usdm_futures", "symbol": symbol, "skipped": True, "skip_reason": "symbol_unavailable", "code": exc.code}
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.oi_poll.skipped",
+                    symbol=symbol,
+                    reason="symbol_unavailable",
+                    code=exc.code,
+                )
+                return self._derivative_skipped_payload(symbol=symbol, reason="symbol_unavailable", code=exc.code)
+            except Exception as exc:
+                self._logger.warning(
+                    "Open interest poll failed — will retry next tick | symbol=%s error=%r",
+                    symbol,
+                    exc,
+                )
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.oi_poll.failed",
+                    symbol=symbol,
+                    reason="request_failed",
+                    error=str(exc),
+                )
+                return self._derivative_skipped_payload(symbol=symbol, reason="request_failed", error=str(exc))
 
-        mark_price = None
-        index_price = None
-        premium_payload: dict[str, Any] | None = None
-        try:
-            premium_raw = await self.get_premium_index(symbol=symbol)
-            if isinstance(premium_raw, dict):
-                premium_payload = premium_raw
-                mark_price = self._safe_float(premium_raw.get("markPrice"))
-                index_price = self._safe_float(premium_raw.get("indexPrice"))
-        except Exception as exc:
-            self._logger.debug(
-                "Open interest price enrichment skipped | symbol=%s error=%r",
-                symbol,
-                exc,
-            )
+            mark_price = None
+            index_price = None
+            premium_payload: dict[str, Any] | None = None
+            try:
+                premium_raw = await self._request(
+                    method="GET",
+                    path="/fapi/v1/premiumIndex",
+                    params={"symbol": symbol},
+                    timeout_seconds=self._rest_config.derivative_snapshot_timeout_seconds,
+                    request_retries=0,
+                    retry_delay_seconds=self._rest_config.derivative_snapshot_retry_delay_seconds,
+                )
+                if isinstance(premium_raw, dict):
+                    premium_payload = premium_raw
+                    mark_price = self._safe_float(premium_raw.get("markPrice"))
+                    index_price = self._safe_float(premium_raw.get("indexPrice"))
+            except Exception as exc:
+                self._logger.debug(
+                    "Open interest price enrichment skipped | symbol=%s error=%r",
+                    symbol,
+                    exc,
+                )
+                await self._emit_derivative_poll_event(
+                    "system.derivatives.oi_poll.price_enrichment_skipped",
+                    symbol=symbol,
+                    reason="premium_index_failed",
+                    error=str(exc),
+                )
 
-        oi_value = self._safe_float(payload.get("openInterest"))
+        oi_value = self._safe_float(payload.get("openInterest")) if isinstance(payload, dict) else None
         oi_notional = oi_value * mark_price if oi_value is not None and mark_price is not None else None
 
         normalized = {
             "exchange": self.EXCHANGE,
             "market_type": "usdm_futures",
-            "symbol": payload.get("symbol") or symbol,
+            "symbol": payload.get("symbol") or symbol if isinstance(payload, dict) else symbol,
             "open_interest": oi_value,
             "open_interest_value": oi_notional,
             "mark_price": mark_price,
             "index_price": index_price,
-            "time": payload.get("time"),
+            "time": payload.get("time") if isinstance(payload, dict) else None,
             "snapshot_time": self._current_timestamp_ms(),
             "metadata": {
                 "source": "binance_futures_rest",
                 "open_interest_raw": payload,
                 "premium_index_raw": premium_payload,
                 "open_interest_value_formula": "open_interest * mark_price",
+                "price_enriched": mark_price is not None or index_price is not None,
             },
         }
 
@@ -616,6 +934,15 @@ class BinanceRestClient:
                 normalized,
                 priority=EventPriority.NORMAL,
             )
+
+        await self._emit_derivative_poll_event(
+            "system.derivatives.oi_poll.success",
+            symbol=symbol,
+            open_interest=oi_value,
+            mark_price=mark_price,
+            index_price=index_price,
+            open_interest_value=oi_notional,
+        )
 
         return normalized
 
@@ -1445,6 +1772,34 @@ class BinanceRestClient:
         return normalized
 
     # ------------------------------------------------------------------
+    # Endpoint routing helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_endpoint_scope(
+        self,
+        *,
+        endpoint_scope: str | None,
+        signed: bool,
+        auth_required: bool,
+    ) -> str:
+        if endpoint_scope:
+            normalized = endpoint_scope.strip().lower()
+            if normalized in {"market", "market_data", "public", "data"}:
+                return "market_data"
+            if normalized in {"execution", "private", "account", "trading", "user"}:
+                return "execution"
+            raise ValueError(f"Unsupported Binance REST endpoint_scope: {endpoint_scope!r}")
+
+        return "execution" if signed or auth_required else "market_data"
+
+    def _base_url_for_scope(self, scope: str) -> str:
+        if scope == "market_data":
+            return self._rest_config.market_data_rest_url.rstrip("/")
+        if scope == "execution":
+            return self._rest_config.execution_rest_url.rstrip("/")
+        raise ValueError(f"Unsupported Binance REST scope: {scope!r}")
+
+    # ------------------------------------------------------------------
     # Core HTTP request logic
     # ------------------------------------------------------------------
 
@@ -1456,6 +1811,10 @@ class BinanceRestClient:
         params: dict[str, Any] | None = None,
         signed: bool = False,
         auth_required: bool = False,
+        endpoint_scope: str | None = None,
+        timeout_seconds: float | None = None,
+        request_retries: int | None = None,
+        retry_delay_seconds: float | None = None,
     ) -> Any:
         await self._ensure_session()
 
@@ -1478,17 +1837,26 @@ class BinanceRestClient:
             # Binance returns -1021 when timestamp is outside recvWindow; on that
             # error we resync server time, rebuild timestamp/signature, and retry.
             if self._time_offset_ms == 0:
-                await self.sync_time()
+                await self.sync_time(endpoint_scope="execution")
 
             recv_window = self._safe_int(base_params.get("recvWindow")) or self._rest_config.recv_window
             recv_window = min(max(recv_window, self._rest_config.recv_window), self._rest_config.max_recv_window)
             base_params["recvWindow"] = recv_window
 
-        url = f"{self._rest_config.rest_url}{path}"
+        resolved_scope = self._resolve_endpoint_scope(
+            endpoint_scope=endpoint_scope,
+            signed=signed,
+            auth_required=auth_required,
+        )
+        base_url = self._base_url_for_scope(resolved_scope)
+        url = f"{base_url}{path}"
 
         last_error: Exception | None = None
+        effective_timeout = float(timeout_seconds if timeout_seconds is not None else self._rest_config.timeout_seconds)
+        effective_retries = int(request_retries if request_retries is not None else self._rest_config.request_retries)
+        effective_retry_delay = float(retry_delay_seconds if retry_delay_seconds is not None else self._rest_config.retry_delay_seconds)
 
-        for attempt in range(self._rest_config.request_retries + 1):
+        for attempt in range(effective_retries + 1):
             params_for_attempt = dict(base_params)
 
             if signed:
@@ -1499,7 +1867,8 @@ class BinanceRestClient:
 
             try:
                 self._logger.debug(
-                    "Sending Binance Futures REST request | method=%s path=%s signed=%s auth_required=%s attempt=%s time_offset_ms=%s",
+                    "Sending Binance Futures REST request | scope=%s method=%s path=%s signed=%s auth_required=%s attempt=%s time_offset_ms=%s",
+                    resolved_scope,
                     method,
                     path,
                     signed,
@@ -1513,6 +1882,7 @@ class BinanceRestClient:
                     url=url,
                     params=params_for_attempt,
                     headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=effective_timeout),
                 ) as response:
                     response_text = await response.text()
 
@@ -1551,7 +1921,7 @@ class BinanceRestClient:
                         if (
                             signed
                             and error_code in self._rest_config.resync_time_error_codes
-                            and attempt < self._rest_config.request_retries
+                            and attempt < effective_retries
                         ):
                             self._logger.warning(
                                 "Binance timestamp rejected; resyncing server time before retry | method=%s path=%s code=%s",
@@ -1559,8 +1929,8 @@ class BinanceRestClient:
                                 path,
                                 error_code,
                             )
-                            await self.sync_time()
-                            await asyncio.sleep(self._rest_config.retry_delay_seconds)
+                            await self.sync_time(endpoint_scope="execution")
+                            await asyncio.sleep(effective_retry_delay)
                             continue
 
                         raise RuntimeError(
@@ -1602,7 +1972,7 @@ class BinanceRestClient:
                         if (
                             signed
                             and code_i in self._rest_config.resync_time_error_codes
-                            and attempt < self._rest_config.request_retries
+                            and attempt < effective_retries
                         ):
                             self._logger.warning(
                                 "Binance business timestamp error; resyncing server time before retry | method=%s path=%s code=%s",
@@ -1610,8 +1980,8 @@ class BinanceRestClient:
                                 path,
                                 code_i,
                             )
-                            await self.sync_time()
-                            await asyncio.sleep(self._rest_config.retry_delay_seconds)
+                            await self.sync_time(endpoint_scope="execution")
+                            await asyncio.sleep(effective_retry_delay)
                             continue
 
                         raise RuntimeError(
@@ -1646,12 +2016,12 @@ class BinanceRestClient:
                     method,
                     path,
                     attempt + 1,
-                    self._rest_config.request_retries + 1,
-                    self._rest_config.timeout_seconds,
+                    effective_retries + 1,
+                    effective_timeout,
                 )
                 if attempt >= self._rest_config.request_retries:
                     raise
-                await asyncio.sleep(self._rest_config.retry_delay_seconds)
+                await asyncio.sleep(effective_retry_delay)
             except Exception as exc:
                 last_error = exc
 
@@ -1671,7 +2041,7 @@ class BinanceRestClient:
                     attempt + 1,
                 )
 
-                await asyncio.sleep(self._rest_config.retry_delay_seconds)
+                await asyncio.sleep(effective_retry_delay)
 
         if last_error is not None:
             raise last_error
@@ -1805,6 +2175,47 @@ class BinanceRestClient:
                 topic,
             )
 
+    async def _emit_derivative_poll_event(
+        self,
+        topic: str,
+        *,
+        symbol: str,
+        reason: str | None = None,
+        **extra: Any,
+    ) -> None:
+        if not self._rest_config.emit_derivative_poll_events:
+            return
+
+        payload: dict[str, Any] = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol.upper(),
+            "snapshot_time": self._current_timestamp_ms(),
+        }
+        if reason is not None:
+            payload["reason"] = reason
+        payload.update({key: value for key, value in extra.items() if value is not None})
+
+        await self._emit_event(topic, payload, priority=EventPriority.LOW)
+
+    def _derivative_skipped_payload(
+        self,
+        *,
+        symbol: str,
+        reason: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        payload = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": symbol.upper(),
+            "skipped": True,
+            "skip_reason": reason,
+            "snapshot_time": self._current_timestamp_ms(),
+        }
+        payload.update({key: value for key, value in extra.items() if value is not None})
+        return payload
+
     # ------------------------------------------------------------------
     # Auth / signing helpers
     # ------------------------------------------------------------------
@@ -1813,6 +2224,14 @@ class BinanceRestClient:
         return bool(self._api_key and self._api_secret)
 
     def _should_skip_private_read_without_credentials(self, operation: str) -> bool:
+        if not self._rest_config.execution_private_rest_enabled:
+            self._logger.warning(
+                "Skipping Binance Futures private read because execution private REST is disabled | operation=%s execution_env=%s",
+                operation,
+                self._rest_config.execution_env,
+            )
+            return True
+
         if self.has_credentials():
             return False
 
@@ -1826,6 +2245,10 @@ class BinanceRestClient:
         return True
 
     def _require_credentials(self) -> None:
+        if not self._rest_config.execution_private_rest_enabled:
+            raise RuntimeError(
+                "Binance Futures private REST is disabled for current execution_env"
+            )
         if not self.has_credentials():
             raise RuntimeError(
                 "Binance Futures API credentials are required for this endpoint"

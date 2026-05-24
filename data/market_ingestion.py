@@ -549,12 +549,18 @@ class MarketIngestionService:
         }
 
     def _liquidation_payload(self, update: LiquidationUpdate) -> dict[str, Any]:
+        notional = update.metadata.get("notional_usd")
+        if notional is None and update.price is not None and update.quantity is not None:
+            notional = float(update.price) * float(update.quantity)
         return {
             **self._scope_payload(update.scope),
             "order_id": update.order_id,
             "price": update.price,
             "quantity": update.quantity,
             "side": update.side,
+            "liquidation_side": update.metadata.get("liquidation_side") or update.metadata.get("raw_side") or update.side,
+            "notional_usd": notional,
+            "notional": notional,
             "timestamp_ms": update.timestamp_ms,
             "received_at_ms": update.received_at_ms,
             "metadata": dict(update.metadata),

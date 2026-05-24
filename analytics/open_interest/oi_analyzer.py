@@ -469,23 +469,22 @@ class OIAnalyzer:
             "timeframe": timeframe or getattr(self.config, "default_timeframe", None),
             "source_topic": "market_state.snapshot",
         }
-        for name in ("_on_open_interest_updated", "_handle_open_interest_updated", "on_open_interest_updated"):
-            method = getattr(self, name, None)
-            if callable(method):
-                result = method(payload)
-                if hasattr(result, "__await__"):
-                    result = await result
-                return result
-        return payload
+        event = Event(
+            topic=(getattr(self.config, "open_interest_input_topics", ("market.open_interest.updated",)) or ("market.open_interest.updated",))[0],
+            payload=payload,
+            priority=EventPriority.NORMAL,
+            source="market_state_store",
+        )
+        return await self.on_open_interest(event)
 
     async def process_market_snapshot(self, snapshot: Any) -> Any | None:
         """MarketScheduler-compatible evaluator callback.
 
-        Prefer the already supplied MarketSnapshot.  Older code re-read the
-        snapshot from an injected state source; when the scheduler passed a
-        snapshot directly but no private state source was injected, the analyzer
-        silently returned None.  This method now consumes the supplied snapshot
-        first and only falls back to process_market_state_snapshot().
+        State-driven OI must consume the same context that the old EventBus path
+        received from candle/trade/funding/orderflow/liquidation events.  The
+        scheduler already passes a rich MarketSnapshot, so update the per-scope
+        price/volume/context buffers from that snapshot before processing the
+        open-interest sample itself.
         """
         scope = getattr(snapshot, "scope", None)
         exchange = getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or getattr(self.config, "default_exchange", "binance")
@@ -493,11 +492,33 @@ class OIAnalyzer:
         symbol = getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None)
         timeframe = getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or getattr(self.config, "default_timeframe", None)
 
-        domain_value = getattr(snapshot, "open_interest", None)
+        await self._apply_market_snapshot_context(
+            snapshot,
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+
+        domain_value = self._snapshot_item(snapshot, "open_interest", "oi")
         if domain_value is not None:
-            payload = _plain(domain_value)
-            if not isinstance(payload, dict):
-                payload = {"open_interest": payload}
+            payload = self._mapping_from_value(domain_value)
+            if not payload:
+                payload = {"open_interest": domain_value}
+
+            price = self._first_float_from_value(
+                payload,
+                "mark_price", "markPrice", "current_price", "last_price", "price",
+            ) or self._snapshot_price(snapshot)
+            index_price = self._first_float_from_value(payload, "index_price", "indexPrice") or self._snapshot_index_price(snapshot)
+            oi_value = self._first_float_from_value(
+                payload,
+                "open_interest_value", "oi_value", "notional_value",
+            )
+            oi_amount = self._first_float_from_value(payload, "oi", "open_interest", "openInterest", "value")
+            if oi_value is None and oi_amount is not None and price is not None:
+                oi_value = oi_amount * price
+
             payload = {
                 **dict(payload),
                 "exchange": exchange,
@@ -507,14 +528,23 @@ class OIAnalyzer:
                 "source_topic": "market_state.snapshot",
                 "source": "market_state_store",
             }
-            for name in ("_on_open_interest_updated", "_handle_open_interest_updated", "on_open_interest_updated"):
-                method = getattr(self, name, None)
-                if callable(method):
-                    result = method(payload)
-                    if hasattr(result, "__await__"):
-                        result = await result
-                    return result
-            return payload
+            if price is not None:
+                payload.setdefault("mark_price", price)
+                payload.setdefault("current_price", price)
+                payload.setdefault("price", price)
+                payload.setdefault("last_price", price)
+            if index_price is not None:
+                payload.setdefault("index_price", index_price)
+            if oi_value is not None:
+                payload.setdefault("open_interest_value", oi_value)
+
+            event = Event(
+                topic=(getattr(self.config, "open_interest_input_topics", ("market.open_interest.updated",)) or ("market.open_interest.updated",))[0],
+                payload=payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            )
+            return await self.on_open_interest(event)
 
         return await self.process_market_state_snapshot(
             exchange=exchange,
@@ -522,6 +552,233 @@ class OIAnalyzer:
             symbol=symbol,
             timeframe=timeframe,
         )
+
+    async def _apply_market_snapshot_context(
+        self,
+        snapshot: Any,
+        *,
+        exchange: str | None,
+        market_type: str | None,
+        symbol: str | None,
+        timeframe: str | None,
+    ) -> None:
+        """Populate OI context buffers from a scheduler MarketSnapshot.
+
+        This restores the old event-driven context path for state-driven mode:
+        candles/trades feed price+volume, funding feeds funding context,
+        liquidations feed long/short liquidation context, and orderflow feeds
+        CVD/aggressive-flow context.
+        """
+        base = {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "source": "market_state_store",
+            "source_topic": "market_state.snapshot",
+        }
+
+        candle_payload = self._candle_payload_from_snapshot(snapshot, base)
+        if candle_payload:
+            await self._apply_candle_payload(candle_payload)
+
+        trade_payloads = self._trade_payloads_from_snapshot(snapshot, base)
+        for trade_payload in trade_payloads:
+            self._apply_trade_payload(trade_payload)
+
+        funding_payload = self._domain_payload_from_snapshot(snapshot, base, "funding")
+        if funding_payload:
+            await self.on_funding(Event(
+                topic=(getattr(self.config, "funding_input_topics", ("market.funding.updated",)) or ("market.funding.updated",))[0],
+                payload=funding_payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            ))
+
+        liquidation_payload = self._liquidation_payload_from_snapshot(snapshot, base)
+        if liquidation_payload:
+            await self.on_liquidation(Event(
+                topic=(getattr(self.config, "liquidations_input_topics", ("analytics.liquidations.updated",)) or ("analytics.liquidations.updated",))[0],
+                payload=liquidation_payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            ))
+
+        orderflow_payload = self._orderflow_payload_from_snapshot(snapshot, base)
+        if orderflow_payload:
+            await self.on_orderflow_update(Event(
+                topic=(getattr(self.config, "orderflow_input_topics", ("analytics.orderflow.updated",)) or ("analytics.orderflow.updated",))[0],
+                payload=orderflow_payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            ))
+
+    @staticmethod
+    def _mapping_from_value(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, Mapping):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            converted = to_dict()
+            if isinstance(converted, Mapping):
+                return dict(converted)
+        to_payload = getattr(value, "to_payload", None)
+        if callable(to_payload):
+            converted = to_payload()
+            if isinstance(converted, Mapping):
+                return dict(converted)
+        try:
+            converted = _plain(value)
+            if isinstance(converted, Mapping):
+                return dict(converted)
+        except Exception:
+            pass
+        return {}
+
+    @classmethod
+    def _snapshot_item(cls, snapshot: Any, *names: str) -> Any:
+        for name in names:
+            if hasattr(snapshot, name):
+                value = getattr(snapshot, name, None)
+                if value is not None:
+                    return value
+        mapping = cls._mapping_from_value(snapshot)
+        for name in names:
+            value = mapping.get(name)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _first_float_from_value(value: Any, *names: str) -> float | None:
+        mapping = OIAnalyzer._mapping_from_value(value)
+        candidates: list[Any] = []
+        for name in names:
+            candidates.append(mapping.get(name))
+            if hasattr(value, name):
+                candidates.append(getattr(value, name, None))
+        for item in candidates:
+            parsed = OIAnalyzer._coerce_float(item)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(parsed):
+            return None
+        return parsed
+
+    def _snapshot_price(self, snapshot: Any) -> float | None:
+        for value in (
+            self._first_float_from_value(snapshot, "mark_price", "markPrice", "current_price", "last_price", "price", "close"),
+            self._first_float_from_value(self._snapshot_item(snapshot, "ticker", "price"), "mark_price", "current_price", "last_price", "price", "close"),
+            self._first_float_from_value(self._snapshot_item(snapshot, "candle", "latest_candle", "last_candle"), "close", "c", "price", "last_price"),
+            self._first_float_from_value(self._snapshot_item(snapshot, "orderbook", "order_book", "book"), "mid_price", "mid", "mark_price", "last_price", "price"),
+        ):
+            if value is not None and value > 0:
+                return value
+        bid = self._first_float_from_value(self._snapshot_item(snapshot, "orderbook", "order_book", "book"), "best_bid", "bid", "bid_price")
+        ask = self._first_float_from_value(self._snapshot_item(snapshot, "orderbook", "order_book", "book"), "best_ask", "ask", "ask_price")
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return None
+
+    def _snapshot_index_price(self, snapshot: Any) -> float | None:
+        return (
+            self._first_float_from_value(snapshot, "index_price", "indexPrice")
+            or self._first_float_from_value(self._snapshot_item(snapshot, "open_interest", "oi"), "index_price", "indexPrice")
+        )
+
+    def _candle_payload_from_snapshot(self, snapshot: Any, base: dict[str, Any]) -> dict[str, Any] | None:
+        candle = self._snapshot_item(snapshot, "candle", "latest_candle", "last_candle", "ohlcv")
+        payload = self._mapping_from_value(candle)
+        price = self._first_float_from_value(payload, "close", "c", "price", "last_price") or self._snapshot_price(snapshot)
+        if price is None:
+            return None
+        volume = self._first_float_from_value(payload, "volume", "v", "base_volume", "qty")
+        quote_volume = self._first_float_from_value(payload, "quote_volume", "quoteVolume", "quote_volume_24h")
+        timestamp = self._first_float_from_value(payload, "timestamp", "event_time", "close_time", "timestamp_ms") or self._first_float_from_value(snapshot, "timestamp", "timestamp_ms")
+        result = {**base, **payload, "close": price, "price": price}
+        if timestamp is not None:
+            result["timestamp"] = timestamp
+        if volume is not None:
+            result["volume"] = volume
+        if quote_volume is not None:
+            result["quote_volume"] = quote_volume
+        mark_price = self._snapshot_price(snapshot)
+        if mark_price is not None:
+            result.setdefault("mark_price", mark_price)
+        index_price = self._snapshot_index_price(snapshot)
+        if index_price is not None:
+            result.setdefault("index_price", index_price)
+        return result
+
+    def _trade_payloads_from_snapshot(self, snapshot: Any, base: dict[str, Any]) -> list[dict[str, Any]]:
+        trades_obj = self._snapshot_item(snapshot, "trades", "recent_trades", "trades_window")
+        if trades_obj is None:
+            return []
+        trades: list[Any]
+        if isinstance(trades_obj, Mapping):
+            trades = list(trades_obj.get("trades") or trades_obj.get("items") or trades_obj.get("events") or [])
+        elif isinstance(trades_obj, (list, tuple, set)):
+            trades = list(trades_obj)
+        else:
+            maybe = getattr(trades_obj, "trades", None) or getattr(trades_obj, "items", None) or getattr(trades_obj, "events", None)
+            trades = list(maybe) if isinstance(maybe, (list, tuple, set)) else []
+        results: list[dict[str, Any]] = []
+        for trade in trades[-50:]:
+            item = self._mapping_from_value(trade)
+            if not item:
+                continue
+            price = self._first_float_from_value(item, "price", "p", "last_price")
+            qty = self._first_float_from_value(item, "qty", "quantity", "q", "size", "volume")
+            if price is None and qty is None:
+                continue
+            results.append({**base, **item})
+        return results
+
+    def _domain_payload_from_snapshot(self, snapshot: Any, base: dict[str, Any], *names: str) -> dict[str, Any] | None:
+        value = self._snapshot_item(snapshot, *names)
+        payload = self._mapping_from_value(value)
+        if not payload:
+            return None
+        return {**base, **payload}
+
+    def _liquidation_payload_from_snapshot(self, snapshot: Any, base: dict[str, Any]) -> dict[str, Any] | None:
+        value = self._snapshot_item(snapshot, "liquidations", "recent_liquidations", "liquidation_events")
+        payload = self._mapping_from_value(value)
+        if not payload and isinstance(value, (list, tuple, set)):
+            long_total = 0.0
+            short_total = 0.0
+            for item in value:
+                data = self._mapping_from_value(item)
+                side = str(data.get("side") or data.get("liquidation_side") or "").lower()
+                qty = self._coerce_float(data.get("notional_usd") or data.get("notional") or data.get("qty") or data.get("quantity")) or 0.0
+                if side in {"long", "buy"}:
+                    long_total += qty
+                elif side in {"short", "sell"}:
+                    short_total += qty
+            if long_total or short_total:
+                payload = {"long_liquidations": long_total, "short_liquidations": short_total}
+        if not payload:
+            return None
+        return {**base, **payload}
+
+    def _orderflow_payload_from_snapshot(self, snapshot: Any, base: dict[str, Any]) -> dict[str, Any] | None:
+        for name in ("orderflow", "order_flow", "flow", "cvd"):
+            payload = self._domain_payload_from_snapshot(snapshot, base, name)
+            if payload:
+                return payload
+        return None
 
     # ------------------------------------------------------------------
     # Lifecycle / registration
@@ -907,6 +1164,24 @@ class OIAnalyzer:
 
             buffers.append_oi(snapshot.oi, snapshot.timestamp)
             state.apply_snapshot(snapshot)
+
+            # In state-driven mode OI REST snapshots commonly include mark/index
+            # price but no separate candle event at the same timeframe.  Use the
+            # mark price as a price-series point so anomaly/divergence features
+            # can compute price_points, price_delta_pct and price_direction.
+            snapshot_price = snapshot.mark_price or snapshot.index_price
+            if snapshot_price is not None and snapshot_price > 0:
+                context_for_price = self._get_or_create_context(key, snapshot.timestamp)
+                self._update_price_context(
+                    context=context_for_price,
+                    buffers=buffers,
+                    price=float(snapshot_price),
+                )
+                if snapshot.mark_price is not None:
+                    context_for_price.mark_price = snapshot.mark_price
+                if snapshot.index_price is not None:
+                    context_for_price.index_price = snapshot.index_price
+                state.apply_context(context_for_price)
 
             context = self._get_context_for_key(key)
             if self.config.require_price_context and context is None:

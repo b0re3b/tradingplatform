@@ -186,6 +186,8 @@ class LiquidationSnapshot:
     side: str
     timestamp_ms: int
     order_id: str | None = None
+    notional_usd: float | None = None
+    liquidation_side: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -193,8 +195,11 @@ class LiquidationSnapshot:
             "price": self.price,
             "quantity": self.quantity,
             "side": self.side,
+            "liquidation_side": self.liquidation_side or self.side,
             "timestamp_ms": self.timestamp_ms,
             "order_id": self.order_id,
+            "notional_usd": self.notional_usd,
+            "notional": self.notional_usd,
             "metadata": dict(self.metadata),
         }
 

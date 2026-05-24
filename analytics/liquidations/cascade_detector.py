@@ -40,6 +40,79 @@ from analytics.liquidations.utils import (
 )
 
 
+
+def _liquidations_detector_truthy_contract_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return bool(value)
+    return True
+
+
+def _enrich_detection_strategy_payload(payload: Any, *, topic: str | None = None) -> dict[str, Any]:
+    """
+    Normalize CascadeDetectionResult payloads into strategy features.
+
+    Strategy-side required features:
+        liquidations.cascade     -> LiquidationCascadeStrategy
+        liquidations.exhaustion  -> SqueezeReversalStrategy
+    """
+    if hasattr(payload, "to_dict") and callable(payload.to_dict):
+        result = payload.to_dict(serialize=True)
+    elif isinstance(payload, dict):
+        result = dict(payload)
+    else:
+        result = {"result": payload}
+
+    event_name = str(topic or result.get("event_name") or result.get("topic") or result.get("source_topic") or "")
+    result.setdefault("domain", "liquidations")
+    result.setdefault("event_name", event_name)
+    result.setdefault("topic", event_name)
+    result.setdefault("source_topic", event_name)
+
+    feature_map = dict(result.get("feature_map") or {})
+    is_exhaustion = "exhaustion" in event_name
+    is_cascade = "cascade" in event_name or not is_exhaustion
+
+    if is_cascade:
+        cascade_payload = result.get("cascade") if isinstance(result.get("cascade"), dict) else dict(result)
+        result.setdefault("cascade", cascade_payload)
+        feature_map.setdefault("liquidations.cascade", cascade_payload)
+        feature_map.setdefault("liquidations.cascade.confidence", result.get("confidence"))
+        feature_map.setdefault("liquidations.cascade.intensity_score", result.get("intensity_score"))
+        feature_map.setdefault("liquidations.cascade.direction", result.get("direction"))
+        feature_map.setdefault("liquidations.cascade.severity", result.get("severity"))
+        feature_map.setdefault("liquidations.cascade.continuation_bias", result.get("continuation_bias"))
+        feature_map.setdefault("liquidations.cascade.exhaustion_bias", result.get("exhaustion_bias"))
+        feature_map.setdefault("liquidations.cascade.total_notional_usd", result.get("total_notional_usd"))
+        feature_map.setdefault("liquidations.cascade.event_count", result.get("event_count"))
+
+    if is_exhaustion or result.get("exhaustion_bias") is not None:
+        exhaustion_payload = result.get("exhaustion") if isinstance(result.get("exhaustion"), dict) else dict(result)
+        result.setdefault("exhaustion", exhaustion_payload)
+        feature_map.setdefault("liquidations.exhaustion", exhaustion_payload)
+        feature_map.setdefault("liquidations.exhaustion.confidence", result.get("confidence"))
+        feature_map.setdefault("liquidations.exhaustion.exhaustion_bias", result.get("exhaustion_bias"))
+        feature_map.setdefault("liquidations.exhaustion.bias_delta", result.get("bias_delta"))
+        feature_map.setdefault("liquidations.exhaustion.confirmed", result.get("status") or True)
+
+    feature_map.setdefault("liquidations.symbol", result.get("symbol"))
+    feature_map.setdefault("liquidations.direction", result.get("direction"))
+    feature_map.setdefault("liquidations.side", result.get("side"))
+    feature_map = {k: v for k, v in feature_map.items() if _liquidations_detector_truthy_contract_value(v)}
+    result["feature_map"] = feature_map
+    result.setdefault("strategy_contract_version", "analytics-strategy-v1")
+    contract = dict(result.get("strategy_contract") or {})
+    contract.setdefault("version", "analytics-strategy-v1")
+    contract.setdefault("domain", "liquidations")
+    contract.setdefault("expected_by", "StrategyContext/SignalBuilder")
+    contract.setdefault("features", ["liquidations.cascade", "liquidations.exhaustion"])
+    result["strategy_contract"] = contract
+    return result
+
+
 class CascadeDetector:
     """
     Analytics detector для liquidation cascades.
@@ -986,6 +1059,10 @@ class CascadeDetector:
             source=self.service_name,
             domain="liquidations",
         )
+        strategy_payload = _enrich_detection_strategy_payload(
+            strategy_payload,
+            topic=self.config.publish_topic_detected,
+        )
         accepted = await self.event_bus.emit(
             self.config.publish_topic_detected,
             strategy_payload,
@@ -1032,6 +1109,10 @@ class CascadeDetector:
                 topic=self.config.publish_topic_exhaustion,
                 source=self.service_name,
                 domain="liquidations",
+            )
+            exhaustion_payload = _enrich_detection_strategy_payload(
+                exhaustion_payload,
+                topic=self.config.publish_topic_exhaustion,
             )
             exhaustion_accepted = await self.event_bus.emit(
                 self.config.publish_topic_exhaustion,

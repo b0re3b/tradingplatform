@@ -675,6 +675,22 @@ STRATEGY_CATALOG: dict[str, StrategyCatalogEntry] = {
             "absorption",
         ),
     ),
+    "whale_large_trade": StrategyCatalogEntry(
+        name="whale_large_trade",
+        category=StrategyCategory.WHALES,
+        default_timeframes=_tf_join(TF_FAST, Timeframe.M1, Timeframe.M5),
+        weight=0.95,
+        priority=34,
+        tags=("whales", "large_trade", "flow", "momentum", "futures"),
+        feature_hints=(
+            "whale_large_trade",
+            "large_trade",
+            "large_trade_signal",
+            "whale_activity",
+            "whale_notional",
+            "whale_zscore",
+        ),
+    ),
     "whale_breakout": StrategyCatalogEntry(
         name="whale_breakout",
         category=StrategyCategory.WHALES,

@@ -238,53 +238,404 @@ class FundingAnalyzer:
             "timeframe": timeframe or getattr(self.config, "default_timeframe", None),
             "source_topic": "market_state.snapshot",
         }
-        # Reuse private EventBus handler when available to keep domain logic intact.
-        for name in ("_on_funding_updated", "_handle_funding_updated", "on_funding_updated"):
-            method = getattr(self, name, None)
-            if callable(method):
-                result = method(payload)
-                if hasattr(result, "__await__"):
-                    result = await result
+        # Reuse the canonical EventBus handler with a synthetic Event so
+        # handler code sees the same topic/correlation/source contract as normal
+        # market.funding.updated delivery.
+        event = Event(
+            topic=getattr(self.config, "funding_event_name", "market.funding.updated"),
+            payload=payload,
+            priority=EventPriority.NORMAL,
+            source="market_state_store",
+        )
+        return await self.on_funding(event)
+
+
+    # ------------------------------------------------------------------
+    # State-driven market snapshot context adapter
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _as_plain_mapping(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        try:
+            plain = _plain(value)
+        except Exception:
+            plain = value
+        if isinstance(plain, Mapping):
+            return dict(plain)
+        to_dict = getattr(plain, "to_dict", None)
+        if callable(to_dict):
+            try:
+                converted = to_dict()
+                if isinstance(converted, Mapping):
+                    return dict(converted)
+            except Exception:
+                return {}
+        return {}
+
+    def _scope_from_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        scope = getattr(snapshot, "scope", None)
+        scope_map = self._as_plain_mapping(scope)
+        return {
+            "exchange": (
+                scope_map.get("exchange")
+                or getattr(scope, "exchange", None)
+                or getattr(snapshot, "exchange", None)
+                or self.config.default_market_type
+            ),
+            "market_type": (
+                scope_map.get("market_type")
+                or getattr(scope, "market_type", None)
+                or getattr(snapshot, "market_type", None)
+                or self.config.default_market_type
+            ),
+            "symbol": (
+                scope_map.get("symbol")
+                or getattr(scope, "symbol", None)
+                or getattr(snapshot, "symbol", None)
+            ),
+            "timeframe": (
+                scope_map.get("timeframe")
+                or getattr(scope, "timeframe", None)
+                or getattr(snapshot, "timeframe", None)
+                or self.config.default_timeframe
+            ),
+            "exchange_symbol": (
+                scope_map.get("exchange_symbol")
+                or getattr(scope, "exchange_symbol", None)
+                or getattr(snapshot, "exchange_symbol", None)
+            ),
+        }
+
+    def _first_path_value(self, value: Any, *paths: str) -> Any:
+        def read_one(current: Any, path: str) -> Any:
+            mapping = self._as_plain_mapping(current)
+            if path in mapping:
+                return mapping[path]
+            cur = current
+            for part in path.split("."):
+                if cur is None:
+                    return None
+                cur_map = self._as_plain_mapping(cur)
+                if part in cur_map:
+                    cur = cur_map[part]
+                else:
+                    cur = getattr(cur, part, None)
+            return cur
+
+        for path in paths:
+            result = read_one(value, path)
+            if result is not None:
                 return result
-        return payload
+        return None
+
+    def _latest_sequence_item(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, deque)):
+            return value[-1] if value else None
+        mapping = self._as_plain_mapping(value)
+        for key in ("latest", "last", "current", "snapshot"):
+            if mapping.get(key) is not None:
+                return mapping[key]
+        for key in ("items", "events", "values", "data", "window", "records"):
+            nested = mapping.get(key)
+            if isinstance(nested, (list, tuple, deque)) and nested:
+                return nested[-1]
+        return value
+
+    def _extract_price_from_market_snapshot(self, snapshot: Any) -> float | None:
+        direct = self._first_path_value(
+            snapshot,
+            "price",
+            "last_price",
+            "mark_price",
+            "current_price",
+            "reference_price",
+            "close",
+        )
+        parsed = self._to_optional_float(direct)
+        if parsed is not None:
+            return parsed
+
+        for attr in ("funding", "open_interest", "ticker", "trade", "trades", "candle", "candles", "orderbook"):
+            item = getattr(snapshot, attr, None)
+            if item is None:
+                continue
+            latest = self._latest_sequence_item(item)
+            candidate = self._first_path_value(
+                latest,
+                "mark_price",
+                "price",
+                "last_price",
+                "current_price",
+                "reference_price",
+                "close",
+                "c",
+                "mid_price",
+            )
+            parsed = self._to_optional_float(candidate)
+            if parsed is not None:
+                return parsed
+
+        return None
+
+    def _extract_open_interest_from_market_snapshot(self, snapshot: Any) -> float | None:
+        item = getattr(snapshot, "open_interest", None)
+        latest = self._latest_sequence_item(item)
+        return self._to_optional_float(
+            self._first_path_value(
+                latest,
+                "open_interest",
+                "oi",
+                "openInterest",
+                "value",
+            )
+        )
+
+    def _extract_cvd_from_market_snapshot(self, snapshot: Any) -> float | None:
+        for attr in ("orderflow", "cvd", "trades", "trades_window"):
+            item = getattr(snapshot, attr, None)
+            if item is None:
+                continue
+            latest = self._latest_sequence_item(item)
+            candidate = self._first_path_value(
+                latest,
+                "cvd",
+                "cumulative_volume_delta",
+                "cumulative_delta",
+                "volume_delta.cumulative_volume_delta",
+                "orderflow.cvd.value",
+            )
+            parsed = self._to_optional_float(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _extract_liquidations_from_market_snapshot(self, snapshot: Any) -> tuple[float | None, float | None]:
+        container = (
+            getattr(snapshot, "liquidations", None)
+            or getattr(snapshot, "recent_liquidations", None)
+            or getattr(snapshot, "liquidation_events", None)
+        )
+        if container is None:
+            return None, None
+
+        if isinstance(container, Mapping):
+            long_value = self._to_optional_float(
+                self._first_path_value(container, "long_liquidations", "long_notional", "long_notional_usd")
+            )
+            short_value = self._to_optional_float(
+                self._first_path_value(container, "short_liquidations", "short_notional", "short_notional_usd")
+            )
+            if long_value is not None or short_value is not None:
+                return long_value, short_value
+            items = container.get("items") or container.get("events") or container.get("liquidations") or container.get("data")
+        else:
+            items = container
+
+        if not isinstance(items, (list, tuple, deque)):
+            items = [items]
+
+        long_total = 0.0
+        short_total = 0.0
+        seen_long = False
+        seen_short = False
+        for raw in items:
+            item = self._as_plain_mapping(raw)
+            side = str(
+                self._first_path_value(item, "side", "position_side", "liquidation_side") or ""
+            ).lower()
+            notional = self._to_optional_float(
+                self._first_path_value(item, "notional", "notional_usd", "value")
+            )
+            if notional is None:
+                qty = self._to_optional_float(self._first_path_value(item, "qty", "quantity", "size"))
+                price = self._to_optional_float(self._first_path_value(item, "price"))
+                if qty is not None and price is not None:
+                    notional = qty * price
+            if notional is None:
+                continue
+            if side in {"long", "buy"}:
+                long_total += notional
+                seen_long = True
+            elif side in {"short", "sell"}:
+                short_total += notional
+                seen_short = True
+        return (long_total if seen_long else None, short_total if seen_short else None)
+
+    def _update_context_from_market_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        key: FundingKey | None = None,
+    ) -> FundingMarketContext | None:
+        scope = self._scope_from_snapshot(snapshot)
+        if key is None:
+            symbol = scope.get("symbol")
+            if not symbol:
+                return None
+            key = self._make_key(
+                symbol=str(symbol),
+                exchange=str(scope.get("exchange") or "unknown"),
+                market_type=str(scope.get("market_type") or self.config.default_market_type),
+                timeframe=scope.get("timeframe") or self.config.default_timeframe,
+            )
+
+        context = self._market_context[key]
+
+        price = self._extract_price_from_market_snapshot(snapshot)
+        if price is not None:
+            if context.latest_price != price:
+                context.previous_price = context.latest_price
+            context.latest_price = price
+
+        oi = self._extract_open_interest_from_market_snapshot(snapshot)
+        if oi is not None:
+            if context.latest_open_interest != oi:
+                context.previous_open_interest = context.latest_open_interest
+            context.latest_open_interest = oi
+
+        cvd = self._extract_cvd_from_market_snapshot(snapshot)
+        if cvd is not None:
+            if context.latest_cvd != cvd:
+                context.previous_cvd = context.latest_cvd
+            context.latest_cvd = cvd
+
+        long_liq, short_liq = self._extract_liquidations_from_market_snapshot(snapshot)
+        if long_liq is not None:
+            context.long_liquidations = long_liq
+        if short_liq is not None:
+            context.short_liquidations = short_liq
+        if long_liq is not None or short_liq is not None:
+            context.liquidation_updated_at = self._utc_now()
+
+        context.updated_at = self._utc_now()
+        return context
+
+    def _merge_related_market_context(
+        self,
+        key: FundingKey,
+        context: FundingMarketContext,
+    ) -> FundingMarketContext:
+        """Merge context collected on a different timeframe for the same instrument.
+
+        Funding analytics runs on 1h, while price/OI/orderflow context often arrives
+        on 1m or 15m.  The previous event-bus flow frequently updated the analyzer
+        with several context topics; the state-driven path must not lose that data
+        solely because context timeframe differs.
+        """
+        exchange, market_type, symbol, _timeframe = key
+        for other_key, other in list(self._market_context.items()):
+            if other_key == key:
+                continue
+            if len(other_key) != 4:
+                continue
+            other_exchange, other_market_type, other_symbol, _ = other_key
+            if (
+                other_exchange != exchange
+                or other_market_type != market_type
+                or other_symbol != symbol
+            ):
+                continue
+
+            if context.latest_open_interest is None and other.latest_open_interest is not None:
+                context.latest_open_interest = other.latest_open_interest
+                context.previous_open_interest = other.previous_open_interest
+            if context.previous_open_interest is None and other.previous_open_interest is not None:
+                context.previous_open_interest = other.previous_open_interest
+
+            if context.latest_price is None and other.latest_price is not None:
+                context.latest_price = other.latest_price
+                context.previous_price = other.previous_price
+            if context.previous_price is None and other.previous_price is not None:
+                context.previous_price = other.previous_price
+
+            if context.latest_cvd is None and other.latest_cvd is not None:
+                context.latest_cvd = other.latest_cvd
+                context.previous_cvd = other.previous_cvd
+            if context.previous_cvd is None and other.previous_cvd is not None:
+                context.previous_cvd = other.previous_cvd
+
+            if context.long_liquidations is None and other.long_liquidations is not None:
+                context.long_liquidations = other.long_liquidations
+            if context.short_liquidations is None and other.short_liquidations is not None:
+                context.short_liquidations = other.short_liquidations
+
+        return context
 
     async def process_market_snapshot(self, snapshot: Any) -> Any | None:
         """MarketScheduler-compatible evaluator callback.
 
-        Prefer the already supplied MarketSnapshot.  Older code re-read the
-        snapshot from an injected state source; when the scheduler passed a
-        snapshot directly but no private state source was injected, the analyzer
-        silently returned None.  This method now consumes the supplied snapshot
-        first and only falls back to process_market_state_snapshot().
+        In the state-driven runtime the FundingAnalyzer receives a complete
+        MarketSnapshot instead of the old sequence of EventBus context events.
+        Therefore this method first extracts price/OI/CVD/liquidations context
+        from the supplied snapshot, then feeds the canonical funding handler.
         """
-        scope = getattr(snapshot, "scope", None)
-        exchange = getattr(scope, "exchange", None) or getattr(snapshot, "exchange", None) or getattr(self.config, "default_exchange", "binance")
-        market_type = getattr(scope, "market_type", None) or getattr(snapshot, "market_type", None) or getattr(self.config, "default_market_type", "usdm_futures")
-        symbol = getattr(scope, "symbol", None) or getattr(snapshot, "symbol", None)
-        timeframe = getattr(scope, "timeframe", None) or getattr(snapshot, "timeframe", None) or getattr(self.config, "default_timeframe", None)
+        scope = self._scope_from_snapshot(snapshot)
+        exchange = scope.get("exchange") or "binance"
+        market_type = scope.get("market_type") or self.config.default_market_type
+        symbol = scope.get("symbol")
+        timeframe = scope.get("timeframe") or self.config.default_timeframe
+        exchange_symbol = scope.get("exchange_symbol") or symbol
+
+        # Always collect available context first.  This restores the information
+        # that used to arrive via market.open_interest.updated, market.candle.closed,
+        # analytics.orderflow.* and market.liquidations.* events.
+        snapshot_context = None
+        try:
+            snapshot_context = self._update_context_from_market_snapshot(snapshot)
+        except Exception:
+            self.logger.exception("Failed to extract funding context from MarketSnapshot")
 
         domain_value = getattr(snapshot, "funding", None)
         if domain_value is not None:
             payload = _plain(domain_value)
             if not isinstance(payload, dict):
                 payload = {"funding": payload}
-            payload = {
-                **dict(payload),
-                "exchange": exchange,
-                "market_type": market_type,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "source_topic": "market_state.snapshot",
-                "source": "market_state_store",
-            }
-            for name in ("_on_funding_updated", "_handle_funding_updated", "on_funding_updated"):
-                method = getattr(self, name, None)
-                if callable(method):
-                    result = method(payload)
-                    if hasattr(result, "__await__"):
-                        result = await result
-                    return result
-            return payload
+
+            payload = dict(payload)
+            payload.setdefault("exchange", exchange)
+            payload.setdefault("market_type", market_type)
+            payload.setdefault("symbol", symbol)
+            payload.setdefault("timeframe", timeframe)
+            payload.setdefault("exchange_symbol", exchange_symbol)
+            payload.setdefault("source_topic", "market_state.snapshot")
+            payload.setdefault("source", "market_state_store")
+
+            # Fill missing context fields directly into the funding payload so
+            # snapshot enrichment and FundingStatistics/history get the same
+            # data regardless of whether the runtime is EventBus- or state-driven.
+            if snapshot_context is not None:
+                if payload.get("open_interest") is None:
+                    payload["open_interest"] = snapshot_context.latest_open_interest
+                if payload.get("mark_price") is None:
+                    payload["mark_price"] = snapshot_context.latest_price
+                metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+                metadata = dict(metadata)
+                metadata.setdefault(
+                    "state_context",
+                    {
+                        "latest_open_interest": snapshot_context.latest_open_interest,
+                        "previous_open_interest": snapshot_context.previous_open_interest,
+                        "latest_price": snapshot_context.latest_price,
+                        "previous_price": snapshot_context.previous_price,
+                        "latest_cvd": snapshot_context.latest_cvd,
+                        "previous_cvd": snapshot_context.previous_cvd,
+                        "long_liquidations": snapshot_context.long_liquidations,
+                        "short_liquidations": snapshot_context.short_liquidations,
+                    },
+                )
+                payload["metadata"] = metadata
+
+            event = Event(
+                topic=getattr(self.config, "funding_event_name", "market.funding.updated"),
+                payload=payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            )
+            return await self.on_funding(event)
 
         return await self.process_market_state_snapshot(
             exchange=exchange,
@@ -979,6 +1330,7 @@ class FundingAnalyzer:
 
         try:
             context = self._market_context[key]
+            context = self._merge_related_market_context(key, context)
             previous_snapshot = self._history[key][-1] if self._history[key] else None
             previous_regime_state = self._latest_regime_state.get(key)
 
@@ -1569,6 +1921,136 @@ class FundingAnalyzer:
 
         return model
 
+
+    def _build_funding_feature_map(
+        self,
+        *,
+        snapshot: FundingSnapshot,
+        statistics: FundingStatistics | None = None,
+        regime_state: FundingRegimeState | None = None,
+        pressure_state: FundingPressureState | None = None,
+        flip_event: FundingFlipEvent | None = None,
+        extreme_event: FundingExtremeEvent | None = None,
+        divergence_event: FundingDivergenceEvent | None = None,
+    ) -> dict[str, Any]:
+        snapshot_payload = snapshot.to_dict()
+        feature_map: dict[str, Any] = {
+            "funding.snapshot": snapshot_payload,
+            "funding.rate": snapshot.funding_rate,
+            "funding.funding_rate": snapshot.funding_rate,
+            "funding.mark_price": snapshot.mark_price,
+            "funding.index_price": snapshot.index_price,
+            "funding.current_price": snapshot.mark_price,
+            "funding.open_interest": snapshot.open_interest,
+            "funding.predicted_funding_rate": snapshot.predicted_funding_rate,
+            "funding.basis": snapshot.basis,
+            "funding.symbol": snapshot.symbol,
+            "funding.exchange": snapshot.exchange.value,
+            "funding.market_type": snapshot.market_type,
+            "funding.timeframe": snapshot.timeframe.value,
+            "funding.exchange_symbol": snapshot.exchange_symbol,
+        }
+
+        if statistics is not None:
+            statistics_payload = statistics.to_dict()
+            feature_map.update(
+                {
+                    "funding.statistics": statistics_payload,
+                    "funding.statistics.sample_size": statistics.sample_size,
+                    "funding.statistics.mean_rate": statistics.mean_rate,
+                    "funding.statistics.zscore": statistics.zscore,
+                    "funding.statistics.percentile": statistics.percentile,
+                }
+            )
+
+        if regime_state is not None:
+            regime_payload = regime_state.to_dict()
+            feature_map.update(
+                {
+                    "funding.regime": regime_payload,
+                    "funding.regime.state": regime_payload,
+                    "funding.regime.name": regime_state.regime.value,
+                    "funding.regime.bias": regime_state.bias.value,
+                    "funding.regime.confidence": regime_state.confidence,
+                    "funding.regime.changed": regime_state.changed,
+                }
+            )
+
+        if pressure_state is not None:
+            pressure_payload = pressure_state.to_dict()
+            feature_map.update(
+                {
+                    "funding.pressure": pressure_payload,
+                    "funding.pressure.state": pressure_payload,
+                    "funding.pressure.score": pressure_state.pressure_score,
+                    "funding.pressure.level": pressure_state.level.value,
+                    "funding.pressure.direction": pressure_state.direction.value,
+                    "funding.pressure.bias": pressure_state.bias.value,
+                    "funding.pressure.squeeze_probability": pressure_state.squeeze_probability,
+                    "funding.pressure.mean_reversion_probability": pressure_state.mean_reversion_probability,
+                    "funding.pressure.oi_confirmation": pressure_state.oi_confirmation,
+                    "funding.pressure.price_stall_confirmation": pressure_state.price_stall_confirmation,
+                }
+            )
+
+        if flip_event is not None:
+            flip_payload = flip_event.to_dict()
+            feature_map.update(
+                {
+                    "funding.flip": flip_payload,
+                    "funding.flip.type": flip_event.flip_type.value,
+                    "funding.flip.confidence": flip_event.confidence,
+                    "funding.flip.previous_rate": flip_event.previous_rate,
+                    "funding.flip.current_rate": flip_event.current_rate,
+                    "funding.flip.magnitude": flip_event.flip_magnitude,
+                }
+            )
+
+        if extreme_event is not None:
+            extreme_payload = extreme_event.to_dict()
+            feature_map.update(
+                {
+                    "funding.extreme": extreme_payload,
+                    "funding.extreme.type": extreme_payload.get("extreme_type"),
+                    "funding.extreme.severity": extreme_payload.get("severity"),
+                    "funding.extreme.confidence": extreme_payload.get("severity"),
+                    "funding.extreme.squeeze_risk": extreme_payload.get("is_squeeze_risk"),
+                    "funding.extreme.reversal_risk": extreme_payload.get("is_reversal_risk"),
+                }
+            )
+
+        if divergence_event is not None:
+            divergence_payload = divergence_event.to_dict()
+            feature_map.update(
+                {
+                    "funding.divergence": divergence_payload,
+                    "funding.divergence.type": divergence_payload.get("divergence_type"),
+                    "funding.divergence.confidence": divergence_event.confidence,
+                    "funding.divergence.price_change_pct": divergence_event.price_change_pct,
+                    "funding.divergence.oi_change_pct": divergence_event.oi_change_pct,
+                    "funding.divergence.cvd_change": divergence_event.cvd_change,
+                }
+            )
+
+        return {key: value for key, value in feature_map.items() if value is not None}
+
+    def _funding_strategy_contract(
+        self,
+        *,
+        snapshot: FundingSnapshot,
+        feature_map: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        has_price = snapshot.mark_price is not None
+        return {
+            "version": "analytics-strategy-v1",
+            "domain": "funding",
+            "expected_by": "StrategyContext/SignalBuilder",
+            "has_price": has_price,
+            "price_field": "funding.current_price" if has_price else None,
+            "price_source": "snapshot.mark_price" if has_price else None,
+            "features_count": len(feature_map),
+        }
+
     # ------------------------------------------------------------------
     # Publishers
     # ------------------------------------------------------------------
@@ -1609,6 +2091,20 @@ class FundingAnalyzer:
         if not self.config.emit_analytics_events:
             return
 
+        feature_map = self._build_funding_feature_map(
+            snapshot=snapshot,
+            statistics=statistics,
+            regime_state=regime_state,
+            pressure_state=pressure_state,
+            flip_event=flip_event,
+            extreme_event=extreme_event,
+            divergence_event=divergence_event,
+        )
+        strategy_contract = self._funding_strategy_contract(
+            snapshot=snapshot,
+            feature_map=feature_map,
+        )
+
         event = FundingAnalyticsEvent(
             event_type=FundingEventType.SNAPSHOT,
             symbol=snapshot.symbol,
@@ -1630,14 +2126,26 @@ class FundingAnalyzer:
                 "flip_event": flip_event.to_dict() if flip_event is not None else None,
                 "extreme_event": extreme_event.to_dict() if extreme_event is not None else None,
                 "divergence_event": divergence_event.to_dict() if divergence_event is not None else None,
+                "feature_map": feature_map,
+                "strategy_contract": strategy_contract,
+                "strategy_contract_version": strategy_contract["version"],
+                "current_price": snapshot.mark_price,
+                "reference_price": snapshot.mark_price,
             },
             event_time=snapshot.event_time,
             source=self.SOURCE,
         )
 
+        payload = event.to_dict()
+        payload["feature_map"] = feature_map
+        payload["strategy_contract"] = strategy_contract
+        payload["strategy_contract_version"] = strategy_contract["version"]
+        payload["current_price"] = snapshot.mark_price
+        payload["reference_price"] = snapshot.mark_price
+
         await self._emit_analytics_event(
             topic=self.config.analytics_event_name,
-            payload=event.to_dict(),
+            payload=payload,
             correlation_id=correlation_id,
             key=snapshot.key,
         )
@@ -1678,6 +2186,18 @@ class FundingAnalyzer:
         if not self.config.emit_snapshots:
             return
 
+        feature_map = self._build_funding_feature_map(snapshot=snapshot)
+        strategy_contract = self._funding_strategy_contract(
+            snapshot=snapshot,
+            feature_map=feature_map,
+        )
+        snapshot_payload = model_to_payload(snapshot)
+        snapshot_payload["feature_map"] = feature_map
+        snapshot_payload["strategy_contract"] = strategy_contract
+        snapshot_payload["strategy_contract_version"] = strategy_contract["version"]
+        snapshot_payload["current_price"] = snapshot.mark_price
+        snapshot_payload["reference_price"] = snapshot.mark_price
+
         event = FundingAnalyticsEvent(
             event_type=FundingEventType.SNAPSHOT,
             symbol=snapshot.symbol,
@@ -1685,14 +2205,21 @@ class FundingAnalyzer:
             market_type=snapshot.market_type,
             timeframe=snapshot.timeframe,
             exchange_symbol=snapshot.exchange_symbol,
-            payload=model_to_payload(snapshot),
+            payload=snapshot_payload,
             event_time=snapshot.event_time,
             source=self.SOURCE,
         )
 
+        payload = event.to_dict()
+        payload["feature_map"] = feature_map
+        payload["strategy_contract"] = strategy_contract
+        payload["strategy_contract_version"] = strategy_contract["version"]
+        payload["current_price"] = snapshot.mark_price
+        payload["reference_price"] = snapshot.mark_price
+
         await self._emit_analytics_event(
             topic=self.config.snapshot_event_name,
-            payload=event.to_dict(),
+            payload=payload,
             correlation_id=correlation_id,
             key=snapshot.key,
         )
@@ -1912,6 +2439,38 @@ class FundingAnalyzer:
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_publish_model_event", _analytics_args)
         except Exception:
             pass
+
+        model_payload = model_to_payload(model)
+        feature_key = f"funding.{event_type.value}"
+        feature_map = {
+            feature_key: model_payload,
+            f"{feature_key}.confidence": model_payload.get("confidence"),
+            f"{feature_key}.score": model_payload.get("score"),
+            f"{feature_key}.type": (
+                model_payload.get("flip_type")
+                or model_payload.get("extreme_type")
+                or model_payload.get("divergence_type")
+                or model_payload.get("regime")
+                or model_payload.get("level")
+            ),
+            "funding.symbol": getattr(model, "symbol", None),
+            "funding.exchange": getattr(getattr(model, "exchange", None), "value", getattr(model, "exchange", None)),
+            "funding.market_type": getattr(model, "market_type", None),
+            "funding.timeframe": getattr(getattr(model, "timeframe", None), "value", getattr(model, "timeframe", None)),
+        }
+        feature_map = {key: value for key, value in feature_map.items() if value is not None}
+        model_payload["feature_map"] = feature_map
+        model_payload["strategy_contract"] = {
+            "version": "analytics-strategy-v1",
+            "domain": "funding",
+            "expected_by": "StrategyContext/SignalBuilder",
+            "has_price": False,
+            "price_field": None,
+            "price_source": None,
+            "features_count": len(feature_map),
+        }
+        model_payload["strategy_contract_version"] = "analytics-strategy-v1"
+
         event = FundingAnalyticsEvent(
             event_type=event_type,
             symbol=model.symbol,
@@ -1919,14 +2478,19 @@ class FundingAnalyzer:
             market_type=model.market_type,
             timeframe=model.timeframe,
             exchange_symbol=model.exchange_symbol,
-            payload=model_to_payload(model),
+            payload=model_payload,
             event_time=model.event_time,
             source=self.SOURCE,
         )
 
+        payload = event.to_dict()
+        payload["feature_map"] = feature_map
+        payload["strategy_contract"] = model_payload["strategy_contract"]
+        payload["strategy_contract_version"] = "analytics-strategy-v1"
+
         await self._emit_analytics_event(
             topic=topic,
-            payload=event.to_dict(),
+            payload=payload,
             correlation_id=correlation_id,
             key=model.key,
         )
@@ -3732,7 +4296,7 @@ class FundingAnalyzer:
         return payload
 
     @staticmethod
-    def _extract_payload(event: Event) -> dict[str, Any]:
+    def _extract_payload(event: Event | Mapping[str, Any]) -> dict[str, Any]:
         try:
             _analytics_class_name = "FundingAnalyzer"
             _analytics_logger = get_logger(f"{__name__}.{_analytics_class_name}")
@@ -3751,6 +4315,12 @@ class FundingAnalyzer:
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "_extract_payload", _analytics_args)
         except Exception:
             pass
+
+        # State-driven MarketScheduler callbacks may reuse the same handlers
+        # with a plain mapping payload.  EventBus handlers still pass Event.
+        if isinstance(event, Mapping):
+            return dict(event)
+
         payload = event.payload
         if not isinstance(payload, dict):
             raise TypeError(f"Event payload must be dict, got: {type(payload)!r}")

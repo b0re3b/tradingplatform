@@ -601,8 +601,10 @@ class MarketStateStore:
                 price=item.price,
                 quantity=item.quantity,
                 side=item.side,
+                liquidation_side=str(item.metadata.get("liquidation_side") or item.metadata.get("raw_side") or item.side),
                 timestamp_ms=item.timestamp_ms,
                 order_id=item.order_id,
+                notional_usd=item.metadata.get("notional_usd"),
                 metadata=dict(item.metadata),
             )
             for item in state.liquidations

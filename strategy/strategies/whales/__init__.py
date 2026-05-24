@@ -28,6 +28,13 @@ from .whale_distribution_strategy import (
     WhaleDistributionStrategy,
     WhaleDistributionStrategyConfig,
 )
+
+from .whale_large_trade_strategy import (
+    WhaleLargeTradePayload,
+    WhaleLargeTradeStrategy,
+    WhaleLargeTradeStrategyConfig,
+)
+
 from .whale_liquidation_reversal_strategy import (
     WhaleLiquidationReversalPayload,
     WhaleLiquidationReversalStrategy,
@@ -64,6 +71,11 @@ __all__ = [
     "WhaleDistributionPayload",
     "WhaleDistributionStrategy",
     "WhaleDistributionStrategyConfig",
+
+    # Large trade
+    "WhaleLargeTradePayload",
+    "WhaleLargeTradeStrategy",
+    "WhaleLargeTradeStrategyConfig",
 
     # Liquidation reversal
     "WhaleLiquidationReversalPayload",

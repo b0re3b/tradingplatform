@@ -416,13 +416,25 @@ class StrategyRegistry(BaseStrategyComponent):
         if not event_name.strip():
             raise StrategyRegistrationError("event_name cannot be empty")
 
-        return self.select(
+        selected = self.select(
             context=context,
             categories=categories,
             changed_features=changed_features,
             source=source,
             include_disabled=include_disabled,
         )
+
+        compatible: list[BaseStrategy] = []
+        for strategy in selected:
+            allowed, _reason = self._event_allows_strategy(
+                strategy=strategy,
+                context=context,
+                event_name=event_name,
+                source=source,
+            )
+            if allowed:
+                compatible.append(strategy)
+        return compatible
 
     def categories(self) -> list[StrategyCategory]:
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
@@ -480,6 +492,7 @@ class StrategyRegistry(BaseStrategyComponent):
         changed_features: list[str] | set[str] | None = None,
         source: FeatureSource | None = None,
         include_disabled: bool = False,
+        event_name: str | None = None,
     ) -> dict[str, Any]:
         """Return actionable diagnostics for strategy routing.
 
@@ -500,7 +513,7 @@ class StrategyRegistry(BaseStrategyComponent):
         strategy_reports: dict[str, dict[str, Any]] = {}
         for name, strategy in sorted(self._strategies.items()):
             required = set(strategy.required_features())
-            missing = sorted(feature for feature in required if not context.has_feature(feature))
+            missing = sorted(feature for feature in required if not self._has_truthy_feature(context, feature))
             reasons: list[str] = []
             if name not in candidate_names:
                 reasons.append("not_in_candidate_set")
@@ -514,6 +527,15 @@ class StrategyRegistry(BaseStrategyComponent):
                 reasons.append("regime_not_supported")
             if missing:
                 reasons.append("missing_required_features")
+            if event_name:
+                allowed, event_reason = self._event_allows_strategy(
+                    strategy=strategy,
+                    context=context,
+                    event_name=event_name,
+                    source=source,
+                )
+                if not allowed and event_reason:
+                    reasons.append(event_reason)
             strategy_reports[name] = {
                 "category": strategy.category.value,
                 "candidate": name in candidate_names,
@@ -529,6 +551,7 @@ class StrategyRegistry(BaseStrategyComponent):
             "timeframe": context.timeframe.value,
             "regime": context.current_regime.value,
             "source": source.value if source else None,
+            "event_name": event_name,
             "categories": sorted(category.value for category in category_set),
             "changed_features": sorted(changed_set),
             "candidate_count": len(candidate_names),
@@ -536,6 +559,101 @@ class StrategyRegistry(BaseStrategyComponent):
             "available_features": sorted(available_features),
             "strategies": strategy_reports,
         }
+
+    @staticmethod
+    def _feature_value_truthy(value: Any) -> bool:
+        """Return whether a required-feature value is a usable contract.
+
+        Numeric zero and False are legitimate feature values.  Empty dict/list
+        and None are not valid contract payloads for strategy routing.
+        """
+        if value is None:
+            return False
+        if isinstance(value, (dict, list, tuple, set)):
+            return bool(value)
+        return True
+
+    def _has_truthy_feature(self, context: StrategyContext, feature: str) -> bool:
+        if not context.has_feature(feature):
+            return False
+        try:
+            return self._feature_value_truthy(context.get_feature(feature))
+        except Exception:
+            return True
+
+    def _event_allows_strategy(
+        self,
+        *,
+        strategy: BaseStrategy,
+        context: StrategyContext,
+        event_name: str,
+        source: FeatureSource | None = None,
+    ) -> tuple[bool, str | None]:
+        """Event/payload compatibility guard for strategy routing.
+
+        This keeps the registry as a selector only: it does not evaluate trading
+        logic.  It prevents partial analytics events from being sent to
+        strategies that require a different domain contract shape.
+        """
+        topic = (event_name or "").strip().lower()
+        name = strategy.strategy_name.strip().lower()
+        category_value = getattr(strategy.category, "value", str(strategy.category)).lower()
+
+        if source is FeatureSource.WHALES or category_value == "whales":
+            is_large_trade_event = "large_trade" in topic
+
+            if name == "whale_large_trade":
+                if not is_large_trade_event:
+                    return False, "event_not_supported:whale_large_trade_requires_large_trade_event"
+                if not self._has_truthy_feature(context, "whales.large_trade"):
+                    return False, "payload_contract_incomplete:whales.large_trade"
+                return True, None
+
+            if is_large_trade_event:
+                return False, "event_not_supported:large_trade_requires_whale_large_trade_strategy"
+
+            if any(token in name for token in ("absorption", "liquidation_reversal")):
+                if not (
+                    self._has_truthy_feature(context, "whales.pressure")
+                    or self._has_truthy_feature(context, "whales.liquidation_context")
+                    or self._has_truthy_feature(context, "whales.cluster_exhaustion")
+                ):
+                    return False, "payload_contract_incomplete:whale_absorption_context"
+
+        if source is FeatureSource.LIQUIDITY or category_value == "liquidity":
+            if "signal" in topic and not (
+                "map" in topic or "snapshot" in topic or self._has_truthy_feature(context, "liquidity.snapshot")
+            ):
+                return False, "payload_contract_incomplete:liquidity_signal_only"
+            required = set(strategy.required_features())
+            if "liquidity.snapshot" in required and not self._has_truthy_feature(context, "liquidity.snapshot"):
+                return False, "payload_contract_incomplete:liquidity.snapshot"
+
+        if source is FeatureSource.ORDERFLOW or category_value == "orderflow":
+            required = set(strategy.required_features())
+            missing_contract = [feature for feature in required if feature.startswith("orderflow.") and not self._has_truthy_feature(context, feature)]
+            if missing_contract:
+                return False, "payload_contract_incomplete:" + ",".join(sorted(missing_contract))
+
+        if source is FeatureSource.FUNDING or category_value == "funding":
+            required = set(strategy.required_features())
+            missing_contract = [feature for feature in required if feature.startswith("funding.") and not self._has_truthy_feature(context, feature)]
+            if missing_contract:
+                return False, "payload_contract_incomplete:" + ",".join(sorted(missing_contract))
+
+        if source is FeatureSource.OPEN_INTEREST or category_value == "open_interest":
+            required = set(strategy.required_features())
+            missing_contract = [feature for feature in required if feature.startswith("open_interest.") and not self._has_truthy_feature(context, feature)]
+            if missing_contract:
+                return False, "payload_contract_incomplete:" + ",".join(sorted(missing_contract))
+
+        if source is FeatureSource.LIQUIDATIONS or category_value == "liquidations":
+            required = set(strategy.required_features())
+            missing_contract = [feature for feature in required if feature.startswith("liquidations.") and not self._has_truthy_feature(context, feature)]
+            if missing_contract:
+                return False, "payload_contract_incomplete:" + ",".join(sorted(missing_contract))
+
+        return True, None
 
     def _candidate_names(
         self,
@@ -614,7 +732,7 @@ class StrategyRegistry(BaseStrategyComponent):
             return False
 
         required = strategy.required_features()
-        if required and not all(context.has_feature(feature) for feature in required):
+        if required and not all(self._has_truthy_feature(context, feature) for feature in required):
             return False
 
         return True

@@ -149,11 +149,28 @@ def get_path(value: Any, path: str, default: Any = None) -> Any:
     if not isinstance(path, str) or not path.strip():
         return default
 
+    normalized = path.strip()
+
+    # Normalized StrategyContext domain_data may contain literal dotted keys
+    # such as ``whales.large_trade.notional`` next to nested dictionaries.
+    mapping = as_mapping(value)
+    if mapping is not None and normalized in mapping:
+        item = mapping.get(normalized)
+        return default if item is None else item
+
     current = value
 
-    for part in path.split("."):
+    for index, part in enumerate(normalized.split(".")):
         if current is None:
             return default
+
+        # Support remaining literal dotted suffixes at each nesting level.
+        current_mapping = as_mapping(current)
+        if current_mapping is not None:
+            suffix = ".".join(normalized.split(".")[index:])
+            if suffix in current_mapping:
+                item = current_mapping.get(suffix)
+                return default if item is None else item
 
         part = part.strip()
         if not part:
@@ -457,8 +474,11 @@ WHALES_DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "large_trade": (
         "large_trade",
+        "whale_large_trade",
         "large_trade_signal",
+        "whale_large_trade_signal",
         "analytics.whales.large_trade",
+        "whales.large_trade",
     ),
     "cluster": (
         "cluster",
@@ -1160,6 +1180,8 @@ def extract_large_trade_notional(value: Any) -> float:
             payload.get("trade_notional"),
             payload.get("notional"),
             payload.get("total_notional"),
+            get_path(payload, "whales.large_trade.notional"),
+            get_path(payload, "whales.notional"),
             get_path(payload, "metadata.large_trade_notional"),
         )
     )
@@ -1172,6 +1194,8 @@ def extract_large_trade_zscore(value: Any) -> float | None:
         payload.get("z_score"),
         payload.get("notional_zscore"),
         payload.get("large_trade_zscore"),
+        get_path(payload, "whales.large_trade.zscore"),
+        get_path(payload, "whales.zscore"),
         get_path(payload, "metadata.large_trade_zscore"),
         default=None,
     )
@@ -1184,7 +1208,9 @@ def extract_reference_price(value: Any) -> float | None:
         payload.get("reference_price"),
         payload.get("mark_price"),
         payload.get("last_price"),
+        payload.get("current_price"),
         payload.get("close"),
+        get_path(payload, "whales.reference_price"),
         get_path(payload, "metadata.reference_price"),
         default=None,
     )
@@ -1822,4 +1848,18 @@ def whale_liquidation_reversal_source_features() -> list[str]:
         "context_strength",
         "liquidation_notional",
         "exhaustion_probability",
+    )
+
+def whale_large_trade_source_features() -> list[str]:
+    return source_features_from_paths(
+        "large_trade",
+        "large_trade.notional",
+        "large_trade.zscore",
+        "large_trade.side",
+        "large_trade.quantity",
+        "side",
+        "notional",
+        "zscore",
+        "reference_price",
+        "price",
     )

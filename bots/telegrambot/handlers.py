@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from time import time
 from typing import Any
@@ -111,6 +112,11 @@ class TelegramEventHandlers:
             max_size=config.queue.max_size,
             worker_count=config.queue.worker_count,
         )
+        self._coalesce_lock = asyncio.Lock()
+        self._coalesced_events: dict[str, TelegramQueuedEvent] = {}
+        self._coalesced_tasks: dict[str, asyncio.Task[None]] = {}
+        self._recent_stop_clusters: dict[str, float] = {}
+        self._last_policy_delivery_ts: dict[str, float] = {}
 
     async def handle_analytics_event(self, event: Event) -> None:
         await self.handle_event(event)
@@ -189,6 +195,13 @@ class TelegramEventHandlers:
                     )
                 queue.task_done()
 
+        for task in list(self._coalesced_tasks.values()):
+            task.cancel()
+        if self._coalesced_tasks:
+            await asyncio.gather(*self._coalesced_tasks.values(), return_exceptions=True)
+        self._coalesced_tasks.clear()
+        self._coalesced_events.clear()
+
         if queue is not None:
             for _ in self._queue_workers:
                 await queue.put(None)
@@ -209,10 +222,273 @@ class TelegramEventHandlers:
         event_name = self._event_name(event)
         self.state.mark_event_received()
 
+        policy_result = await self._apply_delivery_policy(event=event, event_name=event_name)
+        if policy_result is not None:
+            return policy_result
+
         if self.config.queue.enabled and self._queue is not None:
             return await self._enqueue_event(event=event, event_name=event_name)
 
         return await self._process_event_now(event)
+
+    async def _apply_delivery_policy(
+        self,
+        *,
+        event: Event,
+        event_name: str,
+    ) -> TelegramHandlerResult | None:
+        """Apply Telegram-side delivery policy before the event enters the send queue.
+
+        This layer is intentionally local to Telegram.  It does not suppress the
+        EventBus event itself and it does not change analytics behaviour.  It
+        only prevents high-volume observer notifications from turning into a
+        delayed Telegram burst.
+        """
+
+        policy = self.config.delivery_policy
+        if not policy.enabled:
+            return None
+
+        normalized = event_name.strip().lower()
+
+        if normalized == "analytics.liquidity.stop_cluster.detected":
+            if not self._should_publish_liquidity_stop_cluster(event):
+                return self._record_rate_limited(
+                    event_name=event_name,
+                    topic=TelegramTopic.LIQUIDITY,
+                    message_type=TelegramMessageType.ANALYTICS_ALERT,
+                    reason="liquidity stop cluster skipped by Telegram score/dedup policy",
+                )
+            return None
+
+        if normalized == "analytics.orderflow.cvd.signal":
+            throttle_key = self._event_identity_key(event=event, event_name=event_name)
+            now_ts = time()
+            min_interval = float(policy.orderflow_cvd_signal_min_interval_sec)
+            last_ts = self._last_policy_delivery_ts.get(throttle_key)
+            if min_interval > 0 and last_ts is not None and now_ts - last_ts < min_interval:
+                return self._record_rate_limited(
+                    event_name=event_name,
+                    topic=TelegramTopic.ORDERFLOW,
+                    message_type=TelegramMessageType.ANALYTICS_ALERT,
+                    reason="orderflow CVD signal throttled per symbol/timeframe",
+                )
+            self._last_policy_delivery_ts[throttle_key] = now_ts
+            return None
+
+        if normalized == "analytics.whales.large_trade":
+            # Immediate delivery path.  Queue TTL/rate-limit still applies, but
+            # this event is never coalesced because old whale prints are less
+            # useful than fresh whale prints.
+            return None
+
+        window = self._coalesce_window_for_event(normalized)
+        if policy.coalescing_enabled and window is not None and window > 0:
+            return await self._coalesce_event(
+                event=event,
+                event_name=event_name,
+                window_sec=window,
+            )
+
+        return None
+
+    def _coalesce_window_for_event(self, event_name: str) -> float | None:
+        policy = self.config.delivery_policy
+        if event_name == "analytics.liquidity.map.updated":
+            return float(policy.liquidity_map_updated_window_sec)
+        if event_name == "analytics.liquidity.signal.updated":
+            return float(policy.liquidity_signal_updated_window_sec)
+        if event_name == "analytics.orderflow.cvd.updated":
+            return float(policy.orderflow_cvd_updated_window_sec)
+        return None
+
+    async def _coalesce_event(
+        self,
+        *,
+        event: Event,
+        event_name: str,
+        window_sec: float,
+    ) -> TelegramHandlerResult:
+        key = self._event_identity_key(event=event, event_name=event_name)
+        queued = TelegramQueuedEvent(
+            sequence=self._queue_sequence + 1,
+            event=event,
+            event_name=event_name,
+            enqueued_at_ms=int(time() * 1000),
+        )
+
+        async with self._coalesce_lock:
+            if len(self._coalesced_events) >= self.config.delivery_policy.max_pending_coalesced and key not in self._coalesced_events:
+                # Keep the system live.  Drop a single arbitrary pending coalesced
+                # item rather than letting the coalescing buffer grow without bound.
+                dropped_key = next(iter(self._coalesced_events))
+                self._coalesced_events.pop(dropped_key, None)
+                task = self._coalesced_tasks.pop(dropped_key, None)
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await task
+                self.state.queue.mark_dropped(
+                    reason="telegram coalescing buffer full; oldest coalesced event dropped",
+                    queue_size=self._queue.qsize() if self._queue is not None else 0,
+                )
+
+            self._queue_sequence += 1
+            self._coalesced_events[key] = queued
+
+            if key not in self._coalesced_tasks:
+                self._coalesced_tasks[key] = asyncio.create_task(
+                    self._flush_coalesced_event_after_delay(
+                        key=key,
+                        delay_sec=window_sec,
+                    ),
+                    name=f"telegram_coalesced_flush:{key}",
+                )
+
+        return TelegramHandlerResult(
+            ok=True,
+            event_name=event_name,
+            status=TelegramDeliveryStatus.PENDING,
+        )
+
+    async def _flush_coalesced_event_after_delay(self, *, key: str, delay_sec: float) -> None:
+        try:
+            await asyncio.sleep(max(0.0, delay_sec))
+            async with self._coalesce_lock:
+                queued = self._coalesced_events.pop(key, None)
+                self._coalesced_tasks.pop(key, None)
+            if queued is None:
+                return
+            await self._enqueue_event(event=queued.event, event_name=queued.event_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.state.queue.mark_error(error=str(exc))
+            self._logger.exception(
+                "Failed to flush coalesced Telegram event.",
+                extra={"coalescing_key": key},
+            )
+
+    def _should_publish_liquidity_stop_cluster(self, event: Event) -> bool:
+        policy = self.config.delivery_policy
+        payload = self._flatten_event_payload(event.payload)
+        score = self._first_number(
+            payload,
+            "score",
+            "cluster_score",
+            "strength",
+            "confidence",
+            "quality_score",
+            "stop_cluster.score",
+            "cluster.score",
+            "payload.score",
+        )
+        if score is not None and abs(score) >= float(policy.stop_cluster_min_score):
+            self._remember_stop_cluster(event)
+            return True
+
+        cluster_key = self._stop_cluster_key(event)
+        now_ts = time()
+        ttl = float(policy.stop_cluster_dedup_ttl_sec)
+        last_ts = self._recent_stop_clusters.get(cluster_key)
+        if last_ts is None or ttl <= 0 or now_ts - last_ts > ttl:
+            self._recent_stop_clusters[cluster_key] = now_ts
+            self._prune_recent_stop_clusters(now_ts=now_ts, ttl=ttl)
+            return True
+
+        return False
+
+    def _remember_stop_cluster(self, event: Event) -> None:
+        now_ts = time()
+        self._recent_stop_clusters[self._stop_cluster_key(event)] = now_ts
+        self._prune_recent_stop_clusters(now_ts=now_ts, ttl=float(self.config.delivery_policy.stop_cluster_dedup_ttl_sec))
+
+    def _prune_recent_stop_clusters(self, *, now_ts: float, ttl: float) -> None:
+        if ttl <= 0:
+            return
+        stale = [key for key, ts in self._recent_stop_clusters.items() if now_ts - ts > ttl]
+        for key in stale:
+            self._recent_stop_clusters.pop(key, None)
+
+    def _stop_cluster_key(self, event: Event) -> str:
+        payload = self._flatten_event_payload(event.payload)
+        symbol = str(self._first_present(payload, "symbol", "payload.symbol", "scope.symbol") or "unknown").upper()
+        timeframe = str(self._first_present(payload, "timeframe", "payload.timeframe", "scope.timeframe") or "na").lower()
+        side = str(self._first_present(payload, "side", "direction", "cluster.side", "stop_cluster.side") or "na").lower()
+        price = self._first_present(
+            payload,
+            "cluster_id",
+            "id",
+            "price",
+            "level",
+            "price_level",
+            "stop_cluster.price",
+            "cluster.price",
+        )
+        if isinstance(price, float):
+            price_key = f"{price:.6f}"
+        else:
+            price_key = str(price or "unknown")
+        return f"analytics.liquidity.stop_cluster.detected:{symbol}:{timeframe}:{side}:{price_key}"
+
+    def _event_identity_key(self, *, event: Event, event_name: str) -> str:
+        payload = self._flatten_event_payload(event.payload)
+        exchange = str(self._first_present(payload, "exchange", "payload.exchange", "scope.exchange") or "unknown").lower()
+        symbol = str(self._first_present(payload, "symbol", "payload.symbol", "scope.symbol") or "unknown").upper()
+        timeframe = str(self._first_present(payload, "timeframe", "payload.timeframe", "scope.timeframe") or "na").lower()
+        return f"{event_name.strip().lower()}:{exchange}:{symbol}:{timeframe}"
+
+    def _flatten_event_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        merged: dict[str, Any] = {}
+
+        def merge(value: Any) -> None:
+            if isinstance(value, dict):
+                merged.update(value)
+
+        merge(payload.get("payload"))
+        merge(payload.get("data"))
+        merge(payload.get("result"))
+        merge(payload.get("signal"))
+        merge(payload.get("cluster"))
+        merge(payload.get("stop_cluster"))
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else {}
+        merge(context.get("stats") if isinstance(context, dict) else None)
+        merge(context)
+        merge(scope)
+        merged.update(payload)
+        return merged
+
+    def _first_present(self, payload: dict[str, Any], *paths: str) -> Any:
+        for path in paths:
+            value = self._get_path(payload, path)
+            if value is not None and value != "":
+                return value
+        return None
+
+    def _get_path(self, payload: dict[str, Any], path: str) -> Any:
+        if path in payload:
+            return payload[path]
+        current: Any = payload
+        for part in path.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+                continue
+            return None
+        return current
+
+    def _first_number(self, payload: dict[str, Any], *paths: str) -> float | None:
+        value = self._first_present(payload, *paths)
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     async def _process_event_now(self, event: Event) -> TelegramHandlerResult:
         """Route, format and deliver one EventBus event to Telegram."""
@@ -252,19 +528,27 @@ class TelegramEventHandlers:
             )
 
             if not rate_limit_decision.allowed:
-                if self.config.rate_limit.drop_when_limited:
+                retry_after = float(rate_limit_decision.retry_after_sec or 0.0)
+                max_wait = max(0.0, float(self.config.rate_limit.max_wait_sec))
+
+                # Telegram is an observer, not a backpressure source.  If a burst
+                # exceeds local limits, do not hold the delivery worker for many
+                # seconds/minutes; that creates the visible "silence, then batch"
+                # behaviour.  Either wait only a tiny bounded interval or skip the
+                # stale/low-priority notification and keep the queue fresh.
+                if self.config.rate_limit.drop_when_limited or retry_after > max_wait:
                     return self._record_rate_limited(
                         event_name=event_name,
                         topic=route.topic,
                         message_type=route.message_type,
-                        reason=rate_limit_decision.reason
-                        or "Telegram local rate limit exceeded.",
+                        reason=(
+                            rate_limit_decision.reason
+                            or "Telegram local rate limit exceeded."
+                        ),
                     )
 
-                if rate_limit_decision.retry_after_sec:
-                    # Handler не створює background task. Він лише робить коротку
-                    # контрольовану паузу в межах поточної обробки події.
-                    await self._sleep_for_rate_limit(rate_limit_decision.retry_after_sec)
+                if retry_after > 0:
+                    await self._sleep_for_rate_limit(min(retry_after, max_wait))
 
             formatted = self.formatter.format(route=route, event=event_payload)
 
@@ -441,6 +725,19 @@ class TelegramEventHandlers:
                     return
 
                 self.state.queue.mark_dequeued(queue_size=queue.qsize())
+
+                max_age_sec = self._max_event_age_for_delivery(item.event)
+                if max_age_sec > 0:
+                    age_sec = max(0.0, (int(time() * 1000) - item.enqueued_at_ms) / 1000.0)
+                    if age_sec > max_age_sec:
+                        self.state.queue.mark_dropped(
+                            reason="telegram queued event expired before delivery",
+                            stale=True,
+                            queue_size=queue.qsize(),
+                        )
+                        self.state.queue.mark_processed(ok=True)
+                        continue
+
                 result = await self._process_event_now(item.event)
                 self.state.queue.mark_processed(ok=result.ok)
 
@@ -453,6 +750,13 @@ class TelegramEventHandlers:
                 )
             finally:
                 queue.task_done()
+
+
+    def _max_event_age_for_delivery(self, event: Event) -> float:
+        event_name = self._event_name(event).strip().lower()
+        if event_name == "analytics.whales.large_trade":
+            return float(self.config.delivery_policy.whale_large_trade_max_age_sec)
+        return float(self.config.queue.max_event_age_sec)
 
 
     async def publish_test_message(
@@ -811,7 +1115,7 @@ class TelegramEventHandlers:
         Щоб handler не блокувався надовго, обмежуємо sleep зверху.
         """
 
-        safe_sleep = max(0.0, min(float(retry_after_sec), 3.0))
+        safe_sleep = max(0.0, min(float(retry_after_sec), self.config.rate_limit.max_wait_sec))
         if safe_sleep > 0:
             import asyncio
 

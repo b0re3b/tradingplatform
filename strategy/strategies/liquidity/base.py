@@ -173,18 +173,42 @@ def _get_attr_or_key(value: Any, key: str, default: Any = None) -> Any:
 
 
 def _get_path(value: Any, path: str, default: Any = None) -> Any:
+    """
+    Read dotted path from dict-like/object-like data.
+
+    Important compatibility detail: StrategyContext domain data often contains
+    literal dotted feature-map keys such as ``liquidity.snapshot`` or
+    ``liquidity.map.snapshot`` alongside nested objects.  Older liquidity
+    strategy helpers only walked nested paths, so those literal keys were
+    invisible and full-snapshot strategies were routed but then failed with
+    ``missing_liquidity_snapshot_contract``.
+    """
     if not isinstance(path, str) or not path.strip():
         return default
 
+    normalized = path.strip()
+    mapping = _as_mapping(value)
+    if mapping is not None and normalized in mapping:
+        item = mapping.get(normalized)
+        return default if item is None else item
+
     current = value
 
-    for part in path.split("."):
+    for index, part in enumerate(normalized.split(".")):
         if current is None:
             return default
 
         part = part.strip()
         if not part:
             return default
+
+        current_mapping = _as_mapping(current)
+        if current_mapping is not None:
+            # Prefer exact remainder for payloads that store literal dotted keys.
+            remainder = ".".join(normalized.split(".")[index:])
+            if remainder in current_mapping:
+                item = current_mapping.get(remainder)
+                return default if item is None else item
 
         current = _get_attr_or_key(current, part, default=None)
 
@@ -372,8 +396,13 @@ LIQUIDITY_FEATURES = LiquidityFeatureNames()
 LIQUIDITY_DOMAIN_ALIASES: dict[str, tuple[str, ...]] = {
     "snapshot": (
         "snapshot",
+        "liquidity_snapshot",
         "liquidity_map_snapshot",
+        "liquidity.map.snapshot",
+        "liquidity.snapshot",
         "map_snapshot",
+        "map",
+        "liquidity_map",
         "last_snapshot",
     ),
     "current_price": (
@@ -410,6 +439,7 @@ SNAPSHOT_FEATURE_KEYS: tuple[str, ...] = (
     "liquidity.snapshot",
     "liquidity_snapshot",
     "liquidity.map.snapshot",
+    "liquidity.map.updated",
     "analytics.liquidity.map.snapshot",
     "analytics.liquidity.map.updated",
 )
@@ -595,6 +625,329 @@ class LiquidityStrategyConfig:
 # =============================================================================
 
 
+
+
+# =============================================================================
+# Snapshot normalization helpers
+# =============================================================================
+
+
+def _truthy_payload(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, Mapping):
+        return bool(value)
+    if isinstance(value, (list, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _merge_mapping_values(*values: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for value in values:
+        mapping = _as_mapping(value)
+        if mapping:
+            merged.update(dict(mapping))
+    return merged
+
+
+def _scope_mapping(value: Any) -> Mapping[str, Any]:
+    scope = _get_path(value, "scope", default=None)
+    mapping = _as_mapping(scope)
+    return mapping or {}
+
+
+def _candidate_with_feature_map(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Merge common normalized envelopes into one mapping.
+
+    Analytics liquidity events often carry useful fields in ``feature_map`` and
+    ``payload`` while StrategyContext domain_data keeps top-level aliases.  The
+    strategy-side resolver should see one canonical mapping instead of guessing
+    which envelope variant was used.
+    """
+    result = dict(candidate)
+
+    raw = candidate.get("raw")
+    raw_mapping = _as_mapping(raw)
+    if raw_mapping:
+        result.update({k: v for k, v in raw_mapping.items() if k not in result or result[k] is None})
+
+    feature_map = candidate.get("feature_map")
+    feature_mapping = _as_mapping(feature_map)
+    if feature_mapping:
+        for key, value in feature_mapping.items():
+            result.setdefault(str(key), value)
+
+    payload = candidate.get("payload")
+    payload_mapping = _as_mapping(payload)
+    if payload_mapping:
+        for key, value in payload_mapping.items():
+            result.setdefault(str(key), value)
+
+    signal = (
+        candidate.get("signal")
+        or candidate.get("liquidity_signal")
+        or candidate.get("analytics_signal")
+    )
+    signal_mapping = _as_mapping(signal)
+    if signal_mapping:
+        for key in ("confidence", "score", "side", "bias", "strength"):
+            if key in signal_mapping:
+                result.setdefault(key, signal_mapping.get(key))
+
+    return result
+
+
+def _first_payload_value(value: Any, paths: Sequence[str], default: Any = None) -> Any:
+    for path in paths:
+        item = _get_path(value, path, default=None)
+        if item is not None:
+            return item
+    return default
+
+
+def _coerce_items(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [item for item in value if item is not None]
+    return [value]
+
+
+def _normalize_snapshot_mapping(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    data = _candidate_with_feature_map(candidate)
+    scope = _scope_mapping(data)
+
+    symbol = str(
+        _first_payload_value(
+            data,
+            (
+                "symbol",
+                "scope.symbol",
+                "liquidity.symbol",
+                "hybrid.symbol",
+            ),
+            "",
+        )
+        or scope.get("symbol")
+        or ""
+    ).strip().upper()
+
+    exchange = str(
+        _first_payload_value(data, ("exchange", "scope.exchange", "hybrid.exchange"), "")
+        or scope.get("exchange")
+        or "binance"
+    ).strip().lower()
+
+    market_type = str(
+        _first_payload_value(data, ("market_type", "scope.market_type", "hybrid.market_type"), "")
+        or scope.get("market_type")
+        or "usdm_futures"
+    ).strip()
+
+    timeframe = str(
+        _first_payload_value(data, ("timeframe", "scope.timeframe", "hybrid.timeframe"), "")
+        or scope.get("timeframe")
+        or "1m"
+    ).strip().lower()
+
+    exchange_symbol = str(
+        _first_payload_value(data, ("exchange_symbol", "scope.exchange_symbol"), "")
+        or scope.get("exchange_symbol")
+        or symbol
+    ).strip().upper()
+
+    current_price = _to_float(
+        _first_payload_value(
+            data,
+            (
+                "current_price",
+                "reference_price",
+                "entry_reference_price",
+                "last_price",
+                "price",
+                "mark_price",
+                "close",
+                "liquidity.current_price",
+            ),
+        )
+    )
+
+    active_levels = _coerce_items(
+        _first_payload_value(
+            data,
+            (
+                "active_levels",
+                "levels",
+                "liquidity_levels",
+                "source_levels",
+                "liquidity.active_levels",
+            ),
+            [],
+        )
+    )
+
+    equal_levels = _coerce_items(
+        _first_payload_value(
+            data,
+            (
+                "equal_levels",
+                "equal_highs_lows",
+                "liquidity.equal_levels",
+            ),
+            [],
+        )
+    )
+
+    stop_clusters = _coerce_items(
+        _first_payload_value(
+            data,
+            (
+                "stop_clusters",
+                "clusters",
+                "liquidity_clusters",
+                "liquidity.stop_clusters",
+            ),
+            [],
+        )
+    )
+
+    zones = _coerce_items(
+        _first_payload_value(
+            data,
+            (
+                "zones",
+                "liquidity_zones",
+                "liquidity.zones",
+            ),
+            [],
+        )
+    )
+
+    nearest_above = _first_payload_value(
+        data,
+        (
+            "nearest_above_level",
+            "nearest_buy_side_liquidity",
+            "strongest_cluster_above",
+            "liquidity.nearest_above_level",
+        ),
+    )
+    nearest_below = _first_payload_value(
+        data,
+        (
+            "nearest_below_level",
+            "nearest_sell_side_liquidity",
+            "strongest_cluster_below",
+            "liquidity.nearest_below_level",
+        ),
+    )
+
+    strongest_above = _first_payload_value(
+        data,
+        (
+            "strongest_cluster_above",
+            "nearest_buy_side_liquidity",
+            "liquidity.strongest_cluster_above",
+        ),
+    )
+    strongest_below = _first_payload_value(
+        data,
+        (
+            "strongest_cluster_below",
+            "nearest_sell_side_liquidity",
+            "liquidity.strongest_cluster_below",
+        ),
+    )
+
+    above_score = _to_float(
+        _first_payload_value(
+            data,
+            (
+                "above_liquidity_score",
+                "magnet_score_up",
+                "upside_sweep_risk",
+                "sweep_risk_up",
+                "liquidity.magnet.up",
+                "liquidity.sweep_risk.up",
+            ),
+        ),
+        0.0,
+    )
+    below_score = _to_float(
+        _first_payload_value(
+            data,
+            (
+                "below_liquidity_score",
+                "magnet_score_down",
+                "downside_sweep_risk",
+                "sweep_risk_down",
+                "liquidity.magnet.down",
+                "liquidity.sweep_risk.down",
+            ),
+        ),
+        0.0,
+    )
+
+    pressure = _to_float(
+        _first_payload_value(
+            data,
+            (
+                "liquidity_pressure_score",
+                "pressure_score",
+                "liquidity.pressure_score",
+            ),
+        ),
+        None,
+    )
+    if pressure is None:
+        up = _to_float(_first_payload_value(data, ("sweep_risk_up", "magnet_score_up")), 0.0) or 0.0
+        down = _to_float(_first_payload_value(data, ("sweep_risk_down", "magnet_score_down")), 0.0) or 0.0
+        pressure = up - down
+
+    confidence = _to_float(
+        _first_payload_value(data, ("confidence", "signal.confidence", "liquidity_signal.confidence")),
+        0.0,
+    )
+
+    metadata = _merge_mapping_values(data.get("metadata"))
+    metadata.update(
+        {
+            "source": "strategy_liquidity_resolver",
+            "payload_contract_level": data.get("payload_contract_level"),
+            "confidence": confidence,
+            "raw_event_name": data.get("event_name") or data.get("topic"),
+        }
+    )
+
+    return {
+        "exchange": exchange,
+        "market_type": market_type,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "exchange_symbol": exchange_symbol,
+        "timestamp": parse_datetime(
+            _first_payload_value(data, ("timestamp", "event_time", "updated_at", "created_at", "price_timestamp"))
+        )
+        or utc_now(),
+        "current_price": current_price,
+        "active_levels": active_levels,
+        "equal_levels": equal_levels,
+        "stop_clusters": stop_clusters,
+        "zones": zones,
+        "nearest_above_level": nearest_above,
+        "nearest_below_level": nearest_below,
+        "strongest_cluster_above": strongest_above,
+        "strongest_cluster_below": strongest_below,
+        "above_liquidity_score": _clamp01(above_score),
+        "below_liquidity_score": _clamp01(below_score),
+        "liquidity_pressure_score": _clamp_signed(pressure),
+        "bias": _first_payload_value(data, ("bias", "liquidity.bias"), "neutral"),
+        "signal": data.get("signal") or data.get("liquidity_signal") or data.get("analytics_signal"),
+        "metadata": metadata,
+    }
+
 class LiquidityTradingStrategy(TradingStrategy):
     """
     Base class for concrete strategy/strategies/liquidity/* classes.
@@ -774,7 +1127,7 @@ class LiquidityTradingStrategy(TradingStrategy):
         self.validate_context(context)
 
         domain = self.liquidity_domain(context)
-        candidates: list[Any] = []
+        candidates: list[Any] = [domain]
 
         for key in LIQUIDITY_DOMAIN_ALIASES["snapshot"]:
             candidates.append(_get_path(domain, key, default=None))
@@ -823,38 +1176,22 @@ class LiquidityTradingStrategy(TradingStrategy):
             return self._unwrap_snapshot_candidate(candidate.value)
 
         if isinstance(candidate, Mapping):
-            # Try to deserialize a plain dict directly into a minimal
-            # LiquidityMapSnapshot.  analytics.liquidity.map.updated publishes a
-            # payload-safe dict, not the dataclass instance, and older code tried
-            # to call a non-existent from_event_payload() constructor here.
-            if candidate.get("current_price") is not None and candidate.get("symbol") is not None:
+            normalized = _normalize_snapshot_mapping(candidate)
+
+            # Build a strategy-side LiquidityMapSnapshot when the payload has a
+            # real symbol and usable price.  This supports both
+            # analytics.liquidity.map.updated and enriched signal.updated events
+            # where symbol lives under scope and snapshot fields are flattened.
+            if normalized.get("current_price") is not None and normalized.get("symbol"):
                 try:
-                    return LiquidityMapSnapshot(
-                        exchange=str(candidate.get("exchange") or "binance"),
-                        market_type=str(candidate.get("market_type") or "usdm_futures"),
-                        symbol=str(candidate.get("symbol") or ""),
-                        timeframe=str(candidate.get("timeframe") or "1m"),
-                        timestamp=parse_datetime(candidate.get("timestamp") or candidate.get("updated_at") or candidate.get("created_at")) or utc_now(),
-                        current_price=float(candidate.get("current_price") or candidate.get("price") or candidate.get("last_price")),
-                        active_levels=list(candidate.get("active_levels") or candidate.get("levels") or []),
-                        equal_levels=list(candidate.get("equal_levels") or []),
-                        stop_clusters=list(candidate.get("stop_clusters") or candidate.get("clusters") or []),
-                        zones=list(candidate.get("zones") or []),
-                        nearest_above_level=candidate.get("nearest_above_level"),
-                        nearest_below_level=candidate.get("nearest_below_level"),
-                        strongest_cluster_above=candidate.get("strongest_cluster_above"),
-                        strongest_cluster_below=candidate.get("strongest_cluster_below"),
-                        above_liquidity_score=float(candidate.get("above_liquidity_score") or 0.0),
-                        below_liquidity_score=float(candidate.get("below_liquidity_score") or 0.0),
-                        liquidity_pressure_score=float(candidate.get("liquidity_pressure_score") or candidate.get("pressure_score") or 0.0),
-                        bias=candidate.get("bias") or "neutral",
-                        signal=candidate.get("signal"),
-                        metadata=dict(candidate.get("metadata") or {}),
-                    )
+                    return LiquidityMapSnapshot(**normalized)
                 except Exception:
+                    # Continue unwrapping nested candidates below.  Some older
+                    # deployments may require analytics model instances for
+                    # levels/clusters; nested snapshot objects should still win.
                     pass
 
-            for key in ("snapshot", "value", "data", "payload"):
+            for key in ("snapshot", "liquidity_snapshot", "liquidity_map_snapshot", "map_snapshot", "map", "value", "data", "payload"):
                 nested = candidate.get(key)
                 snapshot = self._unwrap_snapshot_candidate(nested)
                 if snapshot is not None:

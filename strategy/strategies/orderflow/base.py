@@ -38,6 +38,7 @@ from .utils import (
     extract_trades_count,
     extract_volume_delta,
     extract_volume_delta_ratio,
+    first_present,
     get_path,
     orderflow_domain,
     orderflow_item,
@@ -1266,6 +1267,196 @@ class OrderflowTradingStrategy(TradingStrategy):
             source="context.features",
         )
 
+
+    @staticmethod
+    def _merge_mapping_values(*values: Any) -> dict[str, Any]:
+        """
+        Merge mapping-like values while ignoring empty/non-mapping inputs.
+
+        Later mappings override earlier ones.  This keeps the event-local
+        ``stats``/``context`` values authoritative when the normalizer also
+        carries older composite snapshots in the same domain payload.
+        """
+        merged: dict[str, Any] = {}
+        for value in values:
+            mapping = as_dict(value)
+            if mapping:
+                merged.update(mapping)
+        return merged
+
+    @staticmethod
+    def _put_if_present(target: dict[str, Any], key: str, value: Any) -> None:
+        if value is not None:
+            target[key] = value
+
+    def _canonical_orderflow_mapping(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        """
+        Convert normalized analytics.orderflow domain data into the stable
+        strategy-side composite shape expected by OrderflowCompositeSnapshot.
+
+        The analytics normalizer intentionally keeps several representations for
+        compatibility: event-local ``stats``/``context``, nested ``cvd`` /
+        ``volume_delta`` / ``aggressive_trades`` sections, and literal dotted
+        keys such as ``orderflow.cvd.delta_ratio``.  Old strategy code could
+        pick the wrong/stale section and then return ``*_payload_not_resolved``
+        even though all required features were present.  This adapter makes the
+        current event metrics authoritative and still preserves fallbacks.
+        """
+        raw = dict(data or {})
+
+        context_payload = as_dict(raw.get("context"))
+        context_stats = as_dict(get_path(context_payload, "stats", None))
+        stats = self._merge_mapping_values(
+            context_payload,
+            context_stats,
+            raw.get("stats"),
+        )
+
+        cvd = self._merge_mapping_values(
+            raw.get("cvd"),
+            raw.get("cvd_metrics"),
+            raw.get("cvd_snapshot"),
+            raw.get("orderflow.cvd"),
+        )
+        volume_delta = self._merge_mapping_values(
+            raw.get("volume_delta"),
+            raw.get("delta"),
+            raw.get("delta_metrics"),
+            raw.get("volume_delta_snapshot"),
+            raw.get("orderflow.volume_delta"),
+        )
+        aggressive = self._merge_mapping_values(
+            raw.get("aggressive_trades"),
+            raw.get("aggressive"),
+            raw.get("aggressive_flow"),
+            raw.get("aggressive_trades_snapshot"),
+            raw.get("orderflow.aggressive_trades"),
+        )
+        imbalance = self._merge_mapping_values(
+            raw.get("orderbook_imbalance"),
+            raw.get("imbalance"),
+            raw.get("orderbook"),
+            raw.get("orderflow.orderbook_imbalance"),
+        )
+
+        # Event-local stats/context are the freshest source for updated events.
+        if stats:
+            for key in (
+                "exchange",
+                "market_type",
+                "symbol",
+                "timeframe",
+                "exchange_symbol",
+                "scope",
+                "scope_key",
+                "timestamp",
+                "source_type",
+                "metric",
+                "window_seconds",
+                "trades_count",
+                "last_price",
+                "price",
+                "price_change",
+                "price_change_pct",
+                "total_volume",
+                "total_notional",
+                "buy_volume",
+                "sell_volume",
+                "buy_notional",
+                "sell_notional",
+                "notional_delta",
+                "volume_delta",
+                "delta_ratio",
+                "cvd_value",
+                "cvd_open",
+                "cvd_high",
+                "cvd_low",
+                "cvd_close",
+                "cvd_change",
+                "cvd_change_pct",
+                "cvd_slope",
+                "avg_trade_size",
+                "avg_trade_notional",
+            ):
+                if key in stats and stats.get(key) is not None:
+                    raw[key] = stats.get(key)
+
+            self._put_if_present(cvd, "value", first_present(stats, ("cvd_value", "cvd_close"), default=None))
+            self._put_if_present(cvd, "cvd_value", first_present(stats, ("cvd_value", "cvd_close"), default=None))
+            self._put_if_present(cvd, "cvd_open", stats.get("cvd_open"))
+            self._put_if_present(cvd, "cvd_high", stats.get("cvd_high"))
+            self._put_if_present(cvd, "cvd_low", stats.get("cvd_low"))
+            self._put_if_present(cvd, "cvd_close", stats.get("cvd_close"))
+            self._put_if_present(cvd, "cvd_change", stats.get("cvd_change"))
+            self._put_if_present(cvd, "cvd_change_pct", stats.get("cvd_change_pct"))
+            self._put_if_present(cvd, "cvd_slope", stats.get("cvd_slope"))
+            self._put_if_present(cvd, "delta_ratio", stats.get("delta_ratio"))
+            self._put_if_present(cvd, "price_change_pct", stats.get("price_change_pct"))
+            self._put_if_present(cvd, "buy_ratio", stats.get("buy_ratio"))
+            self._put_if_present(cvd, "sell_ratio", stats.get("sell_ratio"))
+            self._put_if_present(cvd, "trades_count", stats.get("trades_count"))
+            self._put_if_present(cvd, "total_volume", first_present(stats, ("total_volume", "volume"), default=None))
+            self._put_if_present(cvd, "total_notional", first_present(stats, ("total_notional", "quote_volume"), default=None))
+            self._put_if_present(cvd, "last_price", first_present(stats, ("last_price", "price"), default=None))
+            self._put_if_present(cvd, "window_seconds", stats.get("window_seconds"))
+
+            self._put_if_present(volume_delta, "volume_delta", stats.get("volume_delta"))
+            self._put_if_present(volume_delta, "delta_ratio", stats.get("delta_ratio"))
+            self._put_if_present(volume_delta, "notional_delta", stats.get("notional_delta"))
+            self._put_if_present(volume_delta, "buy_volume", stats.get("buy_volume"))
+            self._put_if_present(volume_delta, "sell_volume", stats.get("sell_volume"))
+            self._put_if_present(volume_delta, "buy_notional", stats.get("buy_notional"))
+            self._put_if_present(volume_delta, "sell_notional", stats.get("sell_notional"))
+            self._put_if_present(volume_delta, "buy_ratio", stats.get("buy_ratio"))
+            self._put_if_present(volume_delta, "sell_ratio", stats.get("sell_ratio"))
+            self._put_if_present(volume_delta, "trades_count", stats.get("trades_count"))
+            self._put_if_present(volume_delta, "total_volume", first_present(stats, ("total_volume", "volume"), default=None))
+            self._put_if_present(volume_delta, "total_notional", first_present(stats, ("total_notional", "quote_volume"), default=None))
+
+            # If no separate aggressive section exists, use trade-side ratios
+            # from stats as a conservative aggressive-flow approximation.
+            self._put_if_present(aggressive, "buy_volume", first_present(aggressive, ("buy_volume",), default=stats.get("buy_volume")))
+            self._put_if_present(aggressive, "sell_volume", first_present(aggressive, ("sell_volume",), default=stats.get("sell_volume")))
+            self._put_if_present(aggressive, "buy_notional", first_present(aggressive, ("buy_notional",), default=stats.get("buy_notional")))
+            self._put_if_present(aggressive, "sell_notional", first_present(aggressive, ("sell_notional",), default=stats.get("sell_notional")))
+            self._put_if_present(aggressive, "buy_ratio", first_present(aggressive, ("buy_ratio",), default=stats.get("buy_ratio")))
+            self._put_if_present(aggressive, "sell_ratio", first_present(aggressive, ("sell_ratio",), default=stats.get("sell_ratio")))
+            self._put_if_present(aggressive, "net_volume_delta", first_present(aggressive, ("net_volume_delta",), default=stats.get("volume_delta")))
+            self._put_if_present(aggressive, "net_notional_delta", first_present(aggressive, ("net_notional_delta",), default=stats.get("notional_delta")))
+            self._put_if_present(aggressive, "trades_count", stats.get("trades_count"))
+
+        # Preserve literal feature-style keys as fallbacks for diagnostics and
+        # for helpers that read exact dotted paths.
+        raw["cvd"] = cvd
+        raw["volume_delta"] = volume_delta
+        raw["aggressive_trades"] = aggressive
+        raw["orderbook_imbalance"] = imbalance
+        raw["orderflow.cvd"] = cvd
+        raw["orderflow.volume_delta"] = volume_delta
+        raw["orderflow.aggressive_trades"] = aggressive
+        raw["orderflow.orderbook_imbalance"] = imbalance
+
+        if "trades_count" not in raw or raw.get("trades_count") is None:
+            self._put_if_present(raw, "trades_count", first_present((stats or raw), ("trades_count", "orderflow.trades_count"), default=None))
+        if "total_volume" not in raw or raw.get("total_volume") is None:
+            total_volume = (
+                to_float(raw.get("buy_volume"), 0.0) or 0.0
+            ) + (
+                to_float(raw.get("sell_volume"), 0.0) or 0.0
+            )
+            if total_volume > 0:
+                raw["total_volume"] = total_volume
+        if "total_notional" not in raw or raw.get("total_notional") is None:
+            total_notional = (
+                to_float(raw.get("buy_notional"), 0.0) or 0.0
+            ) + (
+                to_float(raw.get("sell_notional"), 0.0) or 0.0
+            )
+            if total_notional > 0:
+                raw["total_notional"] = total_notional
+
+        return raw
+
     def _snapshot_from_mapping(
         self,
         data: Mapping[str, Any],
@@ -1277,6 +1468,8 @@ class OrderflowTradingStrategy(TradingStrategy):
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering OrderflowTradingStrategy._snapshot_from_mapping")
+        data = self._canonical_orderflow_mapping(data)
+
         cvd = get_path(data, "cvd", {}) or {}
         volume_delta = get_path(data, "volume_delta", {}) or {}
         aggressive = get_path(data, "aggressive_trades", {}) or {}

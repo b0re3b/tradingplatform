@@ -540,15 +540,37 @@ def build_analytics_components(
         evaluator_kwargs: dict[str, Any] | None = None,
     ) -> Any:
         components.append(component)
-        if market_scheduler is not None:
-            callback = getattr(component, "process_market_snapshot", None)
-            if callable(callback):
-                name = evaluator_name or f"{component.__class__.__name__}:{len(components)}"
-                market_scheduler.register_evaluator(
-                    name=name,
-                    callback=callback,
-                    **(evaluator_kwargs or {}),
-                )
+
+        callback = getattr(component, "process_market_snapshot", None)
+        name = evaluator_name or f"{component.__class__.__name__}:{len(components)}"
+
+        if market_scheduler is None:
+            return component
+
+        if callable(callback):
+            market_scheduler.register_evaluator(
+                name=name,
+                callback=callback,
+                **(evaluator_kwargs or {}),
+            )
+            return component
+
+        # Do not silently ignore analytics components anymore.  If a component
+        # lacks process_market_snapshot it can still run through EventBus after
+        # app/main.py calls register(), but it is not state-driven and therefore
+        # will not receive MarketStateStore snapshots.  This diagnostic catches
+        # old packages such as legacy spreads/spoofing before they look "silent".
+        try:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Analytics component is not state-driven; MarketScheduler evaluator not registered | "
+                "component=%s evaluator=%s required_method=process_market_snapshot",
+                component.__class__.__name__,
+                name,
+            )
+        except Exception:
+            pass
+
         return component
 
     add_component(
@@ -662,6 +684,14 @@ def build_analytics_components(
             "exchange": settings.analytics_exchange,
             "market_type": settings.analytics_market_type,
             "dirty_reasons": {"orderbook", "orderbook_resync_required", "rest_snapshot"},
+            "metadata": {
+                "domain": "spoofing",
+                "feature_source": "spoofing",
+                "exchange": settings.analytics_exchange,
+                "market_type": settings.analytics_market_type,
+                "dirty_reasons": ["orderbook", "orderbook_resync_required", "rest_snapshot"],
+                "requires_orderbook_depth": True,
+            },
         },
     )
     add_component(
@@ -670,7 +700,18 @@ def build_analytics_components(
         evaluator_kwargs={
             "exchange": settings.analytics_exchange,
             "market_type": settings.analytics_market_type,
-            "dirty_reasons": {"price", "funding", "open_interest"},
+            # Spreads are quote/orderbook driven with funding as an optional
+            # enhancer.  A single-exchange spot/futures basis analyzer also
+            # needs orderbook snapshots; cross-exchange will only activate when
+            # multiple exchange scopes exist.
+            "dirty_reasons": {
+                "orderbook",
+                "orderbook_resync_required",
+                "rest_snapshot",
+                "price",
+                "funding",
+                "open_interest",
+            },
         },
     )
     add_component(

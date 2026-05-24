@@ -70,6 +70,32 @@ def _first_env(*keys: str, default: str | None = None) -> str | None:
     return default
 
 
+
+def _normalize_exchange_env(value: str | None, default: str) -> str:
+    normalized = (value or default).strip().lower()
+    if normalized in {"prod", "production", "mainnet", "live"}:
+        return "real"
+    if normalized in {"test", "testnet", "demo", "paper", "sandbox"}:
+        return "testnet" if normalized in {"test", "testnet", "sandbox"} else normalized
+    return default
+
+
+def _binance_market_data_rest_url(env: str) -> str:
+    return "https://testnet.binancefuture.com" if env in {"testnet", "demo", "paper"} else "https://fapi.binance.com"
+
+
+def _binance_market_data_ws_url(env: str) -> str:
+    return "wss://stream.binancefuture.com/stream" if env in {"testnet", "demo", "paper"} else "wss://fstream.binance.com/stream"
+
+
+def _binance_execution_rest_url(env: str) -> str:
+    return "https://fapi.binance.com" if env == "real" else "https://testnet.binancefuture.com"
+
+
+def _binance_execution_ws_url(env: str) -> str:
+    return "wss://fstream.binance.com/ws" if env == "real" else "wss://stream.binancefuture.com/ws"
+
+
 def _load_env_file(env_file: str | Path = ".env") -> None:
     """
     Мінімальний .env loader без сторонніх залежностей.
@@ -178,12 +204,44 @@ class ExchangeCredentials:
 class ExchangeConfig:
     enabled: bool = True
     name: str = "binance"
+
+    # ------------------------------------------------------------------
+    # Scope split
+    # ------------------------------------------------------------------
+    # market_data_* is used only by public REST/WS endpoints that feed
+    # MarketIngestion/analytics. Defaults to real Binance USD-M Futures.
+    market_data_env: str = "real"
+    market_data_rest_url: str = "https://fapi.binance.com"
+    market_data_ws_url: str = "wss://fstream.binance.com/stream"
+
+    # execution_* is used only by signed/private endpoints and private user
+    # streams. Defaults to testnet/demo-safe endpoints so real market data can
+    # be used without accidentally routing orders to production.
+    execution_env: str = "testnet"
+    execution_rest_url: str = "https://testnet.binancefuture.com"
+    execution_ws_url: str = "wss://stream.binancefuture.com/ws"
+
+    # Backward-compatible aliases. Treat these as execution/private endpoints,
+    # not market-data endpoints. Old .env files that set BINANCE_REST_URL to
+    # testnet stay safe, while market_data_* remains real by default.
     ws_url: str | None = None
     rest_url: str | None = None
+
     timeout_seconds: float = 10.0
     reconnect_delay: float = 5.0
     max_reconnect_attempts: int = 20
+
+    # Credentials are execution/private credentials. Public market-data REST/WS
+    # does not require API keys.
     credentials: ExchangeCredentials = field(default_factory=ExchangeCredentials)
+
+    @property
+    def market_data_testnet(self) -> bool:
+        return self.market_data_env.lower() in {"testnet", "demo", "paper"}
+
+    @property
+    def execution_testnet(self) -> bool:
+        return self.execution_env.lower() in {"testnet", "demo", "paper"}
 
 
 @dataclass(slots=True)
@@ -244,6 +302,69 @@ class Config:
         base_dir = Path(_get_env("APP_BASE_DIR", str(Path.cwd()))).resolve()
         data_dir = Path(_get_env("APP_DATA_DIR", str(base_dir / "data"))).resolve()
         logs_dir = Path(_get_env("APP_LOGS_DIR", str(base_dir / "logs"))).resolve()
+
+        market_data_env = _normalize_exchange_env(
+            _first_env("MARKET_DATA_ENV", "BINANCE_MARKET_DATA_ENV", "EXCHANGE_MARKET_DATA_ENV"),
+            "real",
+        )
+        execution_env = _normalize_exchange_env(
+            _first_env("EXECUTION_ENV", "BINANCE_EXECUTION_ENV", "EXCHANGE_EXECUTION_ENV"),
+            "testnet",
+        )
+
+        market_data_rest_url = _to_optional_str(
+            _first_env(
+                "MARKET_DATA_REST_URL",
+                "BINANCE_MARKET_DATA_REST_URL",
+                "EXCHANGE_MARKET_DATA_REST_URL",
+            ),
+            _binance_market_data_rest_url(market_data_env),
+        ) or _binance_market_data_rest_url(market_data_env)
+
+        market_data_ws_url = _to_optional_str(
+            _first_env(
+                "MARKET_DATA_WS_URL",
+                "BINANCE_MARKET_DATA_WS_URL",
+                "EXCHANGE_MARKET_DATA_WS_URL",
+            ),
+            _binance_market_data_ws_url(market_data_env),
+        ) or _binance_market_data_ws_url(market_data_env)
+
+        execution_rest_url = _to_optional_str(
+            _first_env(
+                "EXECUTION_REST_URL",
+                "BINANCE_EXECUTION_REST_URL",
+                "EXCHANGE_EXECUTION_REST_URL",
+            ),
+            _binance_execution_rest_url(execution_env),
+        ) or _binance_execution_rest_url(execution_env)
+
+        execution_ws_url = _to_optional_str(
+            _first_env(
+                "EXECUTION_WS_URL",
+                "BINANCE_EXECUTION_WS_URL",
+                "EXCHANGE_EXECUTION_WS_URL",
+            ),
+            _binance_execution_ws_url(execution_env),
+        ) or _binance_execution_ws_url(execution_env)
+
+        legacy_rest_url = _to_optional_str(
+            _first_env(
+                "EXCHANGE_REST_URL",
+                "BINANCE_REST_URL",
+                "BINANCE_FUTURES_REST_URL",
+            ),
+            execution_rest_url,
+        )
+
+        legacy_ws_url = _to_optional_str(
+            _first_env(
+                "EXCHANGE_WS_URL",
+                "BINANCE_WS_URL",
+                "BINANCE_FUTURES_WS_URL",
+            ),
+            execution_ws_url,
+        )
 
         config = cls(
             app=AppConfig(
@@ -320,20 +441,20 @@ class Config:
             exchange=ExchangeConfig(
                 enabled=_to_bool(_first_env("EXCHANGE_ENABLED", "BINANCE_ENABLED"), True),
                 name=_first_env("EXCHANGE_NAME", default="binance") or "binance",
-                ws_url=_to_optional_str(
-                    _first_env(
-                        "EXCHANGE_WS_URL",
-                        "BINANCE_WS_URL",
-                        "BINANCE_FUTURES_WS_URL",
-                    )
-                ),
-                rest_url=_to_optional_str(
-                    _first_env(
-                        "EXCHANGE_REST_URL",
-                        "BINANCE_REST_URL",
-                        "BINANCE_FUTURES_REST_URL",
-                    )
-                ),
+
+                market_data_env=market_data_env,
+                market_data_rest_url=market_data_rest_url,
+                market_data_ws_url=market_data_ws_url,
+                execution_env=execution_env,
+                execution_rest_url=execution_rest_url,
+                execution_ws_url=execution_ws_url,
+
+                # Backward-compatible aliases for old code paths. These point to
+                # execution/private endpoints by default, not public market-data
+                # endpoints, to avoid accidental live order routing.
+                ws_url=legacy_ws_url,
+                rest_url=legacy_rest_url,
+
                 timeout_seconds=_to_float(_first_env("EXCHANGE_TIMEOUT_SECONDS", "BINANCE_TIMEOUT_SECONDS"), 10.0),
                 reconnect_delay=_to_float(_first_env("EXCHANGE_RECONNECT_DELAY", "BINANCE_RECONNECT_DELAY"), 5.0),
                 max_reconnect_attempts=_to_int(
@@ -343,6 +464,9 @@ class Config:
                 credentials=ExchangeCredentials(
                     api_key=_to_optional_str(
                         _first_env(
+                            "EXECUTION_API_KEY",
+                            "BINANCE_EXECUTION_API_KEY",
+                            "EXCHANGE_EXECUTION_API_KEY",
                             "EXCHANGE_API_KEY",
                             "BINANCE_API_KEY",
                             "BINANCE_FUTURES_API_KEY",
@@ -350,6 +474,9 @@ class Config:
                     ),
                     api_secret=_to_optional_str(
                         _first_env(
+                            "EXECUTION_API_SECRET",
+                            "BINANCE_EXECUTION_API_SECRET",
+                            "EXCHANGE_EXECUTION_API_SECRET",
                             "EXCHANGE_API_SECRET",
                             "BINANCE_API_SECRET",
                             "BINANCE_FUTURES_API_SECRET",
@@ -357,17 +484,28 @@ class Config:
                     ),
                     passphrase=_to_optional_str(
                         _first_env(
+                            "EXECUTION_PASSPHRASE",
+                            "BINANCE_EXECUTION_PASSPHRASE",
+                            "EXCHANGE_EXECUTION_PASSPHRASE",
                             "EXCHANGE_PASSPHRASE",
                             "BINANCE_PASSPHRASE",
                             "BINANCE_API_PASSPHRASE",
                         )
                     ),
                     testnet=_to_bool(
-                        _first_env("EXCHANGE_TESTNET", "BINANCE_TESTNET", "BINANCE_FUTURES_TESTNET"),
-                        False,
+                        _first_env(
+                            "EXECUTION_TESTNET",
+                            "BINANCE_EXECUTION_TESTNET",
+                            "EXCHANGE_EXECUTION_TESTNET",
+                            "EXCHANGE_TESTNET",
+                            "BINANCE_TESTNET",
+                            "BINANCE_FUTURES_TESTNET",
+                        ),
+                        execution_env != "real",
                     ),
                 ),
             ),
+
             risk=RiskConfig(
                 max_risk_per_trade_pct=_to_float(_get_env("RISK_MAX_RISK_PER_TRADE_PCT"), 1.0),
                 max_daily_drawdown_pct=_to_float(_get_env("RISK_MAX_DAILY_DRAWDOWN_PCT"), 5.0),
@@ -402,10 +540,12 @@ class Config:
         config.prepare_directories()
 
         logger.info(
-            "Configuration loaded | app=%s env=%s exchange=%s debug=%s",
+            "Configuration loaded | app=%s env=%s exchange=%s market_data_env=%s execution_env=%s debug=%s",
             config.app.name,
             config.app.env,
             config.exchange.name,
+            config.exchange.market_data_env,
+            config.exchange.execution_env,
             config.app.debug,
         )
         return config
@@ -439,6 +579,24 @@ class Config:
 
         if self.postgres.pool_min_size > self.postgres.pool_max_size:
             errors.append("postgres.pool_min_size must be <= postgres.pool_max_size")
+
+        if self.exchange.market_data_env not in {"real", "testnet", "demo", "paper"}:
+            errors.append("exchange.market_data_env must be one of: real, testnet, demo, paper")
+
+        if self.exchange.execution_env not in {"real", "testnet", "demo", "paper"}:
+            errors.append("exchange.execution_env must be one of: real, testnet, demo, paper")
+
+        if not self.exchange.market_data_rest_url:
+            errors.append("exchange.market_data_rest_url must not be empty")
+
+        if not self.exchange.market_data_ws_url:
+            errors.append("exchange.market_data_ws_url must not be empty")
+
+        if not self.exchange.execution_rest_url:
+            errors.append("exchange.execution_rest_url must not be empty")
+
+        if not self.exchange.execution_ws_url:
+            errors.append("exchange.execution_ws_url must not be empty")
 
         if self.risk.max_risk_per_trade_pct <= 0:
             errors.append("risk.max_risk_per_trade_pct must be > 0")

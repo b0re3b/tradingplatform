@@ -443,17 +443,49 @@ class LiquidationUpdate:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "LiquidationUpdate | None":
         scope = MarketScope.from_payload(payload)
-        price = safe_float(first_present(payload, "price", "p", "average_price"))
+        price = safe_float(first_present(payload, "price", "p", "average_price", "avg_price"))
         quantity = safe_float(first_present(payload, "quantity", "qty", "q", "size"), 0.0)
         if not scope.symbol or price is None or price <= 0:
             return None
+
+        metadata = dict(payload.get("metadata") or {})
+        for key in (
+            "notional_usd",
+            "notional",
+            "avg_price",
+            "average_price",
+            "limit_price",
+            "last_filled_qty",
+            "accumulated_filled_qty",
+            "order_status",
+            "order_type",
+            "time_in_force",
+            "exchange_symbol",
+            "liquidation_side",
+            "trade_time",
+            "event_time",
+            "source",
+        ):
+            if key in payload and payload.get(key) is not None and key not in metadata:
+                metadata[key] = payload.get(key)
+
+        notional = safe_float(first_present(payload, "notional_usd", "notional"))
+        if notional is None and quantity is not None and price is not None:
+            notional = float(quantity or 0.0) * float(price)
+        if notional is not None:
+            metadata.setdefault("notional_usd", notional)
+            metadata.setdefault("notional", notional)
+
+        raw_side = first_present(payload, "liquidation_side", "side", "S", "position_side")
+        metadata.setdefault("raw_side", raw_side)
+
         return cls(
             scope=scope,
             price=price,
             quantity=quantity or 0.0,
-            side=normalize_side(first_present(payload, "side", "S", "position_side")),
-            order_id=str(first_present(payload, "order_id", "id", "i") or "") or None,
+            side=normalize_side(raw_side),
+            order_id=str(first_present(payload, "order_id", "id", "i", "trade_id") or "") or None,
             timestamp_ms=safe_int(first_present(payload, "timestamp_ms", "event_time", "T", "E", "timestamp"), now_ms()) or now_ms(),
             received_at_ms=safe_int(payload.get("received_at_ms"), now_ms()) or now_ms(),
-            metadata=dict(payload.get("metadata") or {}),
+            metadata=metadata,
         )

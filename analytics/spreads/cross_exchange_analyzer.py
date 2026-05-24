@@ -465,6 +465,33 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             "price_input_source": "market.orderbook.updated",
         }
 
+
+    async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        """
+        State-driven MarketScheduler entrypoint for cross-exchange spreads.
+
+        Cross-exchange spreads only need top-of-book snapshots here. Funding is
+        handled by spot/futures spread analytics.
+        """
+        payload = self.orderbook_payload_from_market_snapshot(snapshot)
+        if payload is None:
+            return {
+                "processed": False,
+                "reason": "market_snapshot_without_orderbook",
+            }
+
+        event = Event(
+            topic=self.DEFAULT_ORDERBOOK_TOPIC,
+            payload=payload,
+            priority=EventPriority.NORMAL,
+            source="market_state_store",
+        )
+        await self.on_orderbook_update(event)
+        return {
+            "processed": True,
+            "orderbook_processed": True,
+        }
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------

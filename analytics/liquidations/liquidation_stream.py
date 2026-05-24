@@ -39,6 +39,60 @@ from .utils import (
 )
 
 
+
+def _liquidations_truthy_contract_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return bool(value)
+    return True
+
+
+def _enrich_liquidations_strategy_payload(payload: Any, *, topic: str | None = None) -> dict[str, Any]:
+    """
+    Normalize analytics.liquidations stream payloads into StrategyContext-friendly
+    feature_map.  Stream events are mostly event/update context; cascade and
+    exhaustion strategy features are produced by CascadeDetector.
+    """
+    if hasattr(payload, "to_dict") and callable(payload.to_dict):
+        result = payload.to_dict(serialize=True)
+    elif isinstance(payload, dict):
+        result = dict(payload)
+    else:
+        result = {"event": payload}
+
+    event_name = str(topic or result.get("event_name") or result.get("topic") or result.get("source_topic") or "")
+    result.setdefault("domain", "liquidations")
+    result.setdefault("event_name", event_name)
+    result.setdefault("topic", event_name)
+    result.setdefault("source_topic", event_name)
+
+    feature_map = dict(result.get("feature_map") or {})
+
+    # Atomic stream payloads are useful context for hybrid/debug, but should not
+    # masquerade as cascade/exhaustion unless the detector confirms it.
+    event_payload = result.get("event") if isinstance(result.get("event"), dict) else dict(result)
+    feature_map.setdefault("liquidations.event", event_payload)
+    feature_map.setdefault("liquidations.symbol", result.get("symbol") or event_payload.get("symbol"))
+    feature_map.setdefault("liquidations.side", result.get("side") or event_payload.get("side"))
+    feature_map.setdefault("liquidations.notional_usd", result.get("notional_usd") or event_payload.get("notional_usd"))
+    feature_map.setdefault("liquidations.price", result.get("price") or event_payload.get("price"))
+    feature_map.setdefault("liquidations.timestamp", result.get("timestamp") or event_payload.get("timestamp"))
+
+    feature_map = {k: v for k, v in feature_map.items() if _liquidations_truthy_contract_value(v)}
+    result["feature_map"] = feature_map
+    result.setdefault("strategy_contract_version", "analytics-strategy-v1")
+    contract = dict(result.get("strategy_contract") or {})
+    contract.setdefault("version", "analytics-strategy-v1")
+    contract.setdefault("domain", "liquidations")
+    contract.setdefault("expected_by", "StrategyContext/SignalBuilder")
+    contract.setdefault("features", ["liquidations.event", "liquidations.cascade", "liquidations.exhaustion"])
+    result["strategy_contract"] = contract
+    return result
+
+
 @runtime_checkable
 class LiquidationHistoryStoreProtocol(Protocol):
     """
@@ -949,6 +1003,10 @@ class LiquidationStream:
             source=self.service_name,
             domain="liquidations",
         )
+        strategy_payload = _enrich_liquidations_strategy_payload(
+            strategy_payload,
+            topic=self.config.publish_topic_normalized,
+        )
         accepted = await self.event_bus.emit(
             self.config.publish_topic_normalized,
             strategy_payload,
@@ -1010,6 +1068,10 @@ class LiquidationStream:
             source=self.service_name,
             domain="liquidations",
         )
+        strategy_payload = _enrich_liquidations_strategy_payload(
+            strategy_payload,
+            topic=self.publish_topic_updated,
+        )
         accepted = await self.event_bus.emit(
             self.publish_topic_updated,
             strategy_payload,
@@ -1053,6 +1115,10 @@ class LiquidationStream:
             topic=self.config.publish_topic_large,
             source=self.service_name,
             domain="liquidations",
+        )
+        strategy_payload = _enrich_liquidations_strategy_payload(
+            strategy_payload,
+            topic=self.config.publish_topic_large,
         )
         accepted = await self.event_bus.emit(
             self.config.publish_topic_large,

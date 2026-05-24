@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,9 +25,20 @@ class BinanceWebSocketClientConfig:
     This dataclass contains only Binance WS adapter-specific settings.
     """
 
+    # Public market-data combined stream URL. Keep this on production for real
+    # analytics even if execution/private user-data stream is demo/testnet.
     public_ws_url: str = "wss://fstream.binance.com/stream"
-    private_ws_base_url: str = "wss://fstream.binance.com/ws"
-    rest_url: str = "https://fapi.binance.com"
+
+    # Private execution/user-data stream base URL. Keep this on testnet/demo until
+    # live trading is explicitly enabled.
+    private_ws_base_url: str = "wss://stream.binancefuture.com/ws"
+
+    # REST URL used only for private listenKey lifecycle.
+    execution_rest_url: str = "https://testnet.binancefuture.com"
+
+    # Backward-compatible alias for legacy code; new private listenKey logic uses
+    # execution_rest_url.
+    rest_url: str = "https://testnet.binancefuture.com"
 
     timeout_seconds: float = 10.0
     heartbeat_seconds: float = 20.0
@@ -37,7 +49,7 @@ class BinanceWebSocketClientConfig:
     listen_key_keepalive_timeout_seconds: float = 10.0
 
     symbols: list[str] = field(default_factory=list)
-    streams: list[str] = field(default_factory=lambda: ["trade", "depth", "kline"])
+    streams: list[str] = field(default_factory=lambda: ["trade", "depth", "kline", "forceorder"])
 
     depth_level: str = "20"
     depth_speed: str = "100ms"
@@ -66,14 +78,43 @@ class BinanceWebSocketClientConfig:
         trade_emit_min_interval_ms: int = 250,
         trade_batch_max_size: int = 1000,
     ) -> "BinanceWebSocketClientConfig":
+        defaults = cls()
+
+        public_ws_url = cls._resolve_ws_url_from_env(
+            kind="public",
+            env_name=os.getenv("BINANCE_MARKET_DATA_ENV") or os.getenv("MARKET_DATA_ENV"),
+            explicit=os.getenv("BINANCE_MARKET_DATA_WS_URL") or os.getenv("MARKET_DATA_WS_URL"),
+            default=defaults.public_ws_url,
+        )
+
+        private_ws_base_url = cls._resolve_ws_url_from_env(
+            kind="private",
+            env_name=os.getenv("BINANCE_EXECUTION_ENV") or os.getenv("EXECUTION_ENV"),
+            explicit=os.getenv("BINANCE_EXECUTION_WS_URL") or os.getenv("EXECUTION_WS_URL"),
+            # Legacy config.exchange.ws_url is treated as private/execution URL,
+            # so old testnet execution setups stay safe while public market data
+            # can run on real Binance Futures.
+            default=(getattr(config.exchange, "private_ws_url", None) or defaults.private_ws_base_url),
+        )
+
+        execution_rest_url = cls._resolve_rest_url_from_env(
+            env_name=os.getenv("BINANCE_EXECUTION_ENV") or os.getenv("EXECUTION_ENV"),
+            explicit=os.getenv("BINANCE_EXECUTION_REST_URL") or os.getenv("EXECUTION_REST_URL"),
+            default=(config.exchange.rest_url or defaults.execution_rest_url),
+        )
+
+        resolved_streams = cls._resolve_public_streams(streams)
+
         return cls(
-            public_ws_url=config.exchange.ws_url or cls.public_ws_url,
-            rest_url=config.exchange.rest_url or cls.rest_url,
-            timeout_seconds=config.exchange.timeout_seconds,
-            reconnect_delay_seconds=config.exchange.reconnect_delay,
-            max_reconnect_attempts=config.exchange.max_reconnect_attempts,
+            public_ws_url=public_ws_url,
+            private_ws_base_url=private_ws_base_url,
+            execution_rest_url=execution_rest_url,
+            rest_url=execution_rest_url,
+            timeout_seconds=float(getattr(config.exchange, "timeout_seconds", defaults.timeout_seconds) or defaults.timeout_seconds),
+            reconnect_delay_seconds=float(getattr(config.exchange, "reconnect_delay", defaults.reconnect_delay_seconds) or defaults.reconnect_delay_seconds),
+            max_reconnect_attempts=int(getattr(config.exchange, "max_reconnect_attempts", defaults.max_reconnect_attempts) or defaults.max_reconnect_attempts),
             symbols=symbols,
-            streams=streams or ["trade", "depth", "kline", "forceorder"],
+            streams=resolved_streams,
             depth_level=depth_level,
             kline_interval=kline_interval,
             enable_private_stream=enable_private_stream,
@@ -82,6 +123,85 @@ class BinanceWebSocketClientConfig:
             trade_emit_min_interval_ms=trade_emit_min_interval_ms,
             trade_batch_max_size=trade_batch_max_size,
         )
+
+
+    @classmethod
+    def _resolve_public_streams(cls, streams: list[str] | None) -> list[str]:
+        """Resolve public streams with liquidation/forceOrder enabled by default.
+
+        Some app bootstraps pass an explicit stream list such as trade/depth/kline.
+        In that case the old default forceOrder stream was silently lost, so the
+        liquidation pipeline never received live force-order events.
+        """
+        raw_streams: list[str] = list(streams or ["trade", "depth", "kline", "forceorder"])
+
+        env_streams = os.getenv("BINANCE_WS_STREAMS") or os.getenv("MARKET_DATA_WS_STREAMS")
+        if env_streams and env_streams.strip():
+            raw_streams = [item.strip() for item in env_streams.split(",") if item.strip()]
+
+        enable_forceorder = (
+            os.getenv("BINANCE_WS_ENABLE_FORCEORDER")
+            or os.getenv("MARKET_DATA_ENABLE_LIQUIDATIONS")
+            or "true"
+        ).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+        use_all_market_forceorder = (
+            os.getenv("BINANCE_WS_FORCEORDER_ALL_MARKET")
+            or os.getenv("MARKET_DATA_LIQUIDATIONS_ALL_MARKET")
+            or "false"
+        ).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+        normalized = [item.strip().lower().replace("-", "_") for item in raw_streams if item and item.strip()]
+        if enable_forceorder and not any(item in {"forceorder", "liquidation", "forceorder_all", "liquidation_all"} for item in normalized):
+            normalized.append("forceorder")
+        if enable_forceorder and use_all_market_forceorder and not any(item in {"forceorder_all", "liquidation_all"} for item in normalized):
+            normalized.append("forceorder_all")
+        return list(dict.fromkeys(normalized))
+
+    @staticmethod
+    def _resolve_ws_url_from_env(
+        *,
+        kind: str,
+        env_name: str | None,
+        explicit: str | None,
+        default: str,
+    ) -> str:
+        if explicit and explicit.strip():
+            return explicit.strip().rstrip("/")
+
+        mode = (env_name or "").strip().lower()
+        if kind == "public":
+            if mode in {"real", "prod", "production", "live"}:
+                return "wss://fstream.binance.com/stream"
+            if mode in {"test", "testnet", "sandbox", "paper", "demo"}:
+                return "wss://stream.binancefuture.com/stream"
+            return default.rstrip("/")
+
+        if mode in {"real", "prod", "production", "live"}:
+            return "wss://fstream.binance.com/ws"
+        if mode in {"test", "testnet", "sandbox", "paper", "demo"}:
+            return "wss://stream.binancefuture.com/ws"
+        return default.rstrip("/")
+
+    @staticmethod
+    def _resolve_rest_url_from_env(
+        *,
+        env_name: str | None,
+        explicit: str | None,
+        default: str,
+    ) -> str:
+        if explicit and explicit.strip():
+            return explicit.strip().rstrip("/")
+
+        mode = (env_name or "").strip().lower()
+        if mode in {"real", "prod", "production", "live"}:
+            return "https://fapi.binance.com"
+        if mode in {"demo"}:
+            return "https://demo-fapi.binance.com"
+        if mode in {"test", "testnet", "sandbox", "paper"}:
+            return "https://testnet.binancefuture.com"
+
+        return default.rstrip("/")
 
 
 class BinanceWebSocketClient:
@@ -120,7 +240,7 @@ class BinanceWebSocketClient:
     EXCHANGE = "binance"
     SOURCE = "binance_ws"
 
-    SUPPORTED_STREAMS = {"trade", "depth", "kline", "forceorder", "liquidation"}
+    SUPPORTED_STREAMS = {"trade", "depth", "kline", "forceorder", "liquidation", "forceorder_all", "liquidation_all"}
 
     def __init__(
         self,
@@ -220,9 +340,11 @@ class BinanceWebSocketClient:
         await self._ensure_session()
 
         self._logger.info(
-            "Starting Binance WS client | symbols=%s streams=%s private_stream=%s",
+            "Starting Binance WS client | symbols=%s streams=%s public_ws_url=%s private_ws_url=%s private_stream=%s",
             self._symbols,
             self._streams,
+            self._ws_config.public_ws_url,
+            self._ws_config.private_ws_base_url,
             self._ws_config.enable_private_stream,
         )
 
@@ -233,6 +355,9 @@ class BinanceWebSocketClient:
                 "symbols": [symbol.upper() for symbol in self._symbols],
                 "streams": self._streams,
                 "private_stream": self._ws_config.enable_private_stream,
+                "public_ws_url": self._ws_config.public_ws_url,
+                "private_ws_base_url": self._ws_config.private_ws_base_url,
+                "execution_rest_url": self._ws_config.execution_rest_url,
             },
             priority=EventPriority.NORMAL,
         )
@@ -400,25 +525,29 @@ class BinanceWebSocketClient:
         stream_name = message.get("stream")
         data = message.get("data")
 
-        if not stream_name or not isinstance(data, dict):
-            self._logger.debug("Received malformed Binance public WS payload")
+        if not stream_name:
+            self._logger.debug("Received malformed Binance public WS payload: missing stream")
             return
 
-        if "@trade" in stream_name:
+        stream_name_normalized = str(stream_name).lower()
+
+        if "forceorder" in stream_name_normalized:
+            await self._publish_liquidation_payload(data, stream_name=stream_name_normalized)
+            return
+
+        if not isinstance(data, dict):
+            self._logger.debug("Received malformed Binance public WS payload | stream=%s", stream_name)
+            return
+
+        if "@trade" in stream_name_normalized:
             await self._publish_trade_event(data)
             return
 
-        if "@depth" in stream_name:
+        if "@depth" in stream_name_normalized:
             await self._publish_orderbook_event(data)
             return
 
-        stream_name_normalized = stream_name.lower()
-
-        if "@forceorder" in stream_name_normalized:
-            await self._publish_liquidation_event(data)
-            return
-
-        if "@kline_" in stream_name:
+        if "@kline_" in stream_name_normalized:
             await self._publish_kline_event(data)
             return
 
@@ -568,7 +697,7 @@ class BinanceWebSocketClient:
             "X-MBX-APIKEY": self._api_key,
         }
 
-        url = f"{self._ws_config.rest_url}/api/v3/userDataStream"
+        url = f"{self._ws_config.execution_rest_url.rstrip('/')}/fapi/v1/listenKey"
 
         self._logger.info("Creating Binance listen key")
 
@@ -627,7 +756,7 @@ class BinanceWebSocketClient:
             "listenKey": self._listen_key,
         }
 
-        url = f"{self._ws_config.rest_url}/api/v3/userDataStream"
+        url = f"{self._ws_config.execution_rest_url.rstrip('/')}/fapi/v1/listenKey"
 
         self._logger.info("Refreshing Binance listen key")
 
@@ -1015,17 +1144,47 @@ class BinanceWebSocketClient:
                 priority=EventPriority.HIGH,
             )
 
-    async def _publish_liquidation_event(self, data: dict[str, Any]) -> None:
+    async def _publish_liquidation_payload(self, data: Any, *, stream_name: str) -> None:
+        """Publish one or many Binance forceOrder payloads.
+
+        Binance all-market liquidation stream ``!forceOrder@arr`` sends a list,
+        while per-symbol streams send a single mapping. Both must feed the same
+        MarketIngestion path.
+        """
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self._publish_liquidation_event(item, stream_name=stream_name)
+            return
+
+        if isinstance(data, dict):
+            await self._publish_liquidation_event(data, stream_name=stream_name)
+            return
+
+        self._logger.debug("Malformed Binance forceOrder payload | stream=%s payload_type=%s", stream_name, type(data).__name__)
+
+    async def _publish_liquidation_event(self, data: dict[str, Any], *, stream_name: str | None = None) -> None:
         """Publish Binance USD-M forceOrder stream as canonical liquidation input."""
         order = data.get("o")
         if not isinstance(order, dict):
             self._logger.debug("Malformed Binance forceOrder payload")
             return
 
-        symbol = order.get("s") or data.get("s")
-        price = self._safe_float(order.get("ap")) or self._safe_float(order.get("p"))
+        symbol = str(order.get("s") or data.get("s") or "").upper().strip()
+        if self._symbols and symbol.lower() not in set(self._symbols):
+            # all-market forceOrder may send symbols outside the configured universe.
+            return
+
+        avg_price = self._safe_float(order.get("ap"))
+        limit_price = self._safe_float(order.get("p"))
+        price = avg_price or limit_price
         quantity = self._safe_float(order.get("q"))
-        notional = price * quantity if price is not None and quantity is not None else None
+        last_filled_qty = self._safe_float(order.get("l"))
+        accumulated_filled_qty = self._safe_float(order.get("z"))
+        notional_qty = accumulated_filled_qty or quantity or last_filled_qty
+        notional = price * notional_qty if price is not None and notional_qty is not None else None
+        timestamp_ms = order.get("T") or data.get("E")
+        raw_side = order.get("S")
 
         payload = {
             "exchange": self.EXCHANGE,
@@ -1033,22 +1192,38 @@ class BinanceWebSocketClient:
             "symbol": symbol,
             "exchange_symbol": symbol,
             "timeframe": self._ws_config.kline_interval,
-            "side": order.get("S"),
+            "side": raw_side,
+            "liquidation_side": raw_side,
             "order_type": order.get("o"),
             "time_in_force": order.get("f"),
             "quantity": quantity,
             "qty": quantity,
+            "size": quantity,
             "price": price,
-            "avg_price": self._safe_float(order.get("ap")),
-            "limit_price": self._safe_float(order.get("p")),
+            "avg_price": avg_price,
+            "average_price": avg_price,
+            "limit_price": limit_price,
             "notional_usd": notional,
+            "notional": notional,
             "order_status": order.get("X"),
-            "last_filled_qty": self._safe_float(order.get("l")),
-            "accumulated_filled_qty": self._safe_float(order.get("z")),
+            "last_filled_qty": last_filled_qty,
+            "accumulated_filled_qty": accumulated_filled_qty,
             "trade_time": order.get("T"),
             "event_time": data.get("E"),
-            "timestamp_ms": order.get("T") or data.get("E"),
+            "timestamp_ms": timestamp_ms,
             "source": self.SOURCE,
+            "metadata": {
+                "raw": data,
+                "raw_order": order,
+                "raw_side": raw_side,
+                "stream": stream_name or "forceorder",
+                "notional_usd": notional,
+                "avg_price": avg_price,
+                "limit_price": limit_price,
+                "last_filled_qty": last_filled_qty,
+                "accumulated_filled_qty": accumulated_filled_qty,
+                "exchange_symbol": symbol,
+            },
         }
 
         if not payload["symbol"] or not payload["price"] or not payload["quantity"]:
@@ -1056,7 +1231,13 @@ class BinanceWebSocketClient:
             return
 
         if self._market_ingestion is not None:
-            await self._market_ingestion.ingest_liquidation(payload)
+            ok = await self._market_ingestion.ingest_liquidation(payload)
+            if not ok:
+                await self._emit_event(
+                    "system.exchange.liquidation.skipped",
+                    {"exchange": self.EXCHANGE, "symbol": symbol, "reason": "ingestion_rejected", "payload": payload},
+                    priority=EventPriority.LOW,
+                )
         else:
             await self._emit_event(
                 "market.liquidation",
@@ -1221,6 +1402,9 @@ class BinanceWebSocketClient:
 
             if "forceorder" in self._streams or "liquidation" in self._streams:
                 stream_names.append(f"{symbol}@forceOrder")
+
+        if "forceorder_all" in self._streams or "liquidation_all" in self._streams:
+            stream_names.append("!forceOrder@arr")
 
         if not stream_names:
             raise RuntimeError("No Binance public streams configured")

@@ -361,6 +361,52 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             "funding_input_source": "market.funding.updated",
         }
 
+
+    async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
+        """
+        State-driven MarketScheduler entrypoint.
+
+        New runtime flow does not emit raw market.orderbook.updated/funding
+        events for every update.  This adapter unwraps MarketSnapshot.orderbook
+        and MarketSnapshot.funding into the same Event contracts used by the
+        legacy handlers.
+        """
+        result: dict[str, Any] = {
+            "processed": False,
+            "orderbook_processed": False,
+            "funding_processed": False,
+            "reason": None,
+        }
+
+        orderbook_payload = self.orderbook_payload_from_market_snapshot(snapshot)
+        if orderbook_payload is not None:
+            event = Event(
+                topic=self.DEFAULT_ORDERBOOK_TOPIC,
+                payload=orderbook_payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            )
+            await self.on_orderbook_update(event)
+            result["processed"] = True
+            result["orderbook_processed"] = True
+
+        funding_payload = self.funding_payload_from_market_snapshot(snapshot)
+        if funding_payload is not None:
+            event = Event(
+                topic=self.DEFAULT_FUNDING_TOPIC,
+                payload=funding_payload,
+                priority=EventPriority.NORMAL,
+                source="market_state_store",
+            )
+            await self.on_funding_update(event)
+            result["processed"] = True
+            result["funding_processed"] = True
+
+        if not result["processed"]:
+            result["reason"] = "market_snapshot_without_orderbook_or_funding"
+
+        return result
+
     # ------------------------------------------------------------------
     # Event handlers
     # ------------------------------------------------------------------

@@ -181,40 +181,66 @@ def _log_env_diagnostics(env_file: Path) -> None:
 # ----------------------------------------------------------------------
 
 
+def _component_flag(component: Any, *names: str) -> bool:
+    """Best-effort lifecycle flag reader for mixed legacy/new components."""
+    for name in names:
+        value = getattr(component, name, None)
+        if isinstance(value, bool):
+            return value
+        if callable(value):
+            try:
+                result = value()
+            except TypeError:
+                continue
+            if isinstance(result, bool):
+                return result
+    return False
+
+
 async def _start_analytics_component(component: Any) -> None:
     """
-    Універсальний запуск аналітичного компонента.
+    Start analytics components safely under the state-driven runtime.
 
-    Деякі компоненти мають тільки register() без start() (OIAnalyzer,
-    PriceActionAnalyzer, SpoofingAnalyzer). start_component() шукає
-    атрибут .start і якщо його нема — мовчки нічого не робить, через
-    що компонент ніколи не реєструється і не слухає жодних подій.
+    Old analytics classes are not consistent: some implement only register(),
+    some implement start() but do not call register(), and newer services call
+    register() inside start().  The app bootstrap must not assume any one style.
 
-    Порядок:
-    1. Якщо є start() — викликаємо його. Компоненти що мають обидва методи
-       (FundingAnalyzer, WhaleAnalyzer, SpreadAnalyzer, LiquidationStream,
-       LiquidityService, OrderFlowAnalyzer) самі викликають register()
-       всередині start(), тому окремий виклик register() їм не потрібен.
-    2. Якщо start() відсутній але є register() — викликаємо register()
-       напряму, щоб компонент підписався на EventBus і запустив scheduler
-       jobs.
+    Correct lifecycle for analytics is always:
+        register() once, then start() once when available.
+
+    This guarantees EventBus subscriptions and Scheduler jobs are installed for
+    PriceAction, Spoofing, Spreads, Funding/OI, Liquidations, Liquidity,
+    Orderflow and Whales without putting domain logic into app.
     """
-    has_start = callable(getattr(component, "start", None))
     has_register = callable(getattr(component, "register", None))
+    has_start = callable(getattr(component, "start", None))
 
-    if has_start:
-        await start_component(component)
-    elif has_register:
+    if has_register and not _component_flag(component, "is_registered", "registered", "_registered"):
         await register_component(component)
         logger.debug(
-            "Analytics component started via register() (no start() method) | component=%s",
+            "Analytics component registered | component=%s",
             component.__class__.__name__,
         )
-    else:
-        logger.warning(
-            "Analytics component has neither start() nor register() | component=%s",
+
+    if has_start and not _component_flag(component, "is_started", "started", "_started"):
+        await start_component(component)
+        logger.debug(
+            "Analytics component started | component=%s",
             component.__class__.__name__,
         )
+        return
+
+    if has_register:
+        logger.debug(
+            "Analytics component has no start() or is already started; register() completed | component=%s",
+            component.__class__.__name__,
+        )
+        return
+
+    logger.warning(
+        "Analytics component has neither start() nor register() | component=%s",
+        component.__class__.__name__,
+    )
 
 
 class TradingSystemRuntime:

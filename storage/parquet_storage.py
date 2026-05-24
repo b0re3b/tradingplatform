@@ -63,6 +63,11 @@ class ParquetStorageConfig:
 
     @classmethod
     def from_core_config(cls, config: Config) -> "ParquetStorageConfig":
+        # ``ParquetStorageConfig`` is a slotted dataclass, so class-level field
+        # access such as ``cls.flush_job_timeout_seconds`` returns a
+        # ``member_descriptor`` on some Python versions. Keep defaults on an
+        # instance and read fallback values from it.
+        defaults = cls()
         storage = getattr(config, "storage", None)
 
         root_dir = getattr(storage, "parquet_dir", None)
@@ -71,13 +76,13 @@ class ParquetStorageConfig:
         if root_dir is None:
             app = getattr(config, "app", None)
             data_dir = getattr(app, "data_dir", None)
-            root_dir = str(Path(data_dir) / "parquet") if data_dir is not None else cls.root_dir
+            root_dir = str(Path(data_dir) / "parquet") if data_dir is not None else defaults.root_dir
 
-        enabled = bool(getattr(storage, "parquet_enabled", cls.enabled)) if storage is not None else cls.enabled
-        flush_interval = float(getattr(storage, "flush_interval_seconds", cls.flush_interval_seconds)) if storage is not None else cls.flush_interval_seconds
-        batch_size = int(getattr(storage, "batch_size", cls.max_records_per_dataset)) if storage is not None else cls.max_records_per_dataset
-        flush_job_timeout = float(getattr(storage, "flush_job_timeout_seconds", cls.flush_job_timeout_seconds)) if storage is not None else cls.flush_job_timeout_seconds
-        flush_lock_timeout = float(getattr(storage, "flush_lock_timeout_seconds", cls.flush_lock_timeout_seconds)) if storage is not None else cls.flush_lock_timeout_seconds
+        enabled = bool(getattr(storage, "parquet_enabled", defaults.enabled)) if storage is not None else defaults.enabled
+        flush_interval = float(getattr(storage, "flush_interval_seconds", defaults.flush_interval_seconds)) if storage is not None else defaults.flush_interval_seconds
+        batch_size = int(getattr(storage, "batch_size", defaults.max_records_per_dataset)) if storage is not None else defaults.max_records_per_dataset
+        flush_job_timeout = float(getattr(storage, "flush_job_timeout_seconds", defaults.flush_job_timeout_seconds)) if storage is not None else defaults.flush_job_timeout_seconds
+        flush_lock_timeout = float(getattr(storage, "flush_lock_timeout_seconds", defaults.flush_lock_timeout_seconds)) if storage is not None else defaults.flush_lock_timeout_seconds
 
         return cls(
             root_dir=str(root_dir),
@@ -86,18 +91,18 @@ class ParquetStorageConfig:
             flush_job_timeout_seconds=max(flush_interval, flush_job_timeout),
             flush_lock_timeout_seconds=max(0.0, flush_lock_timeout),
             max_records_per_dataset=max(1, batch_size),
-            store_trades=bool(getattr(storage, "store_trades", cls.store_trades)) if storage is not None else cls.store_trades,
-            store_closed_candles=bool(getattr(storage, "store_closed_candles", cls.store_closed_candles)) if storage is not None else cls.store_closed_candles,
-            store_orderbook_snapshots=bool(getattr(storage, "store_orderbook_snapshots", cls.store_orderbook_snapshots)) if storage is not None else cls.store_orderbook_snapshots,
-            store_funding=bool(getattr(storage, "store_funding", cls.store_funding)) if storage is not None else cls.store_funding,
-            store_open_interest=bool(getattr(storage, "store_open_interest", cls.store_open_interest)) if storage is not None else cls.store_open_interest,
-            store_liquidations=bool(getattr(storage, "store_liquidations", cls.store_liquidations)) if storage is not None else cls.store_liquidations,
-            store_analytics=bool(getattr(storage, "store_analytics", cls.store_analytics)) if storage is not None else cls.store_analytics,
-            store_strategy_events=bool(getattr(storage, "store_strategy_events", cls.store_strategy_events)) if storage is not None else cls.store_strategy_events,
-            store_signal_events=bool(getattr(storage, "store_signal_events", cls.store_signal_events)) if storage is not None else cls.store_signal_events,
-            store_risk_events=bool(getattr(storage, "store_risk_events", cls.store_risk_events)) if storage is not None else cls.store_risk_events,
-            store_execution_events=bool(getattr(storage, "store_execution_events", cls.store_execution_events)) if storage is not None else cls.store_execution_events,
-            store_position_events=bool(getattr(storage, "store_position_events", cls.store_position_events)) if storage is not None else cls.store_position_events,
+            store_trades=bool(getattr(storage, "store_trades", defaults.store_trades)) if storage is not None else defaults.store_trades,
+            store_closed_candles=bool(getattr(storage, "store_closed_candles", defaults.store_closed_candles)) if storage is not None else defaults.store_closed_candles,
+            store_orderbook_snapshots=bool(getattr(storage, "store_orderbook_snapshots", defaults.store_orderbook_snapshots)) if storage is not None else defaults.store_orderbook_snapshots,
+            store_funding=bool(getattr(storage, "store_funding", defaults.store_funding)) if storage is not None else defaults.store_funding,
+            store_open_interest=bool(getattr(storage, "store_open_interest", defaults.store_open_interest)) if storage is not None else defaults.store_open_interest,
+            store_liquidations=bool(getattr(storage, "store_liquidations", defaults.store_liquidations)) if storage is not None else defaults.store_liquidations,
+            store_analytics=bool(getattr(storage, "store_analytics", defaults.store_analytics)) if storage is not None else defaults.store_analytics,
+            store_strategy_events=bool(getattr(storage, "store_strategy_events", defaults.store_strategy_events)) if storage is not None else defaults.store_strategy_events,
+            store_signal_events=bool(getattr(storage, "store_signal_events", defaults.store_signal_events)) if storage is not None else defaults.store_signal_events,
+            store_risk_events=bool(getattr(storage, "store_risk_events", defaults.store_risk_events)) if storage is not None else defaults.store_risk_events,
+            store_execution_events=bool(getattr(storage, "store_execution_events", defaults.store_execution_events)) if storage is not None else defaults.store_execution_events,
+            store_position_events=bool(getattr(storage, "store_position_events", defaults.store_position_events)) if storage is not None else defaults.store_position_events,
         )
 
 

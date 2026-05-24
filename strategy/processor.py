@@ -644,6 +644,11 @@ class SignalNormalizer(BaseStrategyComponent):
         if value is None or not isinstance(path, str) or not path.strip():
             return default
 
+
+        if isinstance(value, dict) and path in value:
+            current = value.get(path)
+            return default if current is None else current
+
         current = value
         for part in path.split("."):
             if current is None:
@@ -652,7 +657,10 @@ class SignalNormalizer(BaseStrategyComponent):
             if not part:
                 return default
             if isinstance(current, dict):
-                current = current.get(part)
+                if part in current:
+                    current = current.get(part)
+                else:
+                    return default
             else:
                 current = getattr(current, part, None)
         return default if current is None else current
@@ -836,9 +844,11 @@ class SignalNormalizer(BaseStrategyComponent):
             domain_data=domain_data,
         ) or {}
 
-        cvd_value = get("cvd.value", "cvd", "cumulative_volume_delta", "stats.cvd", "context.cvd")
-        delta_value = get("volume_delta.volume_delta", "volume_delta", "delta", "stats.volume_delta", "context.volume_delta")
+        cvd_value = get("orderflow.cvd.value", "cvd.value", "cvd", "cumulative_volume_delta", "stats.cvd", "context.cvd")
+        delta_value = get("orderflow.volume_delta.volume_delta", "volume_delta.volume_delta", "volume_delta", "delta", "stats.volume_delta", "context.volume_delta")
         delta_ratio = get(
+            "orderflow.cvd.delta_ratio",
+            "orderflow.volume_delta.delta_ratio",
             "cvd.delta_ratio",
             "volume_delta.delta_ratio",
             "delta_ratio",
@@ -851,8 +861,8 @@ class SignalNormalizer(BaseStrategyComponent):
         if total_volume is None and buy_volume is not None and sell_volume is not None:
             total_volume = buy_volume + sell_volume
 
-        buy_ratio = _to_float(get("buy_ratio", "stats.buy_ratio", "context.buy_ratio", "aggressive_trades.buy_ratio"), None)
-        sell_ratio = _to_float(get("sell_ratio", "stats.sell_ratio", "context.sell_ratio", "aggressive_trades.sell_ratio"), None)
+        buy_ratio = _to_float(get("orderflow.aggressive_trades.buy_ratio", "buy_ratio", "stats.buy_ratio", "context.buy_ratio", "aggressive_trades.buy_ratio"), None)
+        sell_ratio = _to_float(get("orderflow.aggressive_trades.sell_ratio", "sell_ratio", "stats.sell_ratio", "context.sell_ratio", "aggressive_trades.sell_ratio"), None)
         if total_volume and total_volume > 0:
             if buy_ratio is None and buy_volume is not None:
                 buy_ratio = buy_volume / total_volume
@@ -866,14 +876,14 @@ class SignalNormalizer(BaseStrategyComponent):
         for key, value in {
             "value": cvd_value,
             "delta_ratio": delta_ratio,
-            "cvd_change_pct": get("cvd.cvd_change_pct", "cvd_change_pct", "change_pct"),
-            "cvd_slope": get("cvd.cvd_slope", "cvd_slope", "slope"),
-            "price_change_pct": get("cvd.price_change_pct", "price_change_pct", "price_delta_pct"),
+            "cvd_change_pct": get("orderflow.cvd.cvd_change_pct", "cvd.cvd_change_pct", "cvd_change_pct", "change_pct"),
+            "cvd_slope": get("orderflow.cvd.cvd_slope", "cvd.cvd_slope", "cvd_slope", "slope"),
+            "price_change_pct": get("orderflow.cvd.price_change_pct", "cvd.price_change_pct", "price_change_pct", "price_delta_pct"),
             "buy_ratio": buy_ratio,
             "sell_ratio": sell_ratio,
         }.items():
             if value is not None:
-                cvd.setdefault(key, value)
+                cvd[key] = value
 
         for key, value in {
             "volume_delta": delta_value,
@@ -883,14 +893,14 @@ class SignalNormalizer(BaseStrategyComponent):
             "cumulative_notional_delta": get("volume_delta.cumulative_notional_delta", "cumulative_notional_delta"),
         }.items():
             if value is not None:
-                volume_delta.setdefault(key, value)
+                volume_delta[key] = value
 
-        net_volume_delta = get("aggressive_trades.net_volume_delta", "net_volume_delta", "volume_delta", "delta")
+        net_volume_delta = get("orderflow.aggressive_trades.net_volume_delta", "aggressive_trades.net_volume_delta", "net_volume_delta", "volume_delta", "delta")
         for key, value in {
             "buy_ratio": buy_ratio,
             "sell_ratio": sell_ratio,
             "net_volume_delta": net_volume_delta,
-            "net_notional_delta": get("aggressive_trades.net_notional_delta", "net_notional_delta", "notional_delta"),
+            "net_notional_delta": get("orderflow.aggressive_trades.net_notional_delta", "aggressive_trades.net_notional_delta", "net_notional_delta", "notional_delta"),
             "burst_score": get("aggressive_trades.burst_score", "burst_score", "aggression_score"),
             "large_buy_trades": get("aggressive_trades.large_buy_trades", "large_buy_trades"),
             "large_sell_trades": get("aggressive_trades.large_sell_trades", "large_sell_trades"),
@@ -898,7 +908,7 @@ class SignalNormalizer(BaseStrategyComponent):
             "sell_volume": sell_volume,
         }.items():
             if value is not None:
-                aggressive.setdefault(key, value)
+                aggressive[key] = value
 
         for key, value in {
             "ratio": get("orderbook_imbalance.ratio", "imbalance_ratio", "orderbook_imbalance_ratio"),
@@ -908,13 +918,33 @@ class SignalNormalizer(BaseStrategyComponent):
                 orderbook.setdefault(key, value)
 
         if cvd:
-            domain_data.setdefault("cvd", cvd)
+            domain_data["cvd"] = cvd
         if volume_delta:
-            domain_data.setdefault("volume_delta", volume_delta)
+            domain_data["volume_delta"] = volume_delta
         if aggressive:
-            domain_data.setdefault("aggressive_trades", aggressive)
+            domain_data["aggressive_trades"] = aggressive
         if orderbook:
-            domain_data.setdefault("orderbook_imbalance", orderbook)
+            domain_data["orderbook_imbalance"] = orderbook
+
+        # Stable nested aliases expected by concrete orderflow strategies.
+        if cvd:
+            domain_data.setdefault("cvd_metrics", cvd)
+            domain_data.setdefault("cvd_snapshot", cvd)
+            domain_data.setdefault("cumulative_delta", cvd)
+        if volume_delta:
+            domain_data.setdefault("delta", volume_delta)
+            domain_data.setdefault("delta_metrics", volume_delta)
+            domain_data.setdefault("volume_delta_snapshot", volume_delta)
+        if aggressive:
+            domain_data.setdefault("aggressive", aggressive)
+            domain_data.setdefault("aggressive_flow", aggressive)
+            domain_data.setdefault("aggressive_trades_snapshot", aggressive)
+
+        signal = self._contract_first_mapping("signal", "setup", "orderflow_signal", "analytics_signal", payload=payload, domain_data=domain_data)
+        if signal:
+            domain_data.setdefault("signal", signal)
+            domain_data.setdefault("setup", signal)
+            domain_data.setdefault("orderflow_signal", signal)
 
         for key, value in {
             "trades_count": get("trades_count", "trades", "trade_count", "stats.trades_count"),
@@ -1190,15 +1220,20 @@ class SignalNormalizer(BaseStrategyComponent):
         if "price" in flat and "reference_price" not in flat:
             flat["reference_price"] = flat["price"]
 
+        topic = self._topic_from_payload(payload)
+        is_large_trade_event = "large_trade" in topic
         if large_trade is None and any(key in flat for key in ("large_trade_notional", "large_trade_zscore", "total_notional")):
             large_trade = dict(flat)
-        if activity is None and (large_trade or cluster or cluster_update or flat):
+        # Do not synthesize pressure/liquidation_context from a plain large-trade
+        # event.  Those sections are distinct whale setups and routing should not
+        # make absorption/liquidation strategies think their required contracts exist.
+        if activity is None and (large_trade or cluster or cluster_update):
             activity = dict(flat)
             if large_trade:
                 activity.setdefault("large_trade", large_trade)
-        if pressure is None and any(key in flat for key in ("pressure_score", "imbalance_ratio", "dominant_side", "whale_side")):
+        if (not is_large_trade_event) and pressure is None and any(key in flat for key in ("pressure_score", "imbalance_ratio")):
             pressure = dict(flat)
-        if liquidation_context is None and any(key in flat for key in ("liquidation_side", "liquidation_notional", "exhaustion_probability")):
+        if (not is_large_trade_event) and liquidation_context is None and any(key in flat for key in ("liquidation_side", "liquidation_notional", "exhaustion_probability")):
             liquidation_context = dict(flat)
 
         for name, section in (
@@ -1336,8 +1371,10 @@ class SignalNormalizer(BaseStrategyComponent):
             flat = {
                 key: get(key)
                 for key in (
-                    "current_price", "above_liquidity_score", "below_liquidity_score",
-                    "pressure_score", "bias", "nearest_above_level", "nearest_below_level",
+                    "current_price", "last_price", "reference_price", "price",
+                    "above_liquidity_score", "below_liquidity_score",
+                    "pressure_score", "liquidity_pressure_score", "bias",
+                    "nearest_above_level", "nearest_below_level",
                     "strongest_cluster_above", "strongest_cluster_below",
                     "equal_levels", "zones",
                 )
@@ -1347,13 +1384,24 @@ class SignalNormalizer(BaseStrategyComponent):
                 flat.setdefault("active_levels", active_levels)
             if stop_clusters is not None:
                 flat.setdefault("stop_clusters", stop_clusters)
-            if flat:
+            price = flat.get("current_price") or flat.get("last_price") or flat.get("reference_price") or flat.get("price")
+            has_structure = any(flat.get(key) not in (None, [], {}) for key in (
+                "active_levels", "stop_clusters", "equal_levels", "zones",
+                "nearest_above_level", "nearest_below_level",
+                "strongest_cluster_above", "strongest_cluster_below",
+            ))
+            if price is not None and has_structure:
+                flat.setdefault("current_price", price)
                 snapshot = flat
-        if snapshot:
+        if self._contract_section_present(snapshot):
             domain_data["snapshot"] = snapshot
             domain_data.setdefault("map", snapshot)
             domain_data.setdefault("map_snapshot", snapshot)
             domain_data.setdefault("liquidity_map", snapshot)
+        elif "signal" in self._topic_from_payload(payload):
+            # Signal-only liquidity events are useful for diagnostics/hybrid votes,
+            # but they are not a full LiquidityMapSnapshot contract.
+            domain_data.setdefault("payload_contract_level", "signal_only")
         if active_levels is not None:
             domain_data.setdefault("active_levels", active_levels)
         if stop_clusters is not None:
@@ -1598,7 +1646,7 @@ class SignalNormalizer(BaseStrategyComponent):
             value = self._contract_get_path(domain_data, path, None)
             if value is None and name in domain_data:
                 value = domain_data.get(name)
-            if value is None:
+            if value is None or (isinstance(value, (dict, list, tuple, set)) and not value):
                 continue
             confidence = self._contract_get_path(domain_data, "confidence", None)
             if confidence is None:
@@ -3429,9 +3477,16 @@ class SignalNormalizer(BaseStrategyComponent):
         - does NOT synthesize cascade/exhaustion/squeeze/signal sections unless
           analytics explicitly supplied a detected/actionable context.
         """
-        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        _strategy_logger = (
+                getattr(self, "logger", None)
+                or getattr(self, "_logger", None)
+                or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        )
         if _strategy_logger.isEnabledFor(logging.DEBUG):
-            _strategy_logger.debug("Entering SignalNormalizer._augment_liquidations_domain_data")
+            _strategy_logger.debug(
+                "Entering SignalNormalizer._augment_liquidations_domain_data"
+            )
+
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
@@ -3542,8 +3597,6 @@ class SignalNormalizer(BaseStrategyComponent):
             if value is None:
                 return
 
-            # Canonical sections override raw/flat fields already copied into
-            # domain_data. This mirrors the OI contract behavior.
             if override:
                 domain_data[target] = value
             else:
@@ -3568,6 +3621,7 @@ class SignalNormalizer(BaseStrategyComponent):
             "cascade_detection",
             "cascade_detected",
             "liquidation_cascade",
+            "liquidations.cascade",
         )
         exhaustion = mapping_for(
             "exhaustion",
@@ -3576,6 +3630,7 @@ class SignalNormalizer(BaseStrategyComponent):
             "exhaustion_detected",
             "reversal_context",
             "liquidation_exhaustion",
+            "liquidations.exhaustion",
         )
         squeeze = mapping_for(
             "squeeze",
@@ -3584,12 +3639,14 @@ class SignalNormalizer(BaseStrategyComponent):
             "squeeze_context",
             "pending_confirmation",
             "liquidation_squeeze",
+            "liquidations.squeeze",
         )
         cluster = mapping_for(
             "cluster",
             "liquidation_cluster",
             "cluster_stats",
             "liquidations_cluster",
+            "liquidations.cluster",
         )
         signal = mapping_for(
             "signal",
@@ -3597,6 +3654,7 @@ class SignalNormalizer(BaseStrategyComponent):
             "liquidations_signal",
             "analytics_signal",
             "setup",
+            "liquidations.signal",
         )
 
         # Some analytics modules publish the primary result under generic "result".
@@ -3649,29 +3707,34 @@ class SignalNormalizer(BaseStrategyComponent):
                     or container.get("cascade_result")
                     or container.get("cascade_detection")
                     or container.get("liquidation_cascade")
+                    or container.get("liquidations.cascade")
             )
             nested_exhaustion = (
                     container.get("exhaustion")
                     or container.get("exhaustion_result")
                     or container.get("exhaustion_detection")
                     or container.get("reversal_context")
+                    or container.get("liquidations.exhaustion")
             )
             nested_squeeze = (
                     container.get("squeeze")
                     or container.get("squeeze_result")
                     or container.get("squeeze_reversal")
                     or container.get("squeeze_context")
+                    or container.get("liquidations.squeeze")
             )
             nested_cluster = (
                     container.get("cluster")
                     or container.get("liquidation_cluster")
                     or container.get("cluster_stats")
+                    or container.get("liquidations.cluster")
             )
             nested_signal = (
                     container.get("signal")
                     or container.get("liquidation_signal")
                     or container.get("analytics_signal")
                     or container.get("setup")
+                    or container.get("liquidations.signal")
             )
 
             if isinstance(nested_cascade, dict) and cascade is None:
@@ -3686,7 +3749,20 @@ class SignalNormalizer(BaseStrategyComponent):
                 signal = dict(nested_signal)
 
         # Safe flat enrichment for cluster only. Cluster is context, not a setup.
-        if cluster is None:
+        # Do not synthesize cluster for plain raw/large liquidation events; only expose
+        # flat cluster context when analytics explicitly published cluster/cascade-style
+        # context.
+        is_cluster_context_event = (
+                "cluster" in topic
+                or "cascade" in topic
+                or "exhaustion" in topic
+                or value_for("cluster_detected", default=None) is not None
+                or value_for("cluster_id", default=None) is not None
+                or value_for("event_count", default=None) is not None
+                or value_for("duration_seconds", default=None) is not None
+        )
+
+        if cluster is None and is_cluster_context_event:
             flat_cluster: dict[str, Any] = {}
             for key in (
                     "duration_seconds",
@@ -3715,7 +3791,8 @@ class SignalNormalizer(BaseStrategyComponent):
         if cascade is None and (
                 "cascade" in topic
                 or value_for("cascade_detected", default=None) is not None
-                or value_for("cascade_direction", "continuation_bias", default=None) is not None
+                or value_for("cascade_direction", "continuation_bias", default=None)
+                is not None
         ):
             cascade = {
                 "detected": to_bool(value_for("cascade_detected", default=True), True),
@@ -3803,7 +3880,8 @@ class SignalNormalizer(BaseStrategyComponent):
         # Flat squeeze only when analytics explicitly indicates squeeze context.
         if squeeze is None and (
                 "squeeze" in topic
-                or value_for("squeeze_confirmed", "squeeze_score", default=None) is not None
+                or value_for("squeeze_confirmed", "squeeze_score", default=None)
+                is not None
         ):
             squeeze = {
                 "detected": to_bool(value_for("squeeze_detected", default=True), True),
@@ -3915,6 +3993,82 @@ class SignalNormalizer(BaseStrategyComponent):
                 ),
                 signal,
             )
+
+        # Common flat aliases for diagnostics / fallback strategy helpers.
+        for key, aliases in {
+            "exchange": ("exchange",),
+            "market_type": ("market_type",),
+            "symbol": ("symbol",),
+            "exchange_symbol": ("exchange_symbol",),
+            "timeframe": ("timeframe",),
+            "side": ("side", "liquidation_side", "direction"),
+            "price": ("price", "avg_price", "average_price", "limit_price"),
+            "quantity": ("quantity", "qty", "executed_qty"),
+            "notional_usd": ("notional_usd", "notional", "total_notional_usd"),
+            "timestamp": ("timestamp", "event_time", "trade_time"),
+        }.items():
+            if key in domain_data and domain_data[key] is not None:
+                continue
+
+            value = value_for(*aliases, default=None)
+            if value is not None:
+                domain_data[key] = value
+
+        # Stable feature aliases. Only set actionable setup features when their
+        # sections are truly present/detected.
+        if cascade and section_detected(cascade):
+            domain_data.setdefault("liquidations.cascade", cascade)
+            if "confidence" in cascade:
+                domain_data.setdefault(
+                    "liquidations.cascade.confidence",
+                    cascade.get("confidence"),
+                )
+            if "intensity_score" in cascade:
+                domain_data.setdefault(
+                    "liquidations.cascade.intensity_score",
+                    cascade.get("intensity_score"),
+                )
+            if "direction" in cascade:
+                domain_data.setdefault(
+                    "liquidations.cascade.direction",
+                    cascade.get("direction"),
+                )
+
+        if exhaustion and section_detected(exhaustion):
+            domain_data.setdefault("liquidations.exhaustion", exhaustion)
+            if "confidence" in exhaustion:
+                domain_data.setdefault(
+                    "liquidations.exhaustion.confidence",
+                    exhaustion.get("confidence"),
+                )
+            if "exhaustion_bias" in exhaustion:
+                domain_data.setdefault(
+                    "liquidations.exhaustion.exhaustion_bias",
+                    exhaustion.get("exhaustion_bias"),
+                )
+            if "bias_delta" in exhaustion:
+                domain_data.setdefault(
+                    "liquidations.exhaustion.bias_delta",
+                    exhaustion.get("bias_delta"),
+                )
+
+        if signal and section_detected(signal):
+            domain_data.setdefault("liquidations.signal", signal)
+            if "confidence" in signal:
+                domain_data.setdefault(
+                    "liquidations.signal.confidence",
+                    signal.get("confidence"),
+                )
+            if "score" in signal:
+                domain_data.setdefault(
+                    "liquidations.signal.score",
+                    signal.get("score"),
+                )
+            if "side" in signal:
+                domain_data.setdefault(
+                    "liquidations.signal.side",
+                    signal.get("side"),
+                )
 
     def _augment_liquidity_domain_data(
             self,
@@ -6380,7 +6534,9 @@ class SignalNormalizer(BaseStrategyComponent):
 
         # Flat enrichment is section-specific. Do not copy the whole payload into
         # all sections; only create a section when the relevant fields exist.
-        if pressure is None:
+        topic = self._topic_from_payload(payload)
+        is_large_trade_event = "large_trade" in topic
+        if pressure is None and not is_large_trade_event:
             flat_pressure: dict[str, Any] = {}
             for key in (
                     "dominant_side",
@@ -6459,7 +6615,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_large_trade:
                 large_trade = flat_large_trade
 
-        if cluster is None:
+        if cluster is None and not is_large_trade_event:
             flat_cluster: dict[str, Any] = {}
             for key in (
                     "cluster_side",
@@ -6487,7 +6643,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster:
                 cluster = flat_cluster
 
-        if cluster_update is None:
+        if cluster_update is None and not is_large_trade_event:
             flat_cluster_update: dict[str, Any] = {}
             for key in (
                     "cluster_update_side",
@@ -6515,7 +6671,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster_update:
                 cluster_update = flat_cluster_update
 
-        if cluster_exhaustion is None:
+        if cluster_exhaustion is None and not is_large_trade_event:
             flat_cluster_exhaustion: dict[str, Any] = {}
             for key in (
                     "exhausted_side",
@@ -6542,7 +6698,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster_exhaustion:
                 cluster_exhaustion = flat_cluster_exhaustion
 
-        if liquidation_context is None:
+        if liquidation_context is None and not is_large_trade_event:
             flat_liquidation_context: dict[str, Any] = {}
             for key in (
                     "liquidation_side",
@@ -7509,6 +7665,7 @@ class SignalNormalizer(BaseStrategyComponent):
                 "features_count": len(features),
                 "extra_domain_sources": sorted(source.value for source in extra_domain_data),
                 "timeframe": timeframe.value,
+                "payload_contract_level": domain_data.get("payload_contract_level", "snapshot"),
             },
         )
 
@@ -8116,7 +8273,10 @@ class SignalNormalizer(BaseStrategyComponent):
                     or container_map.get("meta")
             )
 
-        if pressure is None:
+        topic = self._topic_from_payload(payload)
+        is_large_trade_event = "large_trade" in topic
+
+        if pressure is None and not is_large_trade_event:
             flat_pressure = {
                 key: value_for(key, default=None)
                 for key in (
@@ -8192,7 +8352,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_large_trade:
                 large_trade = flat_large_trade
 
-        if cluster is None:
+        if cluster is None and not is_large_trade_event:
             flat_cluster = {
                 key: value_for(key, default=None)
                 for key in (
@@ -8219,7 +8379,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster:
                 cluster = flat_cluster
 
-        if cluster_update is None:
+        if cluster_update is None and not is_large_trade_event:
             flat_cluster_update = {
                 key: value_for(key, default=None)
                 for key in (
@@ -8246,7 +8406,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster_update:
                 cluster_update = flat_cluster_update
 
-        if cluster_exhaustion is None:
+        if cluster_exhaustion is None and not is_large_trade_event:
             flat_cluster_exhaustion = {
                 key: value_for(key, default=None)
                 for key in (
@@ -8272,7 +8432,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster_exhaustion:
                 cluster_exhaustion = flat_cluster_exhaustion
 
-        if liquidation_context is None:
+        if liquidation_context is None and not is_large_trade_event:
             flat_liquidation_context = {
                 key: value_for(key, default=None)
                 for key in (
@@ -12769,7 +12929,15 @@ class SignalRouter(BaseStrategyComponent):
         skipped: dict[str, str] = {}
 
         routing_diagnostics: dict[str, Any] | None = None
-        if hasattr(self.registry, "select"):
+        if hasattr(self.registry, "select_for_event"):
+            candidates = self.registry.select_for_event(
+                context=context,
+                event_name=event_name,
+                categories=categories or None,
+                changed_features=changed_features or None,
+                source=source,
+            )
+        elif hasattr(self.registry, "select"):
             candidates = self.registry.select(
                 context=context,
                 categories=categories or None,
@@ -12786,6 +12954,7 @@ class SignalRouter(BaseStrategyComponent):
                     categories=categories or None,
                     changed_features=changed_features or None,
                     source=source,
+                    event_name=event_name,
                 )
             except Exception as exc:
                 routing_diagnostics = {"error": str(exc)}

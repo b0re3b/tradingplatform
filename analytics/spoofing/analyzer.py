@@ -342,6 +342,43 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             scope="exchange:market_type:symbol:timeframe",
         )
 
+    async def start(self) -> None:
+        """
+        Async lifecycle hook used by app/main.py.
+
+        Older spoofing runtime only implemented register(), so the component was
+        hard to observe in the new state-driven app bootstrap: it could be
+        registered as a MarketScheduler evaluator, but no analytics.spoofing.*
+        startup event was emitted.  Keep register() synchronous for backward
+        compatibility, and use start() only for explicit runtime diagnostics.
+        """
+        if not self._registered:
+            self.register()
+
+        if getattr(self, "_started", False):
+            return
+
+        self._started = True
+        self._running = True
+
+        await self.emit_event(
+            "analytics.spoofing.analyzer.started",
+            {
+                "service": "spoofing_analyzer",
+                "component": self.component.value,
+                "registered": self._registered,
+                "running": self._running,
+                "input_mode": "market_state",
+                "input_topics": list(self.config.production_source_topics),
+                "orderbook_cache_attached": self.orderbook_cache is not None,
+                "market_state_store_attached": self.market_state_store is not None,
+                "publish_updates": self.config.analyzer.publish_updates,
+                "publish_detected_only": self.config.analyzer.publish_detected_only,
+                "scope": "exchange:market_type:symbol:timeframe",
+            },
+            priority=EventPriority.LOW,
+        )
+
     def stop(self) -> None:
         """
         Зупиняє analyzer lifecycle:
@@ -421,6 +458,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         self._cleanup_job_id = None
         self._registered = False
         self._running = False
+        self._started = False
 
         self.log_info("SpoofingAnalyzer stopped")
 
@@ -793,6 +831,221 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 **self._safe_metadata(metadata),
             },
         )
+
+
+    async def process_market_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        correlation_id: str | None = None,
+    ) -> AnalyzerOutput:
+        """
+        State-driven entrypoint for MarketScheduler.
+
+        New production flow:
+            WS/REST -> MarketIngestion -> MarketStateStore
+            -> MarketScheduler -> SpoofingAnalyzer.process_market_snapshot()
+
+        The legacy/event path still works, but spoofing must not depend on
+        market.orderbook.updated EventBus events anymore.  This adapter unwraps
+        MarketSnapshot.orderbook into the same normalized orderbook contract used
+        by process_orderbook().
+        """
+        payload = self._orderbook_payload_from_market_snapshot(snapshot)
+        if payload is None:
+            scope = getattr(snapshot, "scope", None)
+            key = self.make_key(
+                exchange=getattr(scope, "exchange", "binance"),
+                market_type=getattr(scope, "market_type", DEFAULT_MARKET_TYPE),
+                symbol=getattr(scope, "symbol", "UNKNOWN"),
+                timeframe=getattr(scope, "timeframe", DEFAULT_TIMEFRAME),
+            )
+            reason = "market_snapshot_without_orderbook"
+            await self.emit_event(
+                "analytics.spoofing.snapshot_skipped",
+                {
+                    "service": "spoofing_analyzer",
+                    "reason": reason,
+                    "scope": spoofing_key_to_dict(key),
+                    "dirty_reasons": list(getattr(snapshot, "dirty_reasons", ()) or ()),
+                    "has_orderbook": getattr(snapshot, "orderbook", None) is not None,
+                    "entrypoint": "process_market_snapshot",
+                },
+                priority=EventPriority.LOW,
+            )
+            return self._empty_output(
+                key=key,
+                reason=reason,
+                metadata={"source": "market_scheduler", "entrypoint": "process_market_snapshot"},
+            )
+
+        if len(payload.get("bids") or ()) < max(1, int(getattr(self.config.wall_detection, "min_levels_to_scan", 10))) or len(payload.get("asks") or ()) < max(1, int(getattr(self.config.wall_detection, "min_levels_to_scan", 10))):
+            key = self.make_key(
+                exchange=str(payload.get("exchange") or "binance"),
+                market_type=str(payload.get("market_type") or DEFAULT_MARKET_TYPE),
+                symbol=str(payload.get("symbol") or "UNKNOWN"),
+                timeframe=str(payload.get("timeframe") or DEFAULT_TIMEFRAME),
+            )
+            await self.emit_event(
+                "analytics.spoofing.snapshot_skipped",
+                {
+                    "service": "spoofing_analyzer",
+                    "reason": "insufficient_orderbook_depth",
+                    "scope": spoofing_key_to_dict(key),
+                    "bids": len(payload.get("bids") or ()),
+                    "asks": len(payload.get("asks") or ()),
+                    "min_levels_to_scan": int(getattr(self.config.wall_detection, "min_levels_to_scan", 10)),
+                    "dirty_reasons": payload.get("dirty_reasons") or [],
+                    "entrypoint": "process_market_snapshot",
+                },
+                priority=EventPriority.LOW,
+            )
+            return self._empty_output(
+                key=key,
+                reason="insufficient_orderbook_depth",
+                metadata={
+                    "source": "market_scheduler",
+                    "entrypoint": "process_market_snapshot",
+                    "bids": len(payload.get("bids") or ()),
+                    "asks": len(payload.get("asks") or ()),
+                },
+            )
+
+        return await self.process_orderbook(
+            symbol=str(payload["symbol"]),
+            exchange=str(payload["exchange"]),
+            market_type=str(payload.get("market_type") or DEFAULT_MARKET_TYPE),
+            timeframe=str(payload.get("timeframe") or DEFAULT_TIMEFRAME),
+            exchange_symbol=payload.get("exchange_symbol"),
+            bids=payload.get("bids") or (),
+            asks=payload.get("asks") or (),
+            best_bid=payload.get("best_bid"),
+            best_ask=payload.get("best_ask"),
+            sequence_id=payload.get("sequence") or payload.get("sequence_id") or payload.get("last_update_id"),
+            timestamp=payload.get("updated_at_ms") or payload.get("timestamp_ms") or payload.get("last_update_ms"),
+            current_mid_price=payload.get("mid_price") or payload.get("current_price") or payload.get("reference_price"),
+            metadata={
+                "source": "market_scheduler",
+                "source_topic": "market.state.snapshot",
+                "entrypoint": "process_market_snapshot",
+                "dirty_reasons": payload.get("dirty_reasons") or [],
+            },
+            correlation_id=correlation_id,
+        )
+
+    @staticmethod
+    def _level_to_payload(level: Any) -> dict[str, Any] | list[Any] | tuple[Any, ...] | None:
+        if level is None:
+            return None
+        if isinstance(level, dict):
+            return dict(level)
+        to_dict = getattr(level, "to_dict", None)
+        if callable(to_dict):
+            value = to_dict()
+            if isinstance(value, dict):
+                return value
+        price = getattr(level, "price", None)
+        quantity = getattr(level, "quantity", getattr(level, "qty", getattr(level, "size", None)))
+        if price is not None and quantity is not None:
+            return {"price": price, "quantity": quantity, "size": quantity}
+        return None
+
+    def _orderbook_payload_from_market_snapshot(self, snapshot: Any) -> dict[str, Any] | None:
+        if snapshot is None:
+            return None
+
+        if isinstance(snapshot, Mapping):
+            raw = dict(snapshot)
+            scope = raw.get("scope") if isinstance(raw.get("scope"), Mapping) else {}
+            orderbook = raw.get("orderbook") or raw.get("book") or raw.get("depth")
+        else:
+            scope_obj = getattr(snapshot, "scope", None)
+            scope = scope_obj.to_dict() if hasattr(scope_obj, "to_dict") else {
+                "exchange": getattr(scope_obj, "exchange", None),
+                "market_type": getattr(scope_obj, "market_type", None),
+                "symbol": getattr(scope_obj, "symbol", None),
+                "timeframe": getattr(scope_obj, "timeframe", None),
+                "exchange_symbol": getattr(scope_obj, "exchange_symbol", None),
+            }
+            raw = snapshot.to_dict() if hasattr(snapshot, "to_dict") else {}
+            orderbook = getattr(snapshot, "orderbook", None)
+
+        if orderbook is None:
+            return None
+
+        if isinstance(orderbook, Mapping):
+            book = dict(orderbook)
+        elif hasattr(orderbook, "to_dict"):
+            book = orderbook.to_dict()
+        else:
+            book = {
+                "bids": getattr(orderbook, "bids", ()),
+                "asks": getattr(orderbook, "asks", ()),
+                "best_bid": getattr(orderbook, "best_bid", None),
+                "best_ask": getattr(orderbook, "best_ask", None),
+                "mid_price": getattr(orderbook, "mid_price", None),
+                "spread": getattr(orderbook, "spread", None),
+                "sequence": getattr(orderbook, "sequence", None),
+                "last_update_ms": getattr(orderbook, "last_update_ms", None),
+            }
+
+        raw_bids = (
+            book.get("bids")
+            or book.get("bid_levels")
+            or book.get("buy")
+            or book.get("bid_depth")
+            or ()
+        )
+        raw_asks = (
+            book.get("asks")
+            or book.get("ask_levels")
+            or book.get("sell")
+            or book.get("ask_depth")
+            or ()
+        )
+        bids = [item for item in (self._level_to_payload(level) for level in raw_bids) if item is not None]
+        asks = [item for item in (self._level_to_payload(level) for level in raw_asks) if item is not None]
+
+        # Top-of-book fallback is safe only when size/quantity exists.  Spoofing
+        # detectors need real depth, so never invent synthetic quantity.
+        if not bids:
+            bid_price = book.get("best_bid") or book.get("best_bid_price") or book.get("bid") or book.get("bid_price")
+            bid_qty = book.get("best_bid_quantity") or book.get("best_bid_qty") or book.get("bid_quantity") or book.get("bid_qty") or book.get("bid_size")
+            if bid_price is not None and bid_qty is not None:
+                level = self._level_to_payload({"price": bid_price, "quantity": bid_qty, "size": bid_qty})
+                if level is not None:
+                    bids = [level]
+        if not asks:
+            ask_price = book.get("best_ask") or book.get("best_ask_price") or book.get("ask") or book.get("ask_price")
+            ask_qty = book.get("best_ask_quantity") or book.get("best_ask_qty") or book.get("ask_quantity") or book.get("ask_qty") or book.get("ask_size")
+            if ask_price is not None and ask_qty is not None:
+                level = self._level_to_payload({"price": ask_price, "quantity": ask_qty, "size": ask_qty})
+                if level is not None:
+                    asks = [level]
+
+        if not bids or not asks:
+            return None
+
+        payload = {
+            **scope,
+            "exchange": scope.get("exchange") or raw.get("exchange") or self.config.default_exchange,
+            "market_type": scope.get("market_type") or raw.get("market_type") or DEFAULT_MARKET_TYPE,
+            "symbol": scope.get("symbol") or raw.get("symbol"),
+            "timeframe": scope.get("timeframe") or raw.get("timeframe") or DEFAULT_TIMEFRAME,
+            "exchange_symbol": scope.get("exchange_symbol") or raw.get("exchange_symbol") or scope.get("symbol") or raw.get("symbol"),
+            "best_bid": book.get("best_bid"),
+            "best_ask": book.get("best_ask"),
+            "mid_price": book.get("mid_price") or raw.get("current_price") or raw.get("reference_price"),
+            "spread": book.get("spread"),
+            "sequence": book.get("sequence") or book.get("last_update_id"),
+            "last_update_ms": book.get("last_update_ms") or raw.get("updated_at_ms"),
+            "updated_at_ms": raw.get("updated_at_ms") or book.get("last_update_ms"),
+            "timestamp_ms": raw.get("updated_at_ms") or book.get("last_update_ms"),
+            "bids": bids,
+            "asks": asks,
+            "dirty_reasons": raw.get("dirty_reasons") or [],
+        }
+        return payload if payload.get("symbol") and payload.get("exchange") else None
 
     async def process_orderbook(
         self,
