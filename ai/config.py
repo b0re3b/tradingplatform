@@ -29,6 +29,7 @@ class NewsSourceConfig:
     request_timeout_seconds: float = 10.0
     max_items_per_fetch: int = 50
     min_fetch_interval_seconds: float = 30.0
+    disable_after_failure: bool = True
 
     default_language: NewsLanguage = NewsLanguage.UNKNOWN
     default_categories: tuple[NewsCategory, ...] = (NewsCategory.UNKNOWN,)
@@ -66,6 +67,9 @@ class NewsSourceConfig:
         if self.min_fetch_interval_seconds < 0:
             raise ValueError("NewsSourceConfig.min_fetch_interval_seconds must be >= 0")
 
+        if not isinstance(self.disable_after_failure, bool):
+            raise ValueError("NewsSourceConfig.disable_after_failure must be a bool")
+
         if not 0.0 <= self.source_reputation_score <= 1.0:
             raise ValueError(
                 "NewsSourceConfig.source_reputation_score must be between 0.0 and 1.0"
@@ -93,6 +97,7 @@ class NewsSourceConfig:
             "request_timeout_seconds": self.request_timeout_seconds,
             "max_items_per_fetch": self.max_items_per_fetch,
             "min_fetch_interval_seconds": self.min_fetch_interval_seconds,
+            "disable_after_failure": self.disable_after_failure,
             "default_language": str(self.default_language),
             "default_categories": [str(category) for category in self.default_categories],
             "source_reputation_score": self.source_reputation_score,

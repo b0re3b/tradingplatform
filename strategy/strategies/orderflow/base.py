@@ -1108,12 +1108,13 @@ class OrderflowTradingStrategy(TradingStrategy):
         )
 
     def _build_composite_snapshot_from_domain(
-        self,
-        *,
-        context: StrategyContext,
-        scope: OrderflowStrategyScope,
+            self,
+            *,
+            context: StrategyContext,
+            scope: OrderflowStrategyScope,
     ) -> OrderflowCompositeSnapshot | None:
-        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
+        _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(
+            __name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering OrderflowTradingStrategy._build_composite_snapshot_from_domain")
         domain = self.orderflow_domain(context)
@@ -1126,10 +1127,39 @@ class OrderflowTradingStrategy(TradingStrategy):
         if not any((cvd, volume_delta, aggressive, imbalance, domain)):
             return None
 
+        # volume_delta може прийти як float (cvd.updated) або як dict {delta_ratio: float}
+        # (cvd.signal). Нормалізуємо до dict з усіма потрібними ключами щоб
+        # _canonical_orderflow_mapping і extract_* хелпери читали правильно.
+        volume_delta_dict = as_dict(volume_delta)
+        if not volume_delta_dict:
+            # volume_delta прийшов як скаляр float — конвертуємо
+            vd_float = to_float(volume_delta, None)
+            if vd_float is not None:
+                volume_delta_dict = {"volume_delta": vd_float}
+
+        # Якщо volume_delta dict не має scalar "volume_delta" але має "delta_ratio",
+        # додаємо "volume_delta" через кумулятивне значення з domain якщо доступне.
+        if volume_delta_dict and "volume_delta" not in volume_delta_dict:
+            # Спробуємо витягти з домену напряму (stats.volume_delta)
+            domain_vd = to_float(
+                get_path(as_dict(domain), "volume_delta", None)
+                or get_path(as_dict(domain), "stats.volume_delta", None),
+                None,
+            )
+            if domain_vd is not None and not isinstance(domain_vd, dict):
+                volume_delta_dict["volume_delta"] = domain_vd
+
+        # Аналогічно для cvd — може прийти як {delta_ratio: float} без скалярів
+        cvd_dict = as_dict(cvd)
+        if not cvd_dict:
+            cvd_float = to_float(cvd, None)
+            if cvd_float is not None:
+                cvd_dict = {"delta_ratio": cvd_float}
+
         merged = {
             **as_dict(domain),
-            "cvd": as_dict(cvd),
-            "volume_delta": as_dict(volume_delta),
+            "cvd": cvd_dict,
+            "volume_delta": volume_delta_dict,
             "aggressive_trades": as_dict(aggressive),
             "orderbook_imbalance": as_dict(imbalance),
         }
@@ -1290,18 +1320,7 @@ class OrderflowTradingStrategy(TradingStrategy):
             target[key] = value
 
     def _canonical_orderflow_mapping(self, data: Mapping[str, Any]) -> dict[str, Any]:
-        """
-        Convert normalized analytics.orderflow domain data into the stable
-        strategy-side composite shape expected by OrderflowCompositeSnapshot.
 
-        The analytics normalizer intentionally keeps several representations for
-        compatibility: event-local ``stats``/``context``, nested ``cvd`` /
-        ``volume_delta`` / ``aggressive_trades`` sections, and literal dotted
-        keys such as ``orderflow.cvd.delta_ratio``.  Old strategy code could
-        pick the wrong/stale section and then return ``*_payload_not_resolved``
-        even though all required features were present.  This adapter makes the
-        current event metrics authoritative and still preserves fallbacks.
-        """
         raw = dict(data or {})
 
         context_payload = as_dict(raw.get("context"))
@@ -1425,10 +1444,15 @@ class OrderflowTradingStrategy(TradingStrategy):
             self._put_if_present(aggressive, "net_notional_delta", first_present(aggressive, ("net_notional_delta",), default=stats.get("notional_delta")))
             self._put_if_present(aggressive, "trades_count", stats.get("trades_count"))
 
-        # Preserve literal feature-style keys as fallbacks for diagnostics and
-        # for helpers that read exact dotted paths.
+   
         raw["cvd"] = cvd
+        _raw_vd_scalar = raw.get("volume_delta")
         raw["volume_delta"] = volume_delta
+        if _raw_vd_scalar is not None and not isinstance(_raw_vd_scalar, dict):
+            raw["_volume_delta_scalar"] = _raw_vd_scalar
+
+            if "volume_delta" not in volume_delta or isinstance(volume_delta.get("volume_delta"), dict):
+                volume_delta["volume_delta"] = _raw_vd_scalar
         raw["aggressive_trades"] = aggressive
         raw["orderbook_imbalance"] = imbalance
         raw["orderflow.cvd"] = cvd

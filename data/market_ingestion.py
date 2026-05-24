@@ -184,7 +184,7 @@ class MarketIngestionService:
             update.is_closed
             and self.config.emit_low_frequency_events
             and self.config.emit_candle_closed_event
-            and not suppress_persistable
+            and not self._is_restore_source(payload, source)
         ):
             await self._emit_candle_closed(update)
         return True
@@ -230,7 +230,7 @@ class MarketIngestionService:
             self.config.emit_low_frequency_events
             and self.config.emit_candle_closed_event
             and not self.config.suppress_batch_candle_events
-            and not suppress_persistable
+            and not self._is_restore_source(payload, source)
         ):
             for update in updates:
                 if update.is_closed:
@@ -413,6 +413,27 @@ class MarketIngestionService:
 
     def stats(self) -> dict[str, int]:
         return dict(self._metrics)
+
+
+    def _is_restore_source(self, payload: Any, source: str | None) -> bool:
+        if not self.config.suppress_persistable_for_restore_sources:
+            return False
+        candidates: list[str] = []
+        if source:
+            candidates.append(str(source))
+        if isinstance(payload, Mapping):
+            for key in ("source", "batch_source", "replay_source", "restore_source"):
+                value = payload.get(key)
+                if value:
+                    candidates.append(str(value))
+            metadata = payload.get("metadata")
+            if isinstance(metadata, Mapping):
+                for key in ("source", "replay_source", "restore_source"):
+                    value = metadata.get(key)
+                    if value:
+                        candidates.append(str(value))
+        restore_sources = {str(item).lower() for item in self.config.restore_sources}
+        return any(candidate.lower() in restore_sources for candidate in candidates)
 
     def _should_suppress_persistable(
         self,

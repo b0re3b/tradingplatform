@@ -96,7 +96,19 @@ class NewsCollector:
 
     @property
     def enabled_sources(self) -> tuple[BaseNewsSource, ...]:
-        return tuple(source for source in self._sources if source.enabled)
+        return tuple(
+            source
+            for source in self._sources
+            if bool(getattr(source, "available", source.enabled))
+        )
+
+    @property
+    def disabled_source_names(self) -> tuple[str, ...]:
+        return tuple(
+            source.name
+            for source in self._sources
+            if bool(getattr(source, "runtime_disabled", False))
+        )
 
     @property
     def source_count(self) -> int:
@@ -161,9 +173,27 @@ class NewsCollector:
                 for source in enabled_sources
             ]
 
-            results = await asyncio.gather(*tasks, return_exceptions=False)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for source_items, source_error in results:
+        for source, result in zip(enabled_sources, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+
+            if isinstance(result, BaseException):
+                error = f"News source '{source.name}' failed: {result!r}"
+                errors.append(error)
+                self.logger.warning(
+                    "News source task failed during collection",
+                    extra={
+                        "source_name": source.name,
+                        "source_type": str(source.source_type),
+                        "error_type": result.__class__.__name__,
+                        "error": repr(result),
+                    },
+                )
+                continue
+
+            source_items, source_error = result
             if source_error:
                 errors.append(source_error)
                 continue
@@ -250,6 +280,16 @@ class NewsCollector:
             return self._empty_result(
                 started_at=started_at,
                 errors=(f"News source '{source_name}' is disabled",),
+            )
+
+        if bool(getattr(source, "runtime_disabled", False)):
+            reason = getattr(source, "disabled_after_failure_reason", None)
+            return self._empty_result(
+                started_at=started_at,
+                errors=(
+                    f"News source '{source_name}' is disabled after previous failure"
+                    + (f": {reason}" if reason else ""),
+                ),
             )
 
         async with aiohttp.ClientSession(
@@ -371,6 +411,7 @@ class NewsCollector:
                 else None
             ),
             "last_error": self._last_error,
+            "disabled_source_names": list(self.disabled_source_names),
             "sources": [source_health.to_dict() for source_health in health],
         }
 
@@ -386,9 +427,20 @@ class NewsCollector:
         """
 
         async with semaphore:
+            if bool(getattr(source, "runtime_disabled", False)):
+                reason = getattr(source, "disabled_after_failure_reason", None)
+                message = (
+                    f"News source '{source.name}' skipped because it is disabled after previous failure"
+                    + (f": {reason}" if reason else "")
+                )
+                return [], message
+
             try:
                 items = await source.fetch(session=session)
                 return items, None
+
+            except asyncio.CancelledError:
+                raise
 
             except NewsAIError as exc:
                 error_message = str(exc)

@@ -820,6 +820,17 @@ class SignalNormalizer(BaseStrategyComponent):
             payload: dict[str, Any],
             domain_data: dict[str, Any],
     ) -> None:
+        """
+        Final ORDERFLOW contract adapter used by StrategyContext.
+
+        analytics.orderflow analyzers publish metric-specific values mostly under
+        payload["stats"].  This method lifts those flat stats into the canonical
+        sections that concrete orderflow strategies read via
+        FeatureSource.ORDERFLOW:
+
+            composite, cvd, volume_delta, aggressive_trades,
+            orderbook_imbalance, signal
+        """
         get = lambda *paths, default=None: self._contract_first_value(
             *paths,
             payload=payload,
@@ -827,42 +838,118 @@ class SignalNormalizer(BaseStrategyComponent):
             default=default,
         )
 
-        cvd = self._contract_first_mapping("cvd", "cumulative_volume_delta", payload=payload, domain_data=domain_data) or {}
-        volume_delta = self._contract_first_mapping("volume_delta", "delta", payload=payload, domain_data=domain_data) or {}
-        aggressive = self._contract_first_mapping(
+        def mapping(*paths: str) -> dict[str, Any]:
+            return self._contract_first_mapping(*paths, payload=payload, domain_data=domain_data) or {}
+
+        def put(target: dict[str, Any], key: str, value: Any) -> None:
+            if value is not None:
+                target.setdefault(key, value)
+
+        cvd = mapping(
+            "cvd",
+            "cvd_snapshot",
+            "cvd_metrics",
+            "cumulative_delta",
+            "cumulative_volume_delta",
+            "stats.cvd",
+            "context.cvd",
+            "context.stats.cvd",
+            "orderflow.cvd",
+        )
+        volume_delta = mapping(
+            "volume_delta",
+            "volume_delta_snapshot",
+            "delta",
+            "delta_metrics",
+            "stats.volume_delta_section",
+            "context.volume_delta",
+            "context.stats.volume_delta_section",
+            "orderflow.volume_delta",
+        )
+        aggressive = mapping(
             "aggressive_trades",
-            "aggression",
             "aggressive",
-            payload=payload,
-            domain_data=domain_data,
-        ) or {}
-        orderbook = self._contract_first_mapping(
+            "aggression",
+            "aggressive_flow",
+            "stats.aggressive_trades",
+            "context.aggressive_trades",
+            "context.stats.aggressive_trades",
+            "orderflow.aggressive_trades",
+        )
+        orderbook = mapping(
             "orderbook_imbalance",
+            "orderbook",
             "book_imbalance",
             "imbalance",
-            payload=payload,
-            domain_data=domain_data,
-        ) or {}
+            "stats.orderbook_imbalance",
+            "context.orderbook_imbalance",
+            "context.stats.orderbook_imbalance",
+            "orderflow.orderbook_imbalance",
+        )
+        composite = mapping("composite", "snapshot", "orderflow_snapshot", "composite_snapshot", "orderflow.composite")
 
-        cvd_value = get("orderflow.cvd.value", "cvd.value", "cvd", "cumulative_volume_delta", "stats.cvd", "context.cvd")
-        delta_value = get("orderflow.volume_delta.volume_delta", "volume_delta.volume_delta", "volume_delta", "delta", "stats.volume_delta", "context.volume_delta")
+        cvd_value = get(
+            "orderflow.cvd.value",
+            "cvd.value",
+            "cvd.cvd_value",
+            "cvd_value",
+            "stats.cvd_value",
+            "context.stats.cvd_value",
+            "cvd_close",
+            "stats.cvd_close",
+            "cumulative_volume_delta",
+        )
+        delta_value = get(
+            "orderflow.volume_delta.volume_delta",
+            "volume_delta.volume_delta",
+            "volume_delta",
+            "delta",
+            "stats.volume_delta",
+            "context.stats.volume_delta",
+        )
         delta_ratio = get(
             "orderflow.cvd.delta_ratio",
             "orderflow.volume_delta.delta_ratio",
             "cvd.delta_ratio",
             "volume_delta.delta_ratio",
             "delta_ratio",
+            "volume_delta_ratio",
+            "cvd_delta_ratio",
             "stats.delta_ratio",
-            "context.delta_ratio",
+            "context.stats.delta_ratio",
         )
-        buy_volume = _to_float(get("buy_volume", "stats.buy_volume", "context.buy_volume"), None)
-        sell_volume = _to_float(get("sell_volume", "stats.sell_volume", "context.sell_volume"), None)
-        total_volume = _to_float(get("total_volume", "volume", "stats.total_volume", "context.total_volume"), None)
+
+        buy_volume = _to_float(get("buy_volume", "stats.buy_volume", "context.stats.buy_volume", "aggressive_buy_volume", "stats.aggressive_buy_volume"), None)
+        sell_volume = _to_float(get("sell_volume", "stats.sell_volume", "context.stats.sell_volume", "aggressive_sell_volume", "stats.aggressive_sell_volume"), None)
+        buy_notional = _to_float(get("buy_notional", "stats.buy_notional", "context.stats.buy_notional", "aggressive_buy_notional", "stats.aggressive_buy_notional"), None)
+        sell_notional = _to_float(get("sell_notional", "stats.sell_notional", "context.stats.sell_notional", "aggressive_sell_notional", "stats.aggressive_sell_notional"), None)
+        total_volume = _to_float(get("total_volume", "volume", "stats.total_volume", "context.stats.total_volume"), None)
         if total_volume is None and buy_volume is not None and sell_volume is not None:
             total_volume = buy_volume + sell_volume
+        total_notional = _to_float(get("total_notional", "notional", "quote_volume", "stats.total_notional", "context.stats.total_notional"), None)
+        if total_notional is None and buy_notional is not None and sell_notional is not None:
+            total_notional = buy_notional + sell_notional
 
-        buy_ratio = _to_float(get("orderflow.aggressive_trades.buy_ratio", "buy_ratio", "stats.buy_ratio", "context.buy_ratio", "aggressive_trades.buy_ratio"), None)
-        sell_ratio = _to_float(get("orderflow.aggressive_trades.sell_ratio", "sell_ratio", "stats.sell_ratio", "context.sell_ratio", "aggressive_trades.sell_ratio"), None)
+        buy_ratio = _to_float(get(
+            "orderflow.aggressive_trades.buy_ratio",
+            "aggressive_trades.buy_ratio",
+            "buy_ratio",
+            "cvd_buy_ratio",
+            "aggressive_buy_ratio",
+            "stats.buy_ratio",
+            "stats.aggressive_buy_ratio",
+            "context.stats.buy_ratio",
+        ), None)
+        sell_ratio = _to_float(get(
+            "orderflow.aggressive_trades.sell_ratio",
+            "aggressive_trades.sell_ratio",
+            "sell_ratio",
+            "cvd_sell_ratio",
+            "aggressive_sell_ratio",
+            "stats.sell_ratio",
+            "stats.aggressive_sell_ratio",
+            "context.stats.sell_ratio",
+        ), None)
         if total_volume and total_volume > 0:
             if buy_ratio is None and buy_volume is not None:
                 buy_ratio = buy_volume / total_volume
@@ -875,58 +962,92 @@ class SignalNormalizer(BaseStrategyComponent):
 
         for key, value in {
             "value": cvd_value,
+            "cvd_value": cvd_value,
+            "cvd_open": get("cvd.cvd_open", "cvd_open", "stats.cvd_open"),
+            "cvd_high": get("cvd.cvd_high", "cvd_high", "stats.cvd_high"),
+            "cvd_low": get("cvd.cvd_low", "cvd_low", "stats.cvd_low"),
+            "cvd_close": get("cvd.cvd_close", "cvd_close", "stats.cvd_close"),
+            "cvd_change": get("cvd.cvd_change", "cvd_change", "stats.cvd_change"),
+            "cvd_change_pct": get("orderflow.cvd.cvd_change_pct", "cvd.cvd_change_pct", "cvd_change_pct", "change_pct", "stats.cvd_change_pct"),
+            "cvd_slope": get("orderflow.cvd.cvd_slope", "cvd.cvd_slope", "cvd_slope", "slope", "stats.cvd_slope"),
             "delta_ratio": delta_ratio,
-            "cvd_change_pct": get("orderflow.cvd.cvd_change_pct", "cvd.cvd_change_pct", "cvd_change_pct", "change_pct"),
-            "cvd_slope": get("orderflow.cvd.cvd_slope", "cvd.cvd_slope", "cvd_slope", "slope"),
-            "price_change_pct": get("orderflow.cvd.price_change_pct", "cvd.price_change_pct", "price_change_pct", "price_delta_pct"),
+            "price_change_pct": get("orderflow.cvd.price_change_pct", "cvd.price_change_pct", "price_change_pct", "price_delta_pct", "stats.price_change_pct"),
             "buy_ratio": buy_ratio,
             "sell_ratio": sell_ratio,
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
+            "trades_count": get("trades_count", "trades", "trade_count", "stats.trades_count"),
+            "total_volume": total_volume,
+            "total_notional": total_notional,
+            "last_price": get("last_price", "price", "close", "mark_price", "stats.last_price"),
+            "window_seconds": get("window_seconds", "stats.window_seconds"),
         }.items():
-            if value is not None:
-                cvd[key] = value
+            put(cvd, key, value)
 
         for key, value in {
             "volume_delta": delta_value,
             "delta_ratio": delta_ratio,
-            "cumulative_volume_delta": get("volume_delta.cumulative_volume_delta", "cumulative_volume_delta", "cvd"),
-            "notional_delta": get("volume_delta.notional_delta", "notional_delta"),
-            "cumulative_notional_delta": get("volume_delta.cumulative_notional_delta", "cumulative_notional_delta"),
+            "cumulative_volume_delta": get("volume_delta.cumulative_volume_delta", "cumulative_volume_delta", "stats.cumulative_volume_delta", "cvd_value", "stats.cvd_value"),
+            "notional_delta": get("volume_delta.notional_delta", "notional_delta", "stats.notional_delta"),
+            "cumulative_notional_delta": get("volume_delta.cumulative_notional_delta", "cumulative_notional_delta", "stats.cumulative_notional_delta"),
+            "buy_volume": buy_volume,
+            "sell_volume": sell_volume,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
+            "buy_ratio": buy_ratio,
+            "sell_ratio": sell_ratio,
+            "trades_count": get("trades_count", "trades", "trade_count", "stats.trades_count"),
+            "total_volume": total_volume,
+            "total_notional": total_notional,
         }.items():
-            if value is not None:
-                volume_delta[key] = value
+            put(volume_delta, key, value)
 
-        net_volume_delta = get("orderflow.aggressive_trades.net_volume_delta", "aggressive_trades.net_volume_delta", "net_volume_delta", "volume_delta", "delta")
         for key, value in {
             "buy_ratio": buy_ratio,
             "sell_ratio": sell_ratio,
-            "net_volume_delta": net_volume_delta,
-            "net_notional_delta": get("orderflow.aggressive_trades.net_notional_delta", "aggressive_trades.net_notional_delta", "net_notional_delta", "notional_delta"),
-            "burst_score": get("aggressive_trades.burst_score", "burst_score", "aggression_score"),
-            "large_buy_trades": get("aggressive_trades.large_buy_trades", "large_buy_trades"),
-            "large_sell_trades": get("aggressive_trades.large_sell_trades", "large_sell_trades"),
+            "net_volume_delta": get("orderflow.aggressive_trades.net_volume_delta", "aggressive_trades.net_volume_delta", "net_volume_delta", "stats.net_volume_delta", "volume_delta", "stats.volume_delta", "delta"),
+            "net_notional_delta": get("orderflow.aggressive_trades.net_notional_delta", "aggressive_trades.net_notional_delta", "net_notional_delta", "stats.net_notional_delta", "notional_delta", "stats.notional_delta"),
+            "burst_score": get("aggressive_trades.burst_score", "burst_score", "aggressive_burst_score", "aggression_score", "stats.burst_score"),
+            "large_buy_trades": get("aggressive_trades.large_buy_trades", "large_buy_trades", "stats.large_buy_trades"),
+            "large_sell_trades": get("aggressive_trades.large_sell_trades", "large_sell_trades", "stats.large_sell_trades"),
+            "aggressive_buy_count": get("aggressive_buy_count", "stats.aggressive_buy_count"),
+            "aggressive_sell_count": get("aggressive_sell_count", "stats.aggressive_sell_count"),
             "buy_volume": buy_volume,
             "sell_volume": sell_volume,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
+            "trades_count": get("trades_count", "trades", "trade_count", "stats.trades_count"),
         }.items():
-            if value is not None:
-                aggressive[key] = value
+            put(aggressive, key, value)
 
         for key, value in {
-            "ratio": get("orderbook_imbalance.ratio", "imbalance_ratio", "orderbook_imbalance_ratio"),
-            "diff": get("orderbook_imbalance.diff", "imbalance_diff", "orderbook_imbalance_diff"),
+            "ratio": get("orderbook_imbalance.ratio", "orderbook_imbalance.imbalance_ratio", "imbalance_ratio", "orderbook_imbalance_ratio", "stats.imbalance_ratio"),
+            "diff": get("orderbook_imbalance.diff", "orderbook_imbalance.imbalance_diff", "imbalance_diff", "orderbook_imbalance_diff", "stats.imbalance_diff"),
+            "imbalance_ratio": get("orderbook_imbalance.imbalance_ratio", "imbalance_ratio", "orderbook_imbalance_ratio", "stats.imbalance_ratio"),
+            "imbalance_diff": get("orderbook_imbalance.imbalance_diff", "imbalance_diff", "orderbook_imbalance_diff", "stats.imbalance_diff"),
+            "bid_volume": get("bid_volume", "stats.bid_volume"),
+            "ask_volume": get("ask_volume", "stats.ask_volume"),
+            "best_bid": get("best_bid", "stats.best_bid"),
+            "best_ask": get("best_ask", "stats.best_ask"),
+            "spread": get("spread", "stats.spread"),
+            "mid_price": get("mid_price", "stats.mid_price"),
+            "depth_levels_used": get("depth_levels_used", "stats.depth_levels_used"),
         }.items():
-            if value is not None:
-                orderbook.setdefault(key, value)
+            put(orderbook, key, value)
 
-        if cvd:
-            domain_data["cvd"] = cvd
-        if volume_delta:
-            domain_data["volume_delta"] = volume_delta
-        if aggressive:
-            domain_data["aggressive_trades"] = aggressive
-        if orderbook:
-            domain_data["orderbook_imbalance"] = orderbook
+        for key, section in (
+                ("cvd", cvd),
+                ("volume_delta", volume_delta),
+                ("aggressive_trades", aggressive),
+                ("orderbook_imbalance", orderbook),
+        ):
+            if section:
+                domain_data[key] = section
+                composite.setdefault(key, section)
 
-        # Stable nested aliases expected by concrete orderflow strategies.
+        # Stable aliases expected by strategy/strategies/orderflow/utils.py.
         if cvd:
             domain_data.setdefault("cvd_metrics", cvd)
             domain_data.setdefault("cvd_snapshot", cvd)
@@ -939,32 +1060,71 @@ class SignalNormalizer(BaseStrategyComponent):
             domain_data.setdefault("aggressive", aggressive)
             domain_data.setdefault("aggressive_flow", aggressive)
             domain_data.setdefault("aggressive_trades_snapshot", aggressive)
+        if orderbook:
+            domain_data.setdefault("orderbook", orderbook)
+            domain_data.setdefault("imbalance", orderbook)
+            domain_data.setdefault("orderbook_snapshot", orderbook)
 
-        signal = self._contract_first_mapping("signal", "setup", "orderflow_signal", "analytics_signal", payload=payload, domain_data=domain_data)
-        if signal:
+        signal = mapping("signal", "setup", "orderflow_signal", "analytics_signal")
+        side = self._contract_side(get("side", "direction", "bias", "signal.side", "setup.side"))
+        signal_type = get("signal_type", "setup_type", "type", "signal.type", "setup.type")
+        score = get("score", "signal_score", "signal.score", "setup.score", "strength")
+        confidence = get("confidence", "signal_confidence", "signal.confidence", "setup.confidence", "strength")
+        if signal or side is not None or signal_type is not None:
+            signal.setdefault("detected", True)
+            signal.setdefault("type", signal_type or "orderflow_signal")
+            if side is not None:
+                signal.setdefault("side", side)
+            if score is not None:
+                signal.setdefault("score", score)
+            if confidence is not None:
+                signal.setdefault("confidence", confidence)
+            signal.setdefault("origin", "orderflow")
             domain_data.setdefault("signal", signal)
             domain_data.setdefault("setup", signal)
             domain_data.setdefault("orderflow_signal", signal)
+            domain_data.setdefault("analytics_signal", signal)
 
         for key, value in {
+            "exchange": get("exchange", "stats.exchange", "scope.exchange"),
+            "market_type": get("market_type", "stats.market_type", "scope.market_type"),
+            "symbol": get("symbol", "stats.symbol", "scope.symbol"),
+            "exchange_symbol": get("exchange_symbol", "stats.exchange_symbol", "scope.exchange_symbol"),
+            "timeframe": get("timeframe", "stats.timeframe", "scope.timeframe"),
+            "timestamp": get("timestamp", "stats.timestamp", "event_time"),
+            "last_price": get("last_price", "price", "close", "mark_price", "mid_price", "stats.last_price", "stats.mid_price"),
+            "price": get("price", "last_price", "close", "mark_price", "mid_price", "stats.last_price", "stats.mid_price"),
+            "price_change": get("price_change", "stats.price_change"),
+            "price_change_pct": get("price_change_pct", "price_delta_pct", "stats.price_change_pct"),
+            "window_seconds": get("window_seconds", "stats.window_seconds"),
             "trades_count": get("trades_count", "trades", "trade_count", "stats.trades_count"),
             "total_volume": total_volume,
-            "total_notional": get("total_notional", "notional", "stats.total_notional"),
-            "last_price": get("last_price", "price", "close", "mark_price"),
-            "price_change_pct": get("price_change_pct", "price_delta_pct", "cvd.price_change_pct"),
+            "total_notional": total_notional,
             "buy_volume": buy_volume,
             "sell_volume": sell_volume,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
             "delta_ratio": delta_ratio,
-            "side": self._contract_side(get("side", "direction", "signal.side")),
-            "score": get("score", "signal.score", "strength"),
-            "confidence": get("confidence", "signal.confidence", "strength"),
+            "side": side,
+            "score": score,
+            "confidence": confidence,
+            "metric": get("metric", "stats.metric"),
+            "source_type": get("source_type", "stats.source_type"),
         }.items():
             if value is not None:
                 domain_data.setdefault(key, value)
+                composite.setdefault(key, value)
+
+        if composite:
+            domain_data["composite"] = composite
+            domain_data.setdefault("snapshot", composite)
+            domain_data.setdefault("orderflow_snapshot", composite)
+            domain_data.setdefault("composite_snapshot", composite)
 
         # Dotted aliases make context.domain_dict(ORDERFLOW) usable even when
-        # a strategy/helper requests full contract paths directly.
+        # helper code asks for full contract paths directly.
         for path, value in {
+            "orderflow.composite": composite or None,
             "orderflow.cvd": cvd or None,
             "orderflow.cvd.value": cvd.get("value"),
             "orderflow.cvd.delta_ratio": cvd.get("delta_ratio"),
@@ -974,15 +1134,29 @@ class SignalNormalizer(BaseStrategyComponent):
             "orderflow.volume_delta": volume_delta or None,
             "orderflow.volume_delta.volume_delta": volume_delta.get("volume_delta"),
             "orderflow.volume_delta.delta_ratio": volume_delta.get("delta_ratio"),
+            "orderflow.volume_delta.cumulative_volume_delta": volume_delta.get("cumulative_volume_delta"),
+            "orderflow.volume_delta.notional_delta": volume_delta.get("notional_delta"),
+            "orderflow.volume_delta.cumulative_notional_delta": volume_delta.get("cumulative_notional_delta"),
             "orderflow.aggressive_trades": aggressive or None,
             "orderflow.aggressive_trades.buy_ratio": aggressive.get("buy_ratio"),
             "orderflow.aggressive_trades.sell_ratio": aggressive.get("sell_ratio"),
+            "orderflow.aggressive_trades.burst_score": aggressive.get("burst_score"),
             "orderflow.aggressive_trades.net_volume_delta": aggressive.get("net_volume_delta"),
+            "orderflow.aggressive_trades.net_notional_delta": aggressive.get("net_notional_delta"),
+            "orderflow.aggressive_trades.large_buy_trades": aggressive.get("large_buy_trades"),
+            "orderflow.aggressive_trades.large_sell_trades": aggressive.get("large_sell_trades"),
+            "orderflow.orderbook_imbalance": orderbook or None,
+            "orderflow.orderbook_imbalance.ratio": orderbook.get("ratio") or orderbook.get("imbalance_ratio"),
+            "orderflow.orderbook_imbalance.diff": orderbook.get("diff") or orderbook.get("imbalance_diff"),
             "orderflow.trades_count": domain_data.get("trades_count"),
             "orderflow.total_volume": domain_data.get("total_volume"),
             "orderflow.total_notional": domain_data.get("total_notional"),
             "orderflow.last_price": domain_data.get("last_price"),
             "orderflow.price_change_pct": domain_data.get("price_change_pct"),
+            "orderflow.signal": signal or None,
+            "orderflow.signal.side": signal.get("side") if signal else None,
+            "orderflow.signal.score": signal.get("score") if signal else None,
+            "orderflow.signal.confidence": signal.get("confidence") if signal else None,
         }.items():
             if value is not None:
                 domain_data.setdefault(path, value)
@@ -999,6 +1173,135 @@ class SignalNormalizer(BaseStrategyComponent):
         def get(*paths: str, default: Any = None) -> Any:
             return self._contract_first_value(*paths, payload=payload, domain_data=domain_data, default=default)
 
+        def section_get(section: dict[str, Any] | None, *paths: str, default: Any = None) -> Any:
+            if not isinstance(section, dict):
+                return default
+            for path in paths:
+                if path in section and section[path] is not None:
+                    return section[path]
+                cur: Any = section
+                for part in path.split("."):
+                    if not isinstance(cur, dict) or part not in cur:
+                        cur = None
+                        break
+                    cur = cur.get(part)
+                if cur is not None:
+                    return cur
+            return default
+
+        def truthy(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "y", "on", "active", "detected", "confirmed"}
+            if isinstance(value, (int, float)):
+                return bool(value)
+            return False
+
+        def put_alias(target: str, value: dict[str, Any], *aliases: str) -> None:
+            domain_data[target] = value
+            for alias in aliases:
+                domain_data.setdefault(alias, value)
+
+        def normalize(name: str, raw: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not isinstance(raw, dict) or not raw:
+                return None
+            section = dict(raw)
+            for _runtime_key in ("feature_map", "features", "strategy_contract", "strategy_contract_version"):
+                section.pop(_runtime_key, None)
+
+            def fill(canonical: str, *paths: str, default: Any = None) -> None:
+                value = section_get(section, *paths, default=None)
+                if value is None:
+                    for path in paths:
+                        value = get(f"funding.{name}.{path}", f"{name}_{path}", path, default=None)
+                        if value is not None:
+                            break
+                if value is None:
+                    value = default
+                if value is not None:
+                    section.setdefault(canonical, value)
+
+            if name == "snapshot":
+                fill("funding_rate", "funding_rate", "current_rate", "rate")
+                fill("current_rate", "current_rate", "funding_rate", "rate")
+                fill("predicted_funding_rate", "predicted_funding_rate", "predicted_rate", "next_funding_rate")
+                fill("predicted_rate", "predicted_rate", "predicted_funding_rate", "next_funding_rate")
+                fill("mark_price", "mark_price", "current_price", "reference_price")
+                fill("event_time", "event_time", "timestamp", "updated_at", "received_at")
+            elif name == "statistics":
+                fill("current_rate", "current_rate", "funding_rate", "rate")
+                fill("mean_rate", "mean_rate", "mean")
+                fill("median_rate", "median_rate", "median")
+                fill("std_rate", "std_rate", "std", "stdev")
+                fill("zscore", "zscore", "z_score")
+                fill("sample_size", "sample_size", "samples", "count")
+            elif name == "regime":
+                fill("type", "type", "regime", "name", "state")
+                fill("regime", "regime", "type", "name")
+                fill("bias", "bias", "direction", "side")
+                fill("score", "score", "confidence")
+                fill("confidence", "confidence", "score")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+            elif name == "pressure":
+                fill("score", "score", "pressure_score", "strength", "normalized_score")
+                fill("pressure_score", "pressure_score", "score", "strength", "normalized_score")
+                fill("level", "level", "pressure_level", "type")
+                fill("direction", "direction", "pressure_direction", "bias", "side")
+                fill("bias", "bias", "direction", "pressure_direction")
+                fill("mean_reversion_probability", "mean_reversion_probability", "reversion_probability", "reversal_probability")
+                fill("squeeze_probability", "squeeze_probability", "squeeze_risk")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+            elif name == "extreme":
+                fill("type", "type", "extreme_type", "kind")
+                fill("extreme_type", "extreme_type", "type", "kind")
+                fill("score", "score", "severity", "strength", "normalized_score")
+                fill("severity", "severity", "score", "strength", "normalized_score")
+                fill("confidence", "confidence", "severity", "mean_reversion_probability")
+                fill("funding_rate", "funding_rate", "current_rate", "rate")
+                fill("reversal_risk", "reversal_risk", "is_reversal_risk", "has_reversal_risk", "mean_reversion_risk")
+                fill("squeeze_risk", "squeeze_risk", "is_squeeze_risk", "has_squeeze_risk")
+                fill("mean_reversion_probability", "mean_reversion_probability", "reversion_probability", "reversal_probability")
+                fill("squeeze_probability", "squeeze_probability", "short_squeeze_probability", "long_squeeze_probability", "squeeze_risk")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                severity = section_get(section, "severity", "score", default=0.0)
+                if section_get(section, "is_reversal_risk") is not None:
+                    section.setdefault("reversal_risk", section_get(section, "is_reversal_risk"))
+                if section_get(section, "is_squeeze_risk") is not None:
+                    section.setdefault("squeeze_risk", section_get(section, "is_squeeze_risk"))
+                if truthy(section.get("reversal_risk")) and section.get("mean_reversion_probability") is None:
+                    section["mean_reversion_probability"] = severity
+                if truthy(section.get("squeeze_risk")) and section.get("squeeze_probability") is None:
+                    section["squeeze_probability"] = severity
+                section.setdefault("detected", True)
+            elif name == "divergence":
+                fill("type", "type", "divergence_type", "kind")
+                fill("divergence_type", "divergence_type", "type", "kind")
+                fill("score", "score", "confidence", "strength", "signed_score")
+                fill("confidence", "confidence", "score")
+                fill("bias", "bias", "direction", "side", "expected_side")
+                fill("side", "side", "signal_side", "expected_side", "target_side", "bias", "direction")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                section.setdefault("detected", True)
+            elif name == "flip":
+                fill("type", "type", "flip_type", "kind")
+                fill("flip_type", "flip_type", "type", "kind")
+                fill("score", "score", "confidence", "flip_magnitude")
+                fill("confidence", "confidence", "score")
+                fill("magnitude", "magnitude", "flip_magnitude")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                section.setdefault("detected", True)
+            elif name == "signal":
+                fill("type", "type", "signal_type", "setup_type")
+                fill("signal_type", "signal_type", "type", "setup_type")
+                fill("score", "score", "signed_score", "strength")
+                fill("confidence", "confidence", "score_confidence")
+                fill("bias", "bias", "direction", "side")
+                fill("origin", "origin", "signal_origin")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                section.setdefault("detected", True)
+            return section
+
         sections = {
             "snapshot": mapping("snapshot", "funding_snapshot"),
             "statistics": mapping("statistics", "stats", "funding_statistics"),
@@ -1007,76 +1310,69 @@ class SignalNormalizer(BaseStrategyComponent):
             "extreme": mapping("extreme", "extreme_event", "funding_extreme", "funding_extreme_event"),
             "divergence": mapping("divergence", "divergence_event", "funding_divergence", "funding_divergence_event"),
             "flip": mapping("flip", "flip_event", "funding_flip", "funding_flip_event"),
-            "signal": mapping("signal", "funding_signal", "setup", "strategy_signal"),
+            "signal": mapping("signal", "funding_signal", "analytics_signal", "setup", "strategy_signal"),
         }
 
         if sections["snapshot"] is None:
             flat_snapshot = {
-                key: get(key)
+                key: get(key, f"funding.{key}")
                 for key in (
-                    "funding_rate",
-                    "current_rate",
-                    "next_funding_rate",
-                    "predicted_rate",
-                    "annualized_rate",
-                    "premium_index",
-                    "mark_price",
-                    "index_price",
-                    "next_funding_time",
-                    "exchange",
-                    "market_type",
-                    "symbol",
-                    "exchange_symbol",
-                    "timeframe",
-                    "timestamp",
+                    "funding_rate", "current_rate", "next_funding_rate", "predicted_rate",
+                    "predicted_funding_rate", "annualized_rate", "premium_index",
+                    "mark_price", "index_price", "open_interest", "volume_24h",
+                    "next_funding_time", "exchange", "market_type", "symbol",
+                    "exchange_symbol", "timeframe", "timestamp", "event_time",
                 )
-                if get(key) is not None
+                if get(key, f"funding.{key}") is not None
             }
             if flat_snapshot:
                 sections["snapshot"] = flat_snapshot
 
         if sections["statistics"] is None:
             flat_stats = {
-                key: get(key)
+                key: get(key, f"funding.statistics.{key}")
                 for key in (
-                    "mean_rate",
-                    "median_rate",
-                    "std_rate",
-                    "zscore",
-                    "z_score",
-                    "percentile",
-                    "min_rate",
-                    "max_rate",
-                    "samples",
+                    "current_rate", "mean_rate", "median_rate", "std_rate",
+                    "zscore", "z_score", "percentile", "min_rate", "max_rate",
+                    "sample_size", "samples", "window_start", "window_end", "updated_at",
                 )
-                if get(key) is not None
+                if get(key, f"funding.statistics.{key}") is not None
             }
             if flat_stats:
                 sections["statistics"] = flat_stats
 
+        topic = str(get("event_name", "topic", "source_topic", default="")).lower()
+        event_type = str(get("event_type", "type", default="")).lower()
+        if sections["pressure"] is None and ("pressure" in topic or event_type == "pressure"):
+            sections["pressure"] = dict(payload)
+        if sections["regime"] is None and ("regime" in topic or event_type == "regime"):
+            sections["regime"] = dict(payload)
+        if sections["extreme"] is None and ("extreme" in topic or event_type == "extreme"):
+            sections["extreme"] = dict(payload)
+        if sections["divergence"] is None and ("divergence" in topic or event_type == "divergence"):
+            sections["divergence"] = dict(payload)
+        if sections["flip"] is None and ("flip" in topic or event_type == "flip"):
+            sections["flip"] = dict(payload)
+        if sections["signal"] is None and ("signal" in topic or event_type == "signal"):
+            sections["signal"] = dict(payload)
+
+        alias_map = {
+            "snapshot": ("funding_snapshot",),
+            "statistics": ("stats", "funding_statistics"),
+            "regime": ("regime_state", "funding_regime", "funding_regime_state"),
+            "pressure": ("pressure_state", "funding_pressure", "funding_pressure_state"),
+            "extreme": ("extreme_event", "funding_extreme", "funding_extreme_event"),
+            "divergence": ("divergence_event", "funding_divergence", "funding_divergence_event"),
+            "flip": ("flip_event", "funding_flip", "funding_flip_event"),
+            "signal": ("funding_signal", "analytics_signal", "setup"),
+        }
+
         for name, section in list(sections.items()):
-            if isinstance(section, dict) and section:
-                section.setdefault("confidence", get(f"{name}_confidence", "confidence", default=section.get("confidence")))
-                section.setdefault("score", get(f"{name}_score", "score", default=section.get("score")))
-                if name in {"extreme", "divergence", "flip", "signal"}:
-                    section.setdefault("detected", section.get("active", section.get("confirmed", True)))
-                    section.setdefault("type", section.get(f"{name}_type", section.get("event_type", section.get("bias"))))
-                domain_data[name] = section
+            normalized = normalize(name, section)
+            if normalized:
+                put_alias(name, normalized, *alias_map[name])
 
-        for alias, canonical in {
-            "funding_snapshot": "snapshot",
-            "stats": "statistics",
-            "regime_state": "regime",
-            "pressure_state": "pressure",
-            "extreme_event": "extreme",
-            "divergence_event": "divergence",
-            "flip_event": "flip",
-            "funding_signal": "signal",
-        }.items():
-            if canonical in domain_data:
-                domain_data.setdefault(alias, domain_data[canonical])
-
-        for path, value in {
+        feature_aliases = {
             "funding.snapshot": domain_data.get("snapshot"),
             "funding.statistics": domain_data.get("statistics"),
             "funding.regime": domain_data.get("regime"),
@@ -1085,9 +1381,28 @@ class SignalNormalizer(BaseStrategyComponent):
             "funding.divergence": domain_data.get("divergence"),
             "funding.flip": domain_data.get("flip"),
             "funding.signal": domain_data.get("signal"),
-        }.items():
+            "funding.regime.confidence": section_get(domain_data.get("regime"), "confidence", "score"),
+            "funding.pressure.score": section_get(domain_data.get("pressure"), "score", "pressure_score"),
+            "funding.pressure.level": section_get(domain_data.get("pressure"), "level", "pressure_level"),
+            "funding.pressure.direction": section_get(domain_data.get("pressure"), "direction", "pressure_direction", "bias"),
+            "funding.extreme.type": section_get(domain_data.get("extreme"), "type", "extreme_type"),
+            "funding.extreme.severity": section_get(domain_data.get("extreme"), "severity", "score"),
+            "funding.extreme.mean_reversion_probability": section_get(domain_data.get("extreme"), "mean_reversion_probability", "reversion_probability"),
+            "funding.extreme.squeeze_probability": section_get(domain_data.get("extreme"), "squeeze_probability"),
+            "funding.divergence.type": section_get(domain_data.get("divergence"), "type", "divergence_type"),
+            "funding.divergence.confidence": section_get(domain_data.get("divergence"), "confidence", "score"),
+            "funding.divergence.score": section_get(domain_data.get("divergence"), "score", "confidence", "signed_score"),
+            "funding.flip.type": section_get(domain_data.get("flip"), "type", "flip_type"),
+            "funding.flip.confidence": section_get(domain_data.get("flip"), "confidence", "score"),
+            "funding.signal.type": section_get(domain_data.get("signal"), "type", "signal_type"),
+            "funding.signal.score": section_get(domain_data.get("signal"), "score", "signed_score"),
+            "funding.signal.confidence": section_get(domain_data.get("signal"), "confidence"),
+            "funding.signal.bias": section_get(domain_data.get("signal"), "bias", "direction", "side"),
+        }
+        for path, value in feature_aliases.items():
             if value is not None:
                 domain_data.setdefault(path, value)
+
 
     def _ensure_spreads_strategy_contract(
             self,
@@ -2009,411 +2324,302 @@ class SignalNormalizer(BaseStrategyComponent):
         Normalize analytics.funding.* payloads into the stable funding
         StrategyContext contract.
 
-        OI-style contract adapter only:
-        - expose analytics-provided sections under stable canonical aliases;
-        - extract nested analysis/result sections;
-        - enrich flat funding payloads into snapshot/statistics only when safe;
-        - do NOT synthesize extreme/divergence/flip/signal unless analytics
-          explicitly supplied a detected/actionable context.
+        Contract sections produced for concrete funding strategies:
+            snapshot, statistics, regime, pressure, extreme, divergence, flip, signal
+
+        Important: snapshot/statistics can be enriched from flat funding payloads,
+        but actionable sections (extreme/divergence/flip/signal) are only created
+        when analytics explicitly emitted that context/event.
         """
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering SignalNormalizer._augment_funding_domain_data")
+
         feature_map = payload.get("feature_map")
         if not isinstance(feature_map, dict):
             feature_map = {}
 
+        def nested_get(value: Any, path: str, default: Any = None) -> Any:
+            if not isinstance(path, str) or not path:
+                return default
+            if isinstance(value, dict) and path in value:
+                item = value.get(path)
+                return default if item is None else item
+            current = value
+            for part in path.split("."):
+                if current is None:
+                    return default
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    current = getattr(current, part, None)
+            return default if current is None else current
+
         def mapping_for(*keys: str) -> dict[str, Any] | None:
             for key in keys:
-                value = payload.get(key)
-                if isinstance(value, dict):
+                for root in (payload, domain_data, feature_map):
+                    value = nested_get(root, key)
+                    if isinstance(value, dict) and value:
+                        return dict(value)
+                # feature_map commonly stores canonical dotted feature names.
+                value = nested_get(feature_map, f"funding.{key}")
+                if isinstance(value, dict) and value:
                     return dict(value)
-
-                value = feature_map.get(key)
-                if isinstance(value, dict):
-                    return dict(value)
-
             return None
 
         def value_for(*keys: str, default: Any = None) -> Any:
             for key in keys:
-                if key in payload:
-                    return payload[key]
-                if key in feature_map:
-                    return feature_map[key]
+                for root in (payload, domain_data, feature_map):
+                    value = nested_get(root, key)
+                    if value is not None:
+                        return value
+                value = nested_get(feature_map, f"funding.{key}")
+                if value is not None:
+                    return value
             return default
 
-        topic = (
-            str(
-                payload.get("event_name")
-                or payload.get("topic")
-                or payload.get("source_topic")
-                or ""
-            )
-            .strip()
-            .lower()
-        )
+        topic = str(value_for("event_name", "topic", "source_topic", default="")).strip().lower()
+        event_type = str(value_for("event_type", "type", default="")).strip().lower()
 
         def to_bool(value: Any, default: bool = False) -> bool:
             if isinstance(value, bool):
                 return value
-
             if isinstance(value, str):
                 normalized = value.strip().lower()
-                if normalized in {
-                    "1",
-                    "true",
-                    "yes",
-                    "y",
-                    "on",
-                    "detected",
-                    "active",
-                    "confirmed",
-                    "triggered",
-                }:
+                if normalized in {"1", "true", "yes", "y", "on", "detected", "active", "confirmed", "triggered"}:
                     return True
-                if normalized in {
-                    "0",
-                    "false",
-                    "no",
-                    "n",
-                    "off",
-                    "none",
-                    "not_detected",
-                    "inactive",
-                }:
+                if normalized in {"0", "false", "no", "n", "off", "none", "not_detected", "inactive"}:
                     return False
-
             if isinstance(value, (int, float)):
                 return bool(value)
-
             return default
 
         def section_detected(section: dict[str, Any] | None) -> bool:
             if not section:
                 return False
-
-            detected = section.get(
-                "detected",
-                section.get(
-                    "is_detected",
-                    section.get(
-                        "active",
-                        section.get("confirmed", None),
-                    ),
-                ),
-            )
-
+            detected = section.get("detected", section.get("is_detected", section.get("active", section.get("confirmed"))))
             if detected is None:
-                # Typed nested analytics section without explicit detected flag is
-                # considered analytics-provided/actionable. Empty dicts are rejected.
                 return True
-
             return to_bool(detected, default=False)
 
-        def set_aliases(
-                target: str,
-                aliases: tuple[str, ...],
-                value: dict[str, Any] | None,
-                *,
-                override: bool = True,
-        ) -> None:
-            if value is None:
+        def section_value(section: dict[str, Any] | None, *paths: str, default: Any = None) -> Any:
+            if not isinstance(section, dict):
+                return default
+            for path in paths:
+                value = nested_get(section, path)
+                if value is not None:
+                    return value
+            return default
+
+        def normalize_section(name: str, raw: dict[str, Any] | None) -> dict[str, Any] | None:
+            if not isinstance(raw, dict) or not raw:
+                return None
+            section = dict(raw)
+            for _runtime_key in ("feature_map", "features", "strategy_contract", "strategy_contract_version"):
+                section.pop(_runtime_key, None)
+
+            def fill(canonical: str, *paths: str, default: Any = None) -> None:
+                value = section_value(section, *paths, default=None)
+                if value is None:
+                    for path in paths:
+                        value = value_for(f"funding.{name}.{path}", f"{name}_{path}", path, default=None)
+                        if value is not None:
+                            break
+                if value is None:
+                    value = default
+                if value is not None:
+                    section.setdefault(canonical, value)
+
+            if name == "snapshot":
+                fill("funding_rate", "funding_rate", "current_rate", "rate")
+                fill("current_rate", "current_rate", "funding_rate", "rate")
+                fill("predicted_funding_rate", "predicted_funding_rate", "predicted_rate", "next_funding_rate")
+                fill("predicted_rate", "predicted_rate", "predicted_funding_rate", "next_funding_rate")
+                fill("mark_price", "mark_price", "current_price", "reference_price")
+                fill("event_time", "event_time", "timestamp", "updated_at", "received_at")
+            elif name == "statistics":
+                fill("current_rate", "current_rate", "funding_rate", "rate")
+                fill("mean_rate", "mean_rate", "mean")
+                fill("median_rate", "median_rate", "median")
+                fill("std_rate", "std_rate", "std", "stdev")
+                fill("zscore", "zscore", "z_score")
+                fill("sample_size", "sample_size", "samples", "count")
+            elif name == "regime":
+                fill("type", "type", "regime", "name", "state")
+                fill("regime", "regime", "type", "name")
+                fill("bias", "bias", "direction", "side")
+                fill("score", "score", "confidence")
+                fill("confidence", "confidence", "score")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+            elif name == "pressure":
+                fill("score", "score", "pressure_score", "strength", "normalized_score")
+                fill("pressure_score", "pressure_score", "score", "strength", "normalized_score")
+                fill("level", "level", "pressure_level", "type")
+                fill("direction", "direction", "pressure_direction", "bias", "side")
+                fill("bias", "bias", "direction", "pressure_direction")
+                fill("squeeze_probability", "squeeze_probability", "squeeze_risk")
+                fill("mean_reversion_probability", "mean_reversion_probability", "reversion_probability", "reversal_probability")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+            elif name == "extreme":
+                fill("type", "type", "extreme_type", "kind")
+                fill("extreme_type", "extreme_type", "type", "kind")
+                fill("score", "score", "severity", "strength", "normalized_score")
+                fill("severity", "severity", "score", "strength", "normalized_score")
+                fill("confidence", "confidence", "severity", "mean_reversion_probability")
+                fill("funding_rate", "funding_rate", "current_rate", "rate")
+                fill("reversal_risk", "reversal_risk", "is_reversal_risk", "has_reversal_risk", "mean_reversion_risk")
+                fill("squeeze_risk", "squeeze_risk", "is_squeeze_risk", "has_squeeze_risk")
+                fill("mean_reversion_probability", "mean_reversion_probability", "reversion_probability", "reversal_probability")
+                fill("squeeze_probability", "squeeze_probability", "short_squeeze_probability", "long_squeeze_probability", "squeeze_risk")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                severity = section_value(section, "severity", "score", default=0.0)
+                if section_value(section, "is_reversal_risk") is not None:
+                    section.setdefault("reversal_risk", section_value(section, "is_reversal_risk"))
+                if section_value(section, "is_squeeze_risk") is not None:
+                    section.setdefault("squeeze_risk", section_value(section, "is_squeeze_risk"))
+                if to_bool(section.get("reversal_risk")) and section.get("mean_reversion_probability") is None:
+                    section["mean_reversion_probability"] = severity
+                if to_bool(section.get("squeeze_risk")) and section.get("squeeze_probability") is None:
+                    section["squeeze_probability"] = severity
+                section.setdefault("detected", True)
+            elif name == "divergence":
+                fill("type", "type", "divergence_type", "kind")
+                fill("divergence_type", "divergence_type", "type", "kind")
+                fill("score", "score", "confidence", "strength", "signed_score")
+                fill("confidence", "confidence", "score")
+                fill("bias", "bias", "direction", "side", "expected_side")
+                fill("side", "side", "signal_side", "expected_side", "target_side", "bias", "direction")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                section.setdefault("detected", True)
+            elif name == "flip":
+                fill("type", "type", "flip_type", "kind")
+                fill("flip_type", "flip_type", "type", "kind")
+                fill("score", "score", "confidence", "flip_magnitude")
+                fill("confidence", "confidence", "score")
+                fill("magnitude", "magnitude", "flip_magnitude")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                section.setdefault("detected", True)
+            elif name == "signal":
+                fill("type", "type", "signal_type", "setup_type")
+                fill("signal_type", "signal_type", "type", "setup_type")
+                fill("score", "score", "signed_score", "strength")
+                fill("confidence", "confidence", "score_confidence")
+                fill("bias", "bias", "direction", "side")
+                fill("origin", "origin", "signal_origin")
+                fill("event_time", "event_time", "timestamp", "updated_at")
+                section.setdefault("detected", True)
+            return section
+
+        def set_aliases(target: str, aliases: tuple[str, ...], value: dict[str, Any] | None, *, require_detected: bool = False) -> None:
+            normalized = normalize_section(target, value)
+            if normalized is None:
                 return
-
-            # Canonical funding sections should override raw/flat fields already
-            # copied into domain_data. This mirrors the OI contract behavior.
-            if override:
-                domain_data[target] = value
-            else:
-                domain_data.setdefault(target, value)
-
+            if require_detected and not section_detected(normalized):
+                return
+            domain_data[target] = normalized
             for alias in aliases:
-                domain_data.setdefault(alias, value)
+                domain_data.setdefault(alias, normalized)
 
-        analysis = mapping_for(
-            "analysis",
-            "result",
-            "funding_analysis",
-            "funding_result",
-        )
-        snapshot = mapping_for(
-            "snapshot",
-            "funding_snapshot",
-        )
-        statistics = mapping_for(
-            "statistics",
-            "stats",
-            "funding_statistics",
-        )
-        regime = mapping_for(
-            "regime",
-            "regime_state",
-            "funding_regime",
-            "funding_regime_state",
-        )
-        pressure = mapping_for(
-            "pressure",
-            "pressure_state",
-            "funding_pressure",
-            "funding_pressure_state",
-        )
-        extreme = mapping_for(
-            "extreme",
-            "extreme_event",
-            "funding_extreme",
-            "funding_extreme_event",
-        )
-        divergence = mapping_for(
-            "divergence",
-            "divergence_event",
-            "funding_divergence",
-            "funding_divergence_event",
-        )
-        flip = mapping_for(
-            "flip",
-            "flip_event",
-            "funding_flip",
-            "funding_flip_event",
-        )
-        signal = mapping_for(
-            "signal",
-            "funding_signal",
-            "strategy_signal",
-            "setup",
-        )
+        analysis = mapping_for("analysis", "result", "funding_analysis", "funding_result", "payload")
+        snapshot = mapping_for("snapshot", "funding_snapshot", "payload.snapshot", "payload.funding_snapshot")
+        statistics = mapping_for("statistics", "stats", "funding_statistics", "payload.statistics", "payload.stats")
+        regime = mapping_for("regime", "regime_state", "funding_regime", "funding_regime_state", "payload.regime_state")
+        pressure = mapping_for("pressure", "pressure_state", "funding_pressure", "funding_pressure_state", "payload.pressure_state")
+        extreme = mapping_for("extreme", "extreme_event", "funding_extreme", "funding_extreme_event", "payload.extreme_event")
+        divergence = mapping_for("divergence", "divergence_event", "funding_divergence", "funding_divergence_event", "payload.divergence_event")
+        flip = mapping_for("flip", "flip_event", "funding_flip", "funding_flip_event", "payload.flip_event")
+        signal = mapping_for("signal", "funding_signal", "analytics_signal", "strategy_signal", "setup", "payload.signal")
 
         if analysis is not None:
-            nested_snapshot = (
-                    analysis.get("snapshot")
-                    or analysis.get("funding_snapshot")
-            )
-            nested_statistics = (
-                    analysis.get("statistics")
-                    or analysis.get("stats")
-                    or analysis.get("funding_statistics")
-            )
-            nested_regime = (
-                    analysis.get("regime")
-                    or analysis.get("regime_state")
-                    or analysis.get("funding_regime")
-            )
-            nested_pressure = (
-                    analysis.get("pressure")
-                    or analysis.get("pressure_state")
-                    or analysis.get("funding_pressure")
-            )
-            nested_extreme = (
-                    analysis.get("extreme")
-                    or analysis.get("extreme_event")
-                    or analysis.get("funding_extreme")
-            )
-            nested_divergence = (
-                    analysis.get("divergence")
-                    or analysis.get("divergence_event")
-                    or analysis.get("funding_divergence")
-            )
-            nested_flip = (
-                    analysis.get("flip")
-                    or analysis.get("flip_event")
-                    or analysis.get("funding_flip")
-            )
-            nested_signal = (
-                    analysis.get("signal")
-                    or analysis.get("funding_signal")
-                    or analysis.get("setup")
-            )
+            snapshot = snapshot or mapping_for("analysis.snapshot", "analysis.funding_snapshot", "result.snapshot") or (analysis.get("snapshot") if isinstance(analysis.get("snapshot"), dict) else None)
+            statistics = statistics or (analysis.get("statistics") if isinstance(analysis.get("statistics"), dict) else None) or (analysis.get("stats") if isinstance(analysis.get("stats"), dict) else None)
+            regime = regime or (analysis.get("regime") if isinstance(analysis.get("regime"), dict) else None) or (analysis.get("regime_state") if isinstance(analysis.get("regime_state"), dict) else None)
+            pressure = pressure or (analysis.get("pressure") if isinstance(analysis.get("pressure"), dict) else None) or (analysis.get("pressure_state") if isinstance(analysis.get("pressure_state"), dict) else None)
+            extreme = extreme or (analysis.get("extreme") if isinstance(analysis.get("extreme"), dict) else None) or (analysis.get("extreme_event") if isinstance(analysis.get("extreme_event"), dict) else None)
+            divergence = divergence or (analysis.get("divergence") if isinstance(analysis.get("divergence"), dict) else None) or (analysis.get("divergence_event") if isinstance(analysis.get("divergence_event"), dict) else None)
+            flip = flip or (analysis.get("flip") if isinstance(analysis.get("flip"), dict) else None) or (analysis.get("flip_event") if isinstance(analysis.get("flip_event"), dict) else None)
+            signal = signal or (analysis.get("signal") if isinstance(analysis.get("signal"), dict) else None) or (analysis.get("funding_signal") if isinstance(analysis.get("funding_signal"), dict) else None)
 
-            if isinstance(nested_snapshot, dict) and snapshot is None:
-                snapshot = dict(nested_snapshot)
-            if isinstance(nested_statistics, dict) and statistics is None:
-                statistics = dict(nested_statistics)
-            if isinstance(nested_regime, dict) and regime is None:
-                regime = dict(nested_regime)
-            if isinstance(nested_pressure, dict) and pressure is None:
-                pressure = dict(nested_pressure)
-            if isinstance(nested_extreme, dict) and extreme is None:
-                extreme = dict(nested_extreme)
-            if isinstance(nested_divergence, dict) and divergence is None:
-                divergence = dict(nested_divergence)
-            if isinstance(nested_flip, dict) and flip is None:
-                flip = dict(nested_flip)
-            if isinstance(nested_signal, dict) and signal is None:
-                signal = dict(nested_signal)
-
-        # Safe flat enrichment: snapshot/statistics are context sections, not
-        # trade/setup sections.
         if snapshot is None:
             flat_snapshot: dict[str, Any] = {}
             for key in (
-                    "funding_rate",
-                    "current_rate",
-                    "next_funding_rate",
-                    "predicted_rate",
-                    "annualized_rate",
-                    "premium_index",
-                    "mark_price",
-                    "index_price",
-                    "next_funding_time",
-                    "exchange",
-                    "market_type",
-                    "symbol",
-                    "exchange_symbol",
-                    "timeframe",
-                    "timestamp",
+                "funding_rate", "current_rate", "next_funding_rate", "predicted_rate",
+                "predicted_funding_rate", "annualized_rate", "premium_index",
+                "mark_price", "index_price", "open_interest", "volume_24h",
+                "next_funding_time", "exchange", "market_type", "symbol",
+                "exchange_symbol", "timeframe", "timestamp", "event_time",
             ):
-                value = value_for(key, default=None)
+                value = value_for(key, f"funding.{key}", default=None)
                 if value is not None:
                     flat_snapshot[key] = value
-
             if flat_snapshot:
                 snapshot = flat_snapshot
 
         if statistics is None:
             flat_statistics: dict[str, Any] = {}
             for key in (
-                    "mean",
-                    "median",
-                    "std",
-                    "zscore",
-                    "z_score",
-                    "percentile",
-                    "min",
-                    "max",
-                    "window",
-                    "lookback",
+                "current_rate", "mean_rate", "median_rate", "std_rate", "zscore",
+                "z_score", "percentile", "min_rate", "max_rate", "sample_size",
+                "samples", "window_start", "window_end", "updated_at",
             ):
-                value = value_for(key, default=None)
+                value = value_for(key, f"funding.statistics.{key}", default=None)
                 if value is not None:
                     flat_statistics[key] = value
-
             if flat_statistics:
                 statistics = flat_statistics
 
-        # Flat signal/setup section only when analytics explicitly produced
-        # signal/setup context.
-        signal_like_topic = any(
-            token in topic
-            for token in (
-                "signal",
-                "setup",
-                "confirmed",
-                "generated",
-            )
-        )
-        explicit_signal = bool(
-            signal_like_topic
-            or value_for("signal_type", "setup_type", "signal_bias", default=None)
-            is not None
-            or to_bool(value_for("signal_detected", "setup_detected", default=False))
-        )
-
-        if signal is None and explicit_signal:
-            signal = {
-                "type": value_for("signal_type", "setup_type", default=None),
-                "bias": value_for("bias", "direction", "signal_bias", default=None),
-                "score": value_for("signal_score", "score", default=0.0),
-                "confidence": value_for(
-                    "signal_confidence",
-                    "confidence",
-                    default=0.0,
-                ),
-                "origin": value_for("origin", "signal_origin", default="funding"),
-                "detected": True,
-            }
-
-        # Event-specific flat sections only when explicitly indicated by analytics.
-        if extreme is None and (
-                "extreme" in topic
-                or value_for("extreme_type", "extreme_severity", default=None) is not None
-                or to_bool(value_for("extreme_detected", default=False))
-        ):
-            extreme = {
-                "type": value_for("extreme_type", "type", default=None),
-                "severity": value_for(
-                    "extreme_severity",
-                    "severity",
-                    "score",
-                    default=0.0,
-                ),
-                "mean_reversion_probability": value_for(
-                    "mean_reversion_probability",
-                    "reversion_probability",
-                    default=0.0,
-                ),
-                "squeeze_probability": value_for(
-                    "squeeze_probability",
-                    default=0.0,
-                ),
-                "detected": True,
-            }
-
-        if divergence is None and (
-                "divergence" in topic
-                or value_for("divergence_type", "divergence_score", default=None) is not None
-                or to_bool(value_for("divergence_detected", default=False))
-        ):
-            divergence = {
-                "type": value_for("divergence_type", "type", default=None),
-                "score": value_for("divergence_score", "score", default=0.0),
-                "confidence": value_for(
-                    "divergence_confidence",
-                    "confidence",
-                    default=0.0,
-                ),
-                "bias": value_for("bias", "direction", default=None),
-                "detected": True,
-            }
-
-        if flip is None and (
-                "flip" in topic
-                or value_for("flip_type", "flip_confidence", default=None) is not None
-                or to_bool(value_for("flip_detected", default=False))
-        ):
-            flip = {
-                "type": value_for("flip_type", "type", default=None),
-                "confidence": value_for(
-                    "flip_confidence",
-                    "confidence",
-                    default=0.0,
-                ),
-                "bias": value_for("bias", "direction", default=None),
-                "detected": True,
-            }
+        if pressure is None and ("pressure" in topic or event_type == "pressure"):
+            pressure = dict(payload)
+        if regime is None and ("regime" in topic or event_type == "regime"):
+            regime = dict(payload)
+        if extreme is None and ("extreme" in topic or event_type == "extreme" or value_for("extreme_type", "funding.extreme.type", default=None) is not None):
+            extreme = dict(payload)
+        if divergence is None and ("divergence" in topic or event_type == "divergence" or value_for("divergence_type", "funding.divergence.type", default=None) is not None):
+            divergence = dict(payload)
+        if flip is None and ("flip" in topic or event_type == "flip" or value_for("flip_type", "funding.flip.type", default=None) is not None):
+            flip = dict(payload)
+        signal_like_topic = any(token in topic for token in ("signal", "setup", "confirmed", "generated"))
+        if signal is None and (signal_like_topic or event_type == "signal" or value_for("signal_type", "setup_type", default=None) is not None):
+            signal = dict(payload)
 
         set_aliases("analysis", ("funding_analysis", "result"), analysis)
         set_aliases("snapshot", ("funding_snapshot",), snapshot)
         set_aliases("statistics", ("stats", "funding_statistics"), statistics)
-        set_aliases("regime", ("regime_state", "funding_regime"), regime)
-        set_aliases("pressure", ("pressure_state", "funding_pressure"), pressure)
+        set_aliases("regime", ("regime_state", "funding_regime", "funding_regime_state"), regime)
+        set_aliases("pressure", ("pressure_state", "funding_pressure", "funding_pressure_state"), pressure)
+        set_aliases("extreme", ("extreme_event", "funding_extreme", "funding_extreme_event"), extreme, require_detected=True)
+        set_aliases("divergence", ("divergence_event", "funding_divergence", "funding_divergence_event"), divergence, require_detected=True)
+        set_aliases("flip", ("flip_event", "funding_flip", "funding_flip_event"), flip, require_detected=True)
+        set_aliases("signal", ("funding_signal", "analytics_signal", "setup"), signal, require_detected=True)
 
-        if section_detected(extreme):
-            set_aliases(
-                "extreme",
-                ("extreme_event", "funding_extreme"),
-                extreme,
-            )
+        # Dotted domain aliases make funding_path()/context.get_feature() stable.
+        for name in ("snapshot", "statistics", "regime", "pressure", "extreme", "divergence", "flip", "signal"):
+            section = domain_data.get(name)
+            if section is not None:
+                domain_data.setdefault(f"funding.{name}", section)
 
-        if section_detected(divergence):
-            set_aliases(
-                "divergence",
-                ("divergence_event", "funding_divergence"),
-                divergence,
-            )
+        def put(path: str, value: Any) -> None:
+            if value is not None:
+                domain_data.setdefault(path, value)
 
-        if section_detected(flip):
-            set_aliases(
-                "flip",
-                ("flip_event", "funding_flip"),
-                flip,
-            )
+        put("funding.regime.confidence", section_value(domain_data.get("regime"), "confidence", "score"))
+        put("funding.pressure.score", section_value(domain_data.get("pressure"), "score", "pressure_score"))
+        put("funding.pressure.level", section_value(domain_data.get("pressure"), "level", "pressure_level"))
+        put("funding.pressure.direction", section_value(domain_data.get("pressure"), "direction", "pressure_direction", "bias"))
+        put("funding.extreme.type", section_value(domain_data.get("extreme"), "type", "extreme_type"))
+        put("funding.extreme.severity", section_value(domain_data.get("extreme"), "severity", "score"))
+        put("funding.extreme.mean_reversion_probability", section_value(domain_data.get("extreme"), "mean_reversion_probability", "reversion_probability"))
+        put("funding.extreme.squeeze_probability", section_value(domain_data.get("extreme"), "squeeze_probability"))
+        put("funding.divergence.type", section_value(domain_data.get("divergence"), "type", "divergence_type"))
+        put("funding.divergence.confidence", section_value(domain_data.get("divergence"), "confidence", "score"))
+        put("funding.divergence.score", section_value(domain_data.get("divergence"), "score", "confidence", "signed_score"))
+        put("funding.flip.type", section_value(domain_data.get("flip"), "type", "flip_type"))
+        put("funding.flip.confidence", section_value(domain_data.get("flip"), "confidence", "score"))
+        put("funding.signal.type", section_value(domain_data.get("signal"), "type", "signal_type"))
+        put("funding.signal.score", section_value(domain_data.get("signal"), "score", "signed_score"))
+        put("funding.signal.confidence", section_value(domain_data.get("signal"), "confidence"))
+        put("funding.signal.bias", section_value(domain_data.get("signal"), "bias", "direction", "side"))
 
-        if section_detected(signal):
-            set_aliases(
-                "signal",
-                ("funding_signal", "setup"),
-                signal,
-            )
 
     def _augment_orderflow_domain_data(
             self,
@@ -7628,8 +7834,11 @@ class SignalNormalizer(BaseStrategyComponent):
         # canonical domain contract. This makes routing robust when the raw
         # analytics event is a direct module event, e.g.
         # {topic=analytics.price_action.trend.updated, state=<TrendState>}.
-        # Keep first-pass explicit features authoritative.
-        known_feature_names = {snapshot.name for snapshot in features}
+        #
+        # Explicit non-empty features stay authoritative, but empty/None
+        # first-pass placeholders are replaced by canonical contract values.
+        # This prevents feature_map dict transport bugs from blocking routing.
+        feature_index = {snapshot.name: index for index, snapshot in enumerate(features)}
         augmented_contract_payload = {**payload_for_contract, **domain_data}
         for snapshot in self._build_contract_features(
                 source=source,
@@ -7637,9 +7846,12 @@ class SignalNormalizer(BaseStrategyComponent):
                 payload=augmented_contract_payload,
                 timestamp=ts,
         ):
-            if snapshot.name not in known_feature_names:
+            index = feature_index.get(snapshot.name)
+            if index is None:
+                feature_index[snapshot.name] = len(features)
                 features.append(snapshot)
-                known_feature_names.add(snapshot.name)
+            elif not self._contract_section_present(features[index].value):
+                features[index] = snapshot
 
         for snapshot in self._build_strategy_contract_feature_snapshots(
                 source=source,
@@ -7647,9 +7859,12 @@ class SignalNormalizer(BaseStrategyComponent):
                 domain_data=domain_data,
                 timestamp=ts,
         ):
-            if snapshot.name not in known_feature_names:
+            index = feature_index.get(snapshot.name)
+            if index is None:
+                feature_index[snapshot.name] = len(features)
                 features.append(snapshot)
-                known_feature_names.add(snapshot.name)
+            elif not self._contract_section_present(features[index].value):
+                features[index] = snapshot
 
         normalized = NormalizedPayload(
             source=source,
@@ -12558,7 +12773,21 @@ class SignalNormalizer(BaseStrategyComponent):
                 continue
 
             if isinstance(value, dict):
-                item = {"name": name, **value}
+                # Only treat mappings with explicit FeatureSnapshot fields as
+                # snapshot descriptors.  Domain contract mappings are the value.
+                descriptor_keys = {
+                    "value",
+                    "normalized",
+                    "normalized_value",
+                    "freshness_seconds",
+                    "metadata",
+                }
+                if descriptor_keys & set(value):
+                    item = {"name": name, **value}
+                else:
+                    item = {"name": name, "value": value}
+                    if "confidence" in value:
+                        item["confidence"] = value.get("confidence")
             else:
                 item = {"name": name, "value": value}
 
@@ -12683,9 +12912,35 @@ class SignalNormalizer(BaseStrategyComponent):
             item.get("normalized_value", item.get("normalized"))
         )
 
+        # A strategy contract feature may legitimately be a mapping, e.g.
+        # feature_map["liquidity.snapshot"] = { ...snapshot fields... }.  The
+        # old code interpreted that mapping as FeatureSnapshot metadata and lost
+        # the actual value unless it contained an explicit "value" key.  That
+        # made context.has_feature(...) true but registry truthiness false
+        # because snapshot.value became None, which rejected liquidity/whales/
+        # orderflow/spreads/spoofing/liquidations payloads before strategies
+        # could evaluate them.  Preserve mapping payloads as the feature value.
+        if "value" in item:
+            value = item.get("value")
+        else:
+            reserved_keys = {
+                "name",
+                "confidence",
+                "normalized",
+                "normalized_value",
+                "freshness_seconds",
+                "metadata",
+            }
+            raw_value = {
+                key: value
+                for key, value in item.items()
+                if key not in reserved_keys
+            }
+            value = raw_value if raw_value else None
+
         snapshot = FeatureSnapshot(
             name=self._normalize_feature_name(name),
-            value=item.get("value"),
+            value=value,
             source=source,
             symbol=symbol,
             timestamp=timestamp,

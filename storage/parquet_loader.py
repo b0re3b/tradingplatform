@@ -412,6 +412,61 @@ class ParquetMarketLoader:
             columns=columns,
         )
 
+    def _build_pyarrow_filter(
+        self,
+        *,
+        schema: pa.Schema,
+        exchange: str | None = None,
+        market_type: str | None = None,
+        symbols: Sequence[str] | None = None,
+        timeframes: Sequence[str] | None = None,
+        event_type: str | None = None,
+        analytics_type: str | None = None,
+        strategy_name: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        timestamp_fields: Sequence[str] = ("timestamp_ms",),
+    ) -> ds.Expression | None:
+        """Build a PyArrow Dataset filter for predicate pushdown.
+
+        Python-side filtering is still retained as a compatibility safety net for
+        older files with missing columns or alternative timestamp fields, but this
+        expression lets PyArrow prune partitions/row-groups before materializing
+        the dataset into Python objects.
+        """
+        names = set(schema.names)
+        expr: ds.Expression | None = None
+
+        def add(next_expr: ds.Expression | None) -> None:
+            nonlocal expr
+            if next_expr is None:
+                return
+            expr = next_expr if expr is None else expr & next_expr
+
+        if exchange and "exchange" in names:
+            add(ds.field("exchange") == str(exchange).lower())
+        if market_type and "market_type" in names:
+            add(ds.field("market_type") == str(market_type).lower())
+        if symbols and "symbol" in names:
+            add(ds.field("symbol").isin([str(item).upper() for item in symbols]))
+        if timeframes and "timeframe" in names:
+            add(ds.field("timeframe").isin([str(item) for item in timeframes]))
+        if event_type and "event_type" in names:
+            add(ds.field("event_type") == str(event_type))
+        if analytics_type and "analytics_type" in names:
+            add(ds.field("analytics_type") == str(analytics_type))
+        if strategy_name and "strategy_name" in names:
+            add(ds.field("strategy_name") == str(strategy_name))
+
+        ts_field = next((field for field in timestamp_fields if field in names), None)
+        if ts_field is not None:
+            if start_ms is not None:
+                add(ds.field(ts_field) >= int(start_ms))
+            if end_ms is not None:
+                add(ds.field(ts_field) <= int(end_ms))
+
+        return expr
+
     def _read_dataset_records(
         self,
         *,
@@ -434,7 +489,23 @@ class ParquetMarketLoader:
 
         try:
             dataset_obj = ds.dataset(str(path), format="parquet", partitioning="hive")
-            table = dataset_obj.to_table(columns=list(columns) if columns else None)
+            filter_expr = self._build_pyarrow_filter(
+                schema=dataset_obj.schema,
+                exchange=exchange,
+                market_type=market_type,
+                symbols=symbols,
+                timeframes=timeframes,
+                event_type=event_type,
+                analytics_type=analytics_type,
+                strategy_name=strategy_name,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                timestamp_fields=timestamp_fields,
+            )
+            table = dataset_obj.to_table(
+                columns=list(columns) if columns else None,
+                filter=filter_expr,
+            )
             records = table.to_pylist()
         except Exception as exc:
             self._logger.warning("Parquet dataset read failed | dataset=%s path=%s error=%s", dataset, path, exc)

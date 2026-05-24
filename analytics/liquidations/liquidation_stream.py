@@ -169,6 +169,7 @@ class LiquidationStream:
         metrics: LiquidationMetrics | None = None,
         history_store: LiquidationHistoryStoreProtocol | None = None,
         market_state_store: Any | None = None,
+        market_scheduler: Any | None = None,
         service_name: str = "liquidation_stream",
     ) -> None:
         try:
@@ -199,6 +200,8 @@ class LiquidationStream:
         self.service_name = service_name
         self.history_store = history_store
         self.market_state_store = market_state_store
+        self.market_scheduler = market_scheduler
+        self._market_scheduler_evaluator_name: str | None = None
 
         self.state = state or get_shared_liquidation_state(
             max_events_per_symbol=self.config.max_buffer_size_per_symbol,
@@ -322,6 +325,7 @@ class LiquidationStream:
             self.logger.info(
                 "LiquidationStream registered in state-driven mode; raw EventBus liquidation subscriptions are disabled"
             )
+            self._register_market_scheduler_evaluator()
 
         self._register_scheduler_jobs()
         self._registered = True
@@ -378,6 +382,7 @@ class LiquidationStream:
         self._subscriptions.clear()
 
         await self._remove_scheduler_jobs()
+        self._unregister_market_scheduler_evaluator()
         self._registered = False
 
         self.logger.info("LiquidationStream unregistered")
@@ -524,6 +529,42 @@ class LiquidationStream:
             pass
         await self.stop()
         await self.start()
+
+
+    def _register_market_scheduler_evaluator(self) -> None:
+        market_scheduler = getattr(self, "market_scheduler", None)
+        if market_scheduler is None:
+            self.logger.warning(
+                "LiquidationStream state-driven mode requires MarketScheduler; liquidation snapshots will not be processed"
+            )
+            return
+        register_evaluator = getattr(market_scheduler, "register_evaluator", None)
+        if not callable(register_evaluator):
+            self.logger.warning("Configured market_scheduler has no register_evaluator(); liquidations will not be processed")
+            return
+        name = f"liquidations:stream:{self.service_name}"
+        register_evaluator(
+            name=name,
+            callback=self.process_market_snapshot,
+            enabled=True,
+            metadata={"domain": "liquidations", "dirty_reasons": ("liquidation",)},
+            dirty_reasons=("liquidation",),
+        )
+        self._market_scheduler_evaluator_name = name
+        self.logger.info("LiquidationStream registered MarketScheduler evaluator", extra={"evaluator": name})
+
+    def _unregister_market_scheduler_evaluator(self) -> None:
+        market_scheduler = getattr(self, "market_scheduler", None)
+        name = getattr(self, "_market_scheduler_evaluator_name", None)
+        if market_scheduler is None or not name:
+            return
+        unregister_evaluator = getattr(market_scheduler, "unregister_evaluator", None)
+        if callable(unregister_evaluator):
+            try:
+                unregister_evaluator(name)
+            except Exception:
+                self.logger.exception("Failed to unregister LiquidationStream MarketScheduler evaluator", extra={"evaluator": name})
+        self._market_scheduler_evaluator_name = None
 
     # ------------------------------------------------------------------
     # State-driven input API

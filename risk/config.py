@@ -391,6 +391,35 @@ class CircuitBreakerConfig:
     trigger_on_execution_cost_spike: bool = True
     trigger_on_data_feed_failure: bool = True
 
+    # Scheduler failures are not all trading-critical.  Optional jobs such as
+    # news collection, telemetry, storage flushes or reporting must never halt
+    # futures trading.  RiskManager will only promote scheduler failures whose
+    # job name matches one of the critical patterns below.
+    trigger_on_scheduler_job_failure: bool = True
+    scheduler_failure_critical_jobs: tuple[str, ...] = field(default_factory=lambda: (
+        "execution.",
+        "trade_executor.",
+        "order_manager.",
+        "position_manager.",
+        "sl_tp_manager.",
+        "risk.",
+        "market_state.",
+        "market_scheduler.",
+        "exchange.user_data",
+        "exchange.private",
+        "binance_user_data",
+    ))
+    scheduler_failure_ignored_jobs: tuple[str, ...] = field(default_factory=lambda: (
+        "news_ai_service.",
+        "news.",
+        "ai_news.",
+        "sentiment.",
+        "storage.",
+        "report.",
+        "metrics.",
+        "telemetry.",
+    ))
+
     require_manual_release_for_emergency: bool = True
 
 

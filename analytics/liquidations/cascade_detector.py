@@ -264,16 +264,15 @@ class CascadeDetector:
 
         self.config.assert_input_topic_allowed()
 
-        if self.market_state_store is None:
-            self._subscription = self.event_bus.subscribe(
-                self.config.input_topic,
-                self.on_liquidation_event,
-                name=f"{self.service_name}.on_liquidation_event",
-            )
-        else:
-            self.logger.info(
-                "CascadeDetector registered in state-driven mode; normalized EventBus input subscription is disabled"
-            )
+        # Always consume the normalized analytics.liquidations stream.  In
+        # state-driven mode LiquidationStream is fed by MarketScheduler and then
+        # emits the same normalized low-frequency topic; disabling this
+        # subscription disconnects CascadeDetector from its only production input.
+        self._subscription = self.event_bus.subscribe(
+            self.config.input_topic,
+            self.on_liquidation_event,
+            name=f"{self.service_name}.on_liquidation_event",
+        )
 
         self._register_scheduler_jobs()
         self._registered = True
@@ -403,6 +402,9 @@ class CascadeDetector:
     # ---------------------------------------------------------------------
     # State-driven input API
     # ---------------------------------------------------------------------
+
+    async def process_market_snapshot(self, snapshot: Any) -> CascadeDetectionResult | None:
+        return await self.process_market_state_snapshot(snapshot=snapshot)
 
     async def process_market_state_snapshot(
         self,

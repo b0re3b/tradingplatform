@@ -179,6 +179,9 @@ class BaseNewsSource(ABC):
         self._last_success_at: datetime | None = None
         self._last_error: str | None = None
         self._last_status: NewsFetchStatus = NewsFetchStatus.EMPTY
+        self._disabled_after_failure = False
+        self._disabled_after_failure_at: datetime | None = None
+        self._disabled_after_failure_reason: str | None = None
         self._total_fetches = 0
         self._successful_fetches = 0
         self._failed_fetches = 0
@@ -197,6 +200,18 @@ class BaseNewsSource(ABC):
     def enabled(self) -> bool:
         return self.config.enabled
 
+    @property
+    def runtime_disabled(self) -> bool:
+        return self._disabled_after_failure
+
+    @property
+    def available(self) -> bool:
+        return self.config.enabled and not self._disabled_after_failure
+
+    @property
+    def disabled_after_failure_reason(self) -> str | None:
+        return self._disabled_after_failure_reason
+
     @abstractmethod
     async def fetch(
         self,
@@ -212,8 +227,10 @@ class BaseNewsSource(ABC):
         """
 
         status = NewsSourceStatus.DISABLED
-        if self.enabled:
-            if self._last_status in {
+        if self.config.enabled:
+            if self._disabled_after_failure:
+                status = NewsSourceStatus.FAILED
+            elif self._last_status in {
                 NewsFetchStatus.SUCCESS,
                 NewsFetchStatus.PARTIAL_SUCCESS,
             }:
@@ -236,7 +253,7 @@ class BaseNewsSource(ABC):
             last_fetch_status=self._last_status,
             last_fetch_at=self._last_fetch_at,
             last_success_at=self._last_success_at,
-            last_error=self._last_error,
+            last_error=self._disabled_after_failure_reason or self._last_error,
             total_fetches=self._total_fetches,
             successful_fetches=self._successful_fetches,
             failed_fetches=self._failed_fetches,
@@ -254,8 +271,13 @@ class BaseNewsSource(ABC):
         Wrap concrete fetch logic with metrics and normalized error handling.
         """
 
-        if not self.enabled:
+        if not self.config.enabled:
             self._last_status = NewsFetchStatus.EMPTY
+            return []
+
+        if self._disabled_after_failure:
+            self._last_status = NewsFetchStatus.FAILED
+            self._last_error = self._disabled_after_failure_reason
             return []
 
         self._respect_min_fetch_interval()
@@ -280,11 +302,16 @@ class BaseNewsSource(ABC):
 
             return limited_items
 
+        except asyncio.CancelledError:
+            self._update_latency(started_monotonic)
+            raise
+
         except NewsSourceError as exc:
             self._failed_fetches += 1
             self._last_error = exc.message
             self._last_status = self._status_from_exception(exc)
             self._update_latency(started_monotonic)
+            self._disable_after_failure(exc.message)
             raise
 
         except TimeoutError as exc:
@@ -292,22 +319,52 @@ class BaseNewsSource(ABC):
             self._last_status = NewsFetchStatus.TIMEOUT
             self._last_error = str(exc)
             self._update_latency(started_monotonic)
-            raise NewsTimeoutError(
+            error = NewsTimeoutError(
                 f"News source '{self.name}' timed out",
                 context=self._context(reason=NewsFailureReason.TIMEOUT),
                 cause=exc,
-            ) from exc
+            )
+            self._disable_after_failure(error.message)
+            raise error from exc
 
         except Exception as exc:
             self._failed_fetches += 1
             self._last_status = NewsFetchStatus.FAILED
             self._last_error = str(exc)
             self._update_latency(started_monotonic)
-            raise NewsFetchError(
+            error = NewsFetchError(
                 f"News source '{self.name}' fetch failed",
                 context=self._context(reason=NewsFailureReason.NETWORK_ERROR),
                 cause=exc,
-            ) from exc
+            )
+            self._disable_after_failure(error.message)
+            raise error from exc
+
+    def _disable_after_failure(self, reason: str) -> None:
+        """
+        Runtime-quarantine this source after a failed fetch.
+
+        News feeds are optional for trading. A broken source must not keep
+        being queried on every scheduler tick and must not be able to cascade
+        into global risk halts through repeated scheduler failures.
+        """
+
+        if not self.config.disable_after_failure or self._disabled_after_failure:
+            return
+
+        self._disabled_after_failure = True
+        self._disabled_after_failure_at = utc_now()
+        self._disabled_after_failure_reason = reason
+        self._last_status = NewsFetchStatus.FAILED
+        self._last_error = reason
+        self.logger.warning(
+            "News source disabled after failed fetch",
+            extra={
+                "source_name": self.name,
+                "source_type": str(self.source_type),
+                "reason": reason,
+            },
+        )
 
     def _respect_min_fetch_interval(self) -> None:
         """
@@ -393,6 +450,17 @@ class BaseNewsSource(ABC):
 
         return headers
 
+    def _request_timeout(self) -> aiohttp.ClientTimeout:
+        total = max(1.0, float(self.config.request_timeout_seconds))
+        connect = min(5.0, total)
+        sock_read = min(10.0, total)
+        return aiohttp.ClientTimeout(
+            total=total,
+            connect=connect,
+            sock_connect=connect,
+            sock_read=sock_read,
+        )
+
     async def _request_text(
         self,
         url: str,
@@ -404,7 +472,7 @@ class BaseNewsSource(ABC):
         active_session = session
 
         if active_session is None:
-            timeout = aiohttp.ClientTimeout(total=self.config.request_timeout_seconds)
+            timeout = self._request_timeout()
             active_session = aiohttp.ClientSession(timeout=timeout)
             close_session = True
 
@@ -413,7 +481,7 @@ class BaseNewsSource(ABC):
                 url,
                 headers=self._headers(),
                 params=params or self.config.query_params,
-                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout_seconds),
+                timeout=self._request_timeout(),
             ) as response:
                 if response.status == 429:
                     raise NewsRateLimitError(
@@ -459,7 +527,7 @@ class BaseNewsSource(ABC):
         active_session = session
 
         if active_session is None:
-            timeout = aiohttp.ClientTimeout(total=self.config.request_timeout_seconds)
+            timeout = self._request_timeout()
             active_session = aiohttp.ClientSession(timeout=timeout)
             close_session = True
 
@@ -468,7 +536,7 @@ class BaseNewsSource(ABC):
                 url,
                 headers=self._headers(),
                 params=params or self.config.query_params,
-                timeout=aiohttp.ClientTimeout(total=self.config.request_timeout_seconds),
+                timeout=self._request_timeout(),
             ) as response:
                 if response.status == 429:
                     raise NewsRateLimitError(

@@ -55,8 +55,19 @@ class PriceActionAnalyzerConfig(BasePriceActionConfig):
     snapshot_interval_seconds: float | None = None
 
     # Facade itself should not consume market candles directly.
-    # Child analyzers own candle subscriptions.
+    # In the state-driven pipeline MarketScheduler feeds process_market_snapshot();
+    # child analyzers are driven by this facade and must not subscribe to candle
+    # events independently.
     subscribe_market_candles: bool = False
+
+    # State-driven live mode. When market_scheduler is injected, the facade
+    # registers itself as a bounded snapshot evaluator. evaluate_on_register also
+    # schedules one managed initial pass, which covers the common startup order
+    # where Parquet restore filled MarketStateStore before this analyzer was
+    # registered and dirty scopes were already drained.
+    register_market_scheduler_evaluator: bool = True
+    evaluate_on_register: bool = True
+    initial_evaluation_job_timeout_seconds: float = 30.0
 
     auto_register_modules: bool = True
     shutdown_child_modules: bool = True
@@ -137,6 +148,12 @@ class PriceActionAnalyzerConfig(BasePriceActionConfig):
             self.enable_trend,
         )
 
+        if self.initial_evaluation_job_timeout_seconds <= 0:
+            raise ValueError("initial_evaluation_job_timeout_seconds must be > 0")
+
+        self.register_market_scheduler_evaluator = bool(self.register_market_scheduler_evaluator)
+        self.evaluate_on_register = bool(self.evaluate_on_register)
+
         if self.auto_register_modules and not any(enabled_modules):
             raise ValueError("at least one price action module must be enabled")
 
@@ -208,6 +225,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         liquidity_levels: LiquidityLevelsAnalyzer | None = None,
         trend: TrendAnalyzer | None = None,
         market_state_store: Any | None = None,
+        market_scheduler: Any | None = None,
     ) -> None:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -246,6 +264,11 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
 
         self.config: PriceActionAnalyzerConfig = resolved_config
         self._market_state_store = market_state_store
+        self._market_scheduler = market_scheduler
+        self._market_scheduler_evaluator_name: str | None = None
+        self._initial_evaluation_job_id: str | None = None
+        self._initial_market_state_evaluation_completed = False
+        self._initial_market_state_evaluation_running = False
         self._state_snapshot_source = (
             MarketStateSnapshotSource(market_state_store) if market_state_store is not None else None
         )
@@ -289,6 +312,13 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         }
         self._last_child_payloads: dict[str, dict[str, Any]] = {}
         self._state_version = 0
+        # State-driven snapshots contain a rolling candle window.  The facade is
+        # incremental, so feeding the full window on every MarketScheduler tick
+        # duplicates candles inside child modules and breaks pivots/FVG/trend.
+        # Keep one monotonic watermark per scoped analyzer and process only new
+        # closed candles.  Initial evaluation still hydrates the full restored
+        # closed window.
+        self._last_processed_candle_open_time_ms: int | None = None
 
         self._state = self._new_composite_state()
         self._refresh_composite_state(advance_version=True)
@@ -301,6 +331,25 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 "enabled_modules": self._enabled_module_names(),
             },
         )
+
+    # ------------------------------------------------------------------
+    # State-driven child config helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _state_driven_child_config(config: Any, factory: Any) -> Any:
+        """Return a child config that is driven only by this facade.
+
+        Child analyzers keep all domain thresholds/settings from the provided
+        config, but candle EventBus subscriptions are disabled. In the
+        high-load pipeline MarketStateStore/MarketScheduler supplies a coherent
+        candle snapshot to PriceActionAnalyzer, and this facade calls
+        child.update(candles=...) exactly once per evaluator invocation.
+        """
+        child_config = config if config is not None else factory()
+        if hasattr(child_config, "subscribe_market_candles"):
+            child_config.subscribe_market_candles = False
+        return child_config
 
     # ------------------------------------------------------------------
     # Child analyzer construction
@@ -339,7 +388,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
-            config=self.config.market_structure_config,
+            config=self._state_driven_child_config(
+                self.config.market_structure_config,
+                MarketStructureConfig,
+            ),
         )
 
     def _build_support_resistance_analyzer(self) -> SupportResistanceAnalyzer | None:
@@ -375,7 +427,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
-            config=self.config.support_resistance_config,
+            config=self._state_driven_child_config(
+                self.config.support_resistance_config,
+                SupportResistanceConfig,
+            ),
         )
 
     def _build_fair_value_gap_analyzer(self) -> FairValueGapAnalyzer | None:
@@ -411,7 +466,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
-            config=self.config.fair_value_gap_config,
+            config=self._state_driven_child_config(
+                self.config.fair_value_gap_config,
+                FairValueGapConfig,
+            ),
         )
 
     def _build_liquidity_levels_analyzer(self) -> LiquidityLevelsAnalyzer | None:
@@ -447,7 +505,10 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
-            config=self.config.liquidity_levels_config,
+            config=self._state_driven_child_config(
+                self.config.liquidity_levels_config,
+                LiquidityLevelsConfig,
+            ),
         )
 
     def _build_trend_analyzer(self) -> TrendAnalyzer | None:
@@ -483,8 +544,155 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             timeframe=self.timeframe,
             event_bus=self.event_bus,
             scheduler=self.scheduler,
-            config=self.config.trend_config,
+            config=self._state_driven_child_config(
+                self.config.trend_config,
+                TrendConfig,
+            ),
         )
+
+    # ------------------------------------------------------------------
+    # MarketScheduler integration
+    # ------------------------------------------------------------------
+
+    def _market_scheduler_evaluator_id(self) -> str:
+        return (
+            f"price_action:{self.symbol}:{self.timeframe}:"
+            f"{self.exchange}:{self.market_type}"
+        )
+
+    def _register_market_scheduler_evaluator(self) -> None:
+        if not self.config.register_market_scheduler_evaluator:
+            return
+
+        market_scheduler = getattr(self, "_market_scheduler", None)
+        if market_scheduler is None:
+            self.logger.warning(
+                "PriceActionAnalyzer MarketScheduler is not configured; "
+                "live state-driven candle snapshots will not update price_action",
+                extra=self._log_scope_extra(),
+            )
+            return
+
+        register_evaluator = getattr(market_scheduler, "register_evaluator", None)
+        if not callable(register_evaluator):
+            self.logger.warning(
+                "Configured market_scheduler has no register_evaluator(); "
+                "live state-driven candle snapshots will not update price_action",
+                extra=self._log_scope_extra(),
+            )
+            return
+
+        name = self._market_scheduler_evaluator_id()
+        register_evaluator(
+            name=name,
+            callback=self.process_market_snapshot,
+            enabled=True,
+            metadata={
+                "domain": "price_action",
+                "exchange": self.exchange,
+                "market_type": self.market_type,
+                "symbol": self.symbol,
+                "timeframe": self.timeframe,
+                "dirty_reasons": ("candle", "candle_closed", "warmup"),
+            },
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            dirty_reasons=("candle", "candle_closed", "warmup"),
+        )
+        self._market_scheduler_evaluator_name = name
+        self.logger.info(
+            "PriceActionAnalyzer registered MarketScheduler evaluator",
+            extra={**self._log_scope_extra(), "evaluator": name},
+        )
+
+    def _unregister_market_scheduler_evaluator(self) -> None:
+        market_scheduler = getattr(self, "_market_scheduler", None)
+        name = getattr(self, "_market_scheduler_evaluator_name", None)
+        if market_scheduler is None or not name:
+            return
+
+        unregister_evaluator = getattr(market_scheduler, "unregister_evaluator", None)
+        if callable(unregister_evaluator):
+            try:
+                unregister_evaluator(name)
+            except Exception:
+                self.logger.exception(
+                    "Failed to unregister PriceActionAnalyzer MarketScheduler evaluator",
+                    extra={**self._log_scope_extra(), "evaluator": name},
+                )
+        self._market_scheduler_evaluator_name = None
+
+    def _register_initial_market_state_evaluation_job(self) -> None:
+        if not self.config.evaluate_on_register:
+            return
+        if self._state_snapshot_source is None:
+            return
+        if self.scheduler is None:
+            self.logger.warning(
+                "Initial price_action evaluation requested but Scheduler is not configured",
+                extra=self._log_scope_extra(),
+            )
+            return
+        if self._initial_market_state_evaluation_completed:
+            return
+        if self._initial_market_state_evaluation_running:
+            return
+        if self._initial_evaluation_job_id is not None:
+            return
+
+        job_name = (
+            f"analytics.price_action.initial_evaluation."
+            f"{self.exchange}.{self.market_type}.{self.symbol.lower()}.{self.timeframe}"
+        )
+        self._initial_evaluation_job_id = self.scheduler.add_interval_job(
+            name=job_name,
+            func=self._initial_market_state_evaluation_job,
+            interval=3600.0,
+            run_immediately=True,
+            max_retries=0,
+            retry_delay=1.0,
+            timeout=self.config.initial_evaluation_job_timeout_seconds,
+            allow_overlap=False,
+            enabled=True,
+        )
+        self._scheduled_job_ids.append(self._initial_evaluation_job_id)
+        self.logger.info(
+            "PriceActionAnalyzer scheduled initial MarketState evaluation",
+            extra={**self._log_scope_extra(), "job_id": self._initial_evaluation_job_id},
+        )
+
+    async def _initial_market_state_evaluation_job(self) -> None:
+        job_id = self._initial_evaluation_job_id
+        if self._initial_market_state_evaluation_completed:
+            return
+        if self._initial_market_state_evaluation_running:
+            return
+
+        self._initial_market_state_evaluation_running = True
+        try:
+            result = await self.process_market_state_snapshot()
+            self._initial_market_state_evaluation_completed = True
+            self.logger.info(
+                "PriceActionAnalyzer initial MarketState evaluation completed",
+                extra={**self._log_scope_extra(), "job_id": job_id, "result": result},
+            )
+        finally:
+            self._initial_market_state_evaluation_running = False
+            if job_id is not None and self.scheduler is not None:
+                try:
+                    # Do not remove a job from inside its own running callback: the
+                    # core scheduler logs this as "Removing running job" and some
+                    # implementations can reschedule the callback before removal is
+                    # fully committed.  Disabling is enough for this one-shot warmup;
+                    # unregister()/shutdown() will clean up module-owned jobs later.
+                    self.scheduler.disable_job(job_id)
+                except Exception:
+                    self.logger.exception(
+                        "Failed to disable initial price_action evaluation job",
+                        extra={**self._log_scope_extra(), "job_id": job_id},
+                    )
 
     # ------------------------------------------------------------------
     # Registration / lifecycle
@@ -539,6 +747,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                     module.register()
                     registered_children.append(module)
 
+            self._register_market_scheduler_evaluator()
+            self._register_initial_market_state_evaluation_job()
+
         except Exception:
             for module in reversed(registered_children):
                 try:
@@ -574,6 +785,11 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             },
         )
 
+    def unregister(self) -> None:
+        """Unregister facade subscriptions, child scheduler jobs and MarketScheduler evaluator."""
+        self._unregister_market_scheduler_evaluator()
+        super().unregister()
+
     async def shutdown(self) -> None:
         """
         Shutdown facade and optionally child modules.
@@ -601,6 +817,8 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "shutdown", _analytics_args)
         except Exception:
             pass
+        self._unregister_market_scheduler_evaluator()
+
         if self.config.shutdown_child_modules:
             for module in self._iter_enabled_modules():
                 try:
@@ -615,6 +833,94 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                     )
 
         await super().shutdown()
+
+
+    # ------------------------------------------------------------------
+    # Candle-window normalization / de-duplication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _candle_mapping(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, Mapping):
+            return dict(raw)
+        if hasattr(raw, "to_dict") and callable(raw.to_dict):
+            try:
+                value = raw.to_dict()
+                if isinstance(value, Mapping):
+                    return dict(value)
+            except Exception:
+                pass
+        result: dict[str, Any] = {}
+        for key in (
+            "timeframe", "open_time_ms", "close_time_ms", "timestamp_ms",
+            "open", "high", "low", "close", "volume", "is_closed", "metadata",
+        ):
+            value = getattr(raw, key, None)
+            if value is not None:
+                result[key] = value
+        return result
+
+    @staticmethod
+    def _candle_int(raw: Mapping[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = raw.get(key)
+            if value is None or value == "":
+                continue
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _candle_is_closed(raw: Mapping[str, Any]) -> bool:
+        value = raw.get("is_closed", raw.get("closed", raw.get("x", True)))
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "closed"}
+        return bool(value)
+
+    def _new_closed_candles_from_snapshot(self, snapshot: Any) -> list[dict[str, Any]]:
+        candles = [self._candle_mapping(item) for item in snapshot_candles(snapshot, timeframe=self.timeframe)]
+        normalized: list[tuple[int, dict[str, Any]]] = []
+        for candle in candles:
+            if not candle:
+                continue
+            # Price-action modules should react to stable candle-close data.  Open
+            # candle updates can revise OHLC and create false pivots/signals.
+            if not self._candle_is_closed(candle):
+                continue
+            open_time_ms = self._candle_int(candle, "open_time_ms", "open_time", "start", "t", "timestamp_ms", "timestamp")
+            if open_time_ms is None:
+                continue
+            if (
+                self._last_processed_candle_open_time_ms is not None
+                and open_time_ms <= self._last_processed_candle_open_time_ms
+            ):
+                continue
+            candle.setdefault("exchange", self.exchange)
+            candle.setdefault("market_type", self.market_type)
+            candle.setdefault("symbol", self.symbol)
+            candle.setdefault("exchange_symbol", self.exchange_symbol)
+            candle.setdefault("timeframe", self.timeframe)
+            normalized.append((open_time_ms, candle))
+
+        normalized.sort(key=lambda item: item[0])
+        # Deduplicate by open time inside one snapshot.  Keep the latest dict for
+        # the candle, but preserve chronological processing order.
+        deduped: dict[int, dict[str, Any]] = {}
+        for open_time_ms, candle in normalized:
+            deduped[open_time_ms] = candle
+        return [deduped[key] for key in sorted(deduped)]
+
+    def _mark_candles_processed(self, candles: list[Mapping[str, Any]]) -> None:
+        if not candles:
+            return
+        latest = self._last_processed_candle_open_time_ms
+        for candle in candles:
+            open_time_ms = self._candle_int(candle, "open_time_ms", "open_time", "start", "t", "timestamp_ms", "timestamp")
+            if open_time_ms is not None and (latest is None or open_time_ms > latest):
+                latest = open_time_ms
+        self._last_processed_candle_open_time_ms = latest
 
     async def process_market_state_snapshot(self) -> dict[str, Any]:
         """Evaluate this price-action scope from MarketStateStore candles.
@@ -634,9 +940,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
-        candles = snapshot_candles(snapshot, timeframe=self.timeframe) if snapshot is not None else []
+        candles = self._new_closed_candles_from_snapshot(snapshot) if snapshot is not None else []
         if not candles:
-            return {"processed": False, "reason": "no_candles"}
+            return {"processed": False, "reason": "no_new_closed_candles"}
 
         updated: list[str] = []
         for module_name, module in (
@@ -663,6 +969,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             updated_module=updated[-1] if updated else None,
             source_topic="market_state.snapshot",
         )
+        self._mark_candles_processed(candles)
         return {"processed": True, "updated_modules": updated, "candles": len(candles)}
 
     async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
@@ -707,9 +1014,9 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 },
             }
 
-        candles = snapshot_candles(snapshot, timeframe=self.timeframe)
+        candles = self._new_closed_candles_from_snapshot(snapshot)
         if not candles:
-            return {"processed": False, "reason": "no_candles"}
+            return {"processed": False, "reason": "no_new_closed_candles"}
 
         updated: list[str] = []
         for module_name, module in (
@@ -736,6 +1043,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             updated_module=updated[-1] if updated else None,
             source_topic="market_state.snapshot",
         )
+        self._mark_candles_processed(candles)
         return {"processed": True, "updated_modules": updated, "candles": len(candles)}
 
     # ------------------------------------------------------------------
@@ -1294,7 +1602,7 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
         self._refresh_composite_state(
             updated_module=updated_module,
             source_topic=source_topic,
-            advance_version=False,
+            advance_version=True,
         )
 
         return await self._emit_event(

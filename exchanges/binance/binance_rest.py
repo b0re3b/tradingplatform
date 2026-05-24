@@ -359,6 +359,13 @@ class BinanceRestClient:
             max(1, self._rest_config.derivative_snapshot_poll_concurrency)
         )
 
+        # Last successful private snapshots.  On transient Binance REST
+        # timeouts, returning a fresh empty list is dangerous because execution
+        # and risk reconciliation can interpret it as "no open orders /
+        # no positions".  We prefer stale-but-explicit data when available.
+        self._last_positions_snapshot_by_symbol: dict[str | None, list[dict[str, Any]]] = {}
+        self._last_open_orders_snapshot_by_symbol: dict[str | None, list[dict[str, Any]]] = {}
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -1256,10 +1263,52 @@ class BinanceRestClient:
                 auth_required=True,
             )
         except asyncio.TimeoutError:
+            cache_key = symbol.upper() if symbol else None
+            cached = self._last_positions_snapshot_by_symbol.get(cache_key)
+            if cached is None and cache_key is not None:
+                cached = self._last_positions_snapshot_by_symbol.get(None)
+
+            if cached is not None:
+                self._logger.warning(
+                    "get_positions timed out — returning stale cached snapshot | symbol=%s timeout_seconds=%s count=%s",
+                    symbol,
+                    self._rest_config.timeout_seconds,
+                    len(cached),
+                )
+                await self._emit_event(
+                    "exchange.positions.snapshot_stale",
+                    {
+                        "exchange": self.EXCHANGE,
+                        "market_type": "usdm_futures",
+                        "symbol": symbol.upper() if symbol else None,
+                        "positions": cached,
+                        "count": len(cached),
+                        "snapshot_time": self._current_timestamp_ms(),
+                        "stale": True,
+                        "stale_reason": "timeout",
+                    },
+                    priority=EventPriority.HIGH,
+                )
+                return list(cached)
+
             self._logger.warning(
-                "get_positions timed out — returning empty snapshot | symbol=%s timeout_seconds=%s",
+                "get_positions timed out and no cached snapshot is available | symbol=%s timeout_seconds=%s",
                 symbol,
                 self._rest_config.timeout_seconds,
+            )
+            await self._emit_event(
+                "exchange.positions.snapshot_failed",
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "symbol": symbol.upper() if symbol else None,
+                    "snapshot_time": self._current_timestamp_ms(),
+                    "error": "timeout",
+                    "stale": True,
+                    "positions": None,
+                    "count": None,
+                },
+                priority=EventPriority.HIGH,
             )
             return []
 
@@ -1268,6 +1317,8 @@ class BinanceRestClient:
             for item in payload
             if isinstance(item, dict)
         ]
+        cache_key = symbol.upper() if symbol else None
+        self._last_positions_snapshot_by_symbol[cache_key] = list(normalized)
 
         await self._emit_event(
             "exchange.positions.snapshot",
@@ -1327,10 +1378,52 @@ class BinanceRestClient:
                 auth_required=True,
             )
         except asyncio.TimeoutError:
+            cache_key = symbol.upper() if symbol else None
+            cached = self._last_open_orders_snapshot_by_symbol.get(cache_key)
+            if cached is None and cache_key is not None:
+                cached = self._last_open_orders_snapshot_by_symbol.get(None)
+
+            if cached is not None:
+                self._logger.warning(
+                    "get_open_orders timed out — returning stale cached snapshot | symbol=%s timeout_seconds=%s count=%s",
+                    symbol,
+                    self._rest_config.timeout_seconds,
+                    len(cached),
+                )
+                await self._emit_event(
+                    "exchange.open_orders.snapshot_stale",
+                    {
+                        "exchange": self.EXCHANGE,
+                        "market_type": "usdm_futures",
+                        "symbol": symbol.upper() if symbol else None,
+                        "orders": cached,
+                        "count": len(cached),
+                        "snapshot_time": self._current_timestamp_ms(),
+                        "stale": True,
+                        "stale_reason": "timeout",
+                    },
+                    priority=EventPriority.HIGH,
+                )
+                return list(cached)
+
             self._logger.warning(
-                "get_open_orders timed out — returning empty snapshot | symbol=%s timeout_seconds=%s",
+                "get_open_orders timed out and no cached snapshot is available | symbol=%s timeout_seconds=%s",
                 symbol,
                 self._rest_config.timeout_seconds,
+            )
+            await self._emit_event(
+                "exchange.open_orders.snapshot_failed",
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "symbol": symbol.upper() if symbol else None,
+                    "snapshot_time": self._current_timestamp_ms(),
+                    "error": "timeout",
+                    "stale": True,
+                    "orders": None,
+                    "count": None,
+                },
+                priority=EventPriority.HIGH,
             )
             return []
 
@@ -1339,6 +1432,8 @@ class BinanceRestClient:
             for order in payload
             if isinstance(order, dict)
         ]
+        cache_key = symbol.upper() if symbol else None
+        self._last_open_orders_snapshot_by_symbol[cache_key] = list(normalized)
 
         await self._emit_event(
             "exchange.open_orders.snapshot",

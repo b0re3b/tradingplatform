@@ -1,9 +1,10 @@
 from __future__ import annotations
 from core.logger import get_logger
 
-from dataclasses import asdict, dataclass, field, is_dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping, TypeAlias
+from typing import Any, TypeAlias
 
 from analytics.funding.enums import (
     FundingBias,
@@ -195,32 +196,74 @@ def _inject_scope(
     return payload
 
 
-def _serialize_value(value: Any) -> Any:
+def _serialize_value(value: Any, *, _seen: set[int] | None = None) -> Any:
+    """
+    Safely serialize funding models/events into EventBus/storage payloads.
+
+    This helper intentionally avoids dataclasses.asdict() because asdict() performs
+    recursive deep conversion before we can protect against cycles or non-payload
+    runtime attributes. Funding events may contain nested analytics payloads,
+    FeatureSnapshot-like objects, logger references, or even accidental circular
+    dictionaries from upstream contract adapters.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
     if isinstance(value, datetime):
         return value.isoformat()
 
     if hasattr(value, "value"):
-        return value.value
+        return _serialize_value(getattr(value, "value"), _seen=_seen)
 
-    if is_dataclass(value):
-        return {
-            key: _serialize_value(item)
-            for key, item in asdict(value).items()
-        }
+    if _seen is None:
+        _seen = set()
 
-    if isinstance(value, Mapping):
-        return {
-            str(key): _serialize_value(item)
-            for key, item in value.items()
-        }
+    value_id = id(value)
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)) or (
+        is_dataclass(value) and not isinstance(value, type)
+    ):
+        if value_id in _seen:
+            return "<circular>"
+        _seen.add(value_id)
 
-    if isinstance(value, list):
-        return [_serialize_value(item) for item in value]
+    try:
+        if is_dataclass(value) and not isinstance(value, type):
+            payload: dict[str, Any] = {}
+            for item in fields(value):
+                name = item.name
+                if name in {"logger", "_logger"} or name.startswith("_analytics"):
+                    continue
+                payload[name] = _serialize_value(getattr(value, name), _seen=_seen)
+            return payload
 
-    if isinstance(value, tuple):
-        return [_serialize_value(item) for item in value]
+        if isinstance(value, Mapping):
+            payload: dict[str, Any] = {}
+            for key, item in value.items():
+                key_text = str(_serialize_value(key, _seen=_seen))
+                if key_text in {"logger", "_logger"} or key_text.startswith("_analytics"):
+                    continue
+                payload[key_text] = _serialize_value(item, _seen=_seen)
+            return payload
 
-    return value
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [_serialize_value(item, _seen=_seen) for item in value]
+
+        if hasattr(value, "to_dict") and callable(value.to_dict):
+            try:
+                return _serialize_value(value.to_dict(), _seen=_seen)
+            except Exception:
+                return str(value)
+
+        if hasattr(value, "to_payload") and callable(value.to_payload):
+            try:
+                return _serialize_value(value.to_payload(), _seen=_seen)
+            except Exception:
+                return str(value)
+
+        return value
+    finally:
+        if value_id in _seen:
+            _seen.discard(value_id)
 
 
 # =============================================================================
@@ -1386,7 +1429,7 @@ def model_to_payload(model: Any) -> dict[str, Any]:
             return dict(payload)
 
     if is_dataclass(model):
-        return _serialize_value(asdict(model))
+        return _serialize_value(model)
 
     if isinstance(model, Mapping):
         return _serialize_value(model)

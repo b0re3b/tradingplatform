@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 
 from abc import ABC
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from ..base import BaseStrategy
@@ -41,6 +43,36 @@ from ..models import (
     confidence_to_strength,
     utcnow,
 )
+
+
+@dataclass(slots=True, frozen=True)
+class StrategyRRProfile:
+    """
+    Strategy-layer risk/reward intent attached to every generated signal.
+
+    The profile is not a RiskManager decision and does not size positions. It only
+    gives SignalBuilder a strategy-owned RR intent so fallback TP generation does
+    not silently use an incompatible global default.
+    """
+
+    min_rr: float
+    base_rr: float
+    max_rr: float
+    source: str
+    target_price: float | None = None
+    stop_loss: float | None = None
+    entry_price: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "min_rr": float(self.min_rr),
+            "base_rr": float(self.base_rr),
+            "max_rr": float(self.max_rr),
+            "source": self.source,
+            "target_price": self.target_price,
+            "stop_loss": self.stop_loss,
+            "entry_price": self.entry_price,
+        }
 
 
 class StrategyMixinSupport:
@@ -158,6 +190,8 @@ class StrategySignalMixin(StrategyMixinSupport):
         signal.metadata.setdefault("timeframe", context.timeframe.value)
         signal.metadata.setdefault("setup_type", signal.setup_type.value)
         signal.metadata.setdefault("signal_id", signal.signal_id)
+
+        self.attach_rr_profile(signal=signal, context=context)
 
         signal.validate()
         return signal
@@ -316,8 +350,360 @@ class StrategySignalMixin(StrategyMixinSupport):
         signal.metadata.setdefault("stop_loss", stop_loss)
         signal.metadata.setdefault("take_profit", take_profit)
 
+        self.attach_rr_profile(
+            signal=signal,
+            context=None,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+
+        rr_profile = signal.metadata.get("rr_profile")
+        if isinstance(rr_profile, dict) and targets:
+            rr_value = rr_profile.get("base_rr")
+            if rr_value is not None:
+                try:
+                    targets[0].rr = float(rr_value)
+                except (TypeError, ValueError):
+                    pass
+
         signal.validate()
         return signal
+
+    def attach_rr_profile(
+        self,
+        *,
+        signal: StrategySignal,
+        context: StrategyContext | None = None,
+        entry_price: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+    ) -> StrategySignal:
+        """
+        Attach min/base/max RR intent to every strategy signal.
+
+        Priority:
+        1. Explicit metadata / attached trade plan prices.
+        2. Market-derived target candidates already present in StrategyContext
+           or domain metadata.
+        3. Tier-aware fallback profile.
+
+        This keeps concrete strategies as decision modules and prevents the
+        downstream SignalBuilder from falling back to an RR below the selected
+        strategy tier's minimum.
+        """
+        metadata = signal.metadata
+
+        entry = self._first_float(
+            entry_price,
+            metadata.get("entry_price"),
+            metadata.get("entry"),
+            metadata.get("entry_reference_price"),
+            metadata.get("reference_price"),
+            metadata.get("current_price"),
+            metadata.get("price"),
+            self._context_price(context),
+        )
+        stop = self._first_float(
+            stop_loss,
+            metadata.get("stop_loss"),
+            metadata.get("invalidation_price"),
+            metadata.get("invalid_price"),
+            metadata.get("invalidation", {}).get("price") if isinstance(metadata.get("invalidation"), dict) else None,
+        )
+        target = self._first_float(
+            take_profit,
+            metadata.get("take_profit"),
+            metadata.get("target_price"),
+            metadata.get("primary_target"),
+            metadata.get("expected_target"),
+        )
+
+        tier_value = self._enum_value(metadata.get("tier"))
+        min_rr = self._first_float(
+            metadata.get("min_rr"),
+            metadata.get("minimum_rr"),
+            metadata.get("required_rr"),
+            metadata.get("risk_reward_min"),
+            self._tier_min_rr(tier_value),
+            default=1.8,
+        )
+        if min_rr is None or min_rr <= 0:
+            min_rr = 1.8
+
+        configured_base = self._first_float(
+            metadata.get("base_rr"),
+            metadata.get("rr"),
+            metadata.get("risk_reward"),
+            metadata.get("risk_reward_ratio"),
+            getattr(getattr(self, "config", None), "default_rr_ratio", None),
+            default=min_rr,
+        )
+        if configured_base is None or configured_base <= 0:
+            configured_base = min_rr
+
+        max_candidate = self._max_possible_rr(
+            signal=signal,
+            context=context,
+            entry_price=entry,
+            stop_loss=stop,
+            explicit_target=target,
+        )
+
+        if max_candidate is not None and max_candidate > 0:
+            max_rr = max(float(max_candidate), float(min_rr))
+            base_rr = min(max(float(configured_base), float(min_rr)), max_rr)
+            source = "market_target"
+        else:
+            max_rr = max(float(configured_base), float(min_rr))
+            base_rr = max(float(configured_base), float(min_rr))
+            source = "tier_fallback"
+
+        profile = StrategyRRProfile(
+            min_rr=float(min_rr),
+            base_rr=float(base_rr),
+            max_rr=float(max_rr),
+            source=source,
+            target_price=target,
+            stop_loss=stop,
+            entry_price=entry,
+        )
+
+        metadata["rr_profile"] = profile.to_dict()
+        metadata["min_rr"] = float(profile.min_rr)
+        metadata["base_rr"] = float(profile.base_rr)
+        metadata["max_rr"] = float(profile.max_rr)
+        metadata["rr"] = float(profile.base_rr)
+        metadata.setdefault("rr_source", profile.source)
+
+        if target is not None:
+            metadata.setdefault("target_price", target)
+        if entry is not None:
+            metadata.setdefault("entry_price", entry)
+        if stop is not None:
+            metadata.setdefault("stop_loss", stop)
+
+        return signal
+
+    def _max_possible_rr(
+        self,
+        *,
+        signal: StrategySignal,
+        context: StrategyContext | None,
+        entry_price: float | None,
+        stop_loss: float | None,
+        explicit_target: float | None,
+    ) -> float | None:
+        if entry_price is None or stop_loss is None:
+            return None
+
+        risk_distance = abs(float(entry_price) - float(stop_loss))
+        if risk_distance <= 0:
+            return None
+
+        candidates: list[tuple[float, str]] = []
+        if explicit_target is not None:
+            candidates.append((float(explicit_target), "explicit"))
+
+        candidates.extend(self._rr_target_candidates(signal.metadata))
+        if context is not None:
+            candidates.extend(self._rr_target_candidates(getattr(context, "features", None)))
+            # StrategyContext implementations expose domain data differently
+            # across packages; use common accessors without requiring a specific
+            # context internals contract.
+            for source in FeatureSource:
+                try:
+                    domain = context.domain_dict(source)
+                except Exception:
+                    continue
+                candidates.extend(self._rr_target_candidates(domain))
+
+        best: float | None = None
+        for price, _source in candidates:
+            rr = self._calculate_rr(
+                side=signal.side,
+                entry_price=float(entry_price),
+                stop_loss=float(stop_loss),
+                target_price=price,
+            )
+            if rr is None or rr <= 0:
+                continue
+            best = rr if best is None else max(best, rr)
+
+        return best
+
+    @classmethod
+    def _rr_target_candidates(cls, value: Any) -> list[tuple[float, str]]:
+        candidates: list[tuple[float, str]] = []
+        cls._collect_rr_target_candidates(value, candidates, path="")
+        return candidates
+
+    @classmethod
+    def _collect_rr_target_candidates(
+        cls,
+        value: Any,
+        candidates: list[tuple[float, str]],
+        *,
+        path: str,
+        depth: int = 0,
+    ) -> None:
+        if value is None or depth > 5:
+            return
+
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_s = str(key)
+                child_path = f"{path}.{key_s}" if path else key_s
+                if cls._looks_like_target_price_key(key_s):
+                    item_f = cls._safe_float(item)
+                    if item_f is not None and item_f > 0:
+                        candidates.append((item_f, child_path))
+                cls._collect_rr_target_candidates(item, candidates, path=child_path, depth=depth + 1)
+            return
+
+        if isinstance(value, (list, tuple, set)):
+            for index, item in enumerate(value):
+                cls._collect_rr_target_candidates(item, candidates, path=f"{path}[{index}]", depth=depth + 1)
+            return
+
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                cls._collect_rr_target_candidates(to_dict(), candidates, path=path, depth=depth + 1)
+            except Exception:
+                return
+
+    @staticmethod
+    def _looks_like_target_price_key(key: str) -> bool:
+        normalized = key.lower().strip()
+        if not normalized:
+            return False
+        positive_tokens = (
+            "take_profit",
+            "target_price",
+            "primary_target",
+            "secondary_target",
+            "final_target",
+            "expected_target",
+            "liquidity_target",
+            "sweep_target",
+            "reversion_target",
+            "breakout_target",
+            "continuation_target",
+            "fair_value",
+            "vwap",
+            "poc",
+            "value_area_high",
+            "value_area_low",
+            "swing_high",
+            "swing_low",
+            "resistance",
+            "support",
+        )
+        negative_tokens = (
+            "stop",
+            "invalidation",
+            "entry",
+            "mark_price",
+            "index_price",
+            "last_price",
+            "current_price",
+        )
+        return any(token in normalized for token in positive_tokens) and not any(
+            token in normalized for token in negative_tokens
+        )
+
+    @staticmethod
+    def _calculate_rr(
+        *,
+        side: SignalSide,
+        entry_price: float,
+        stop_loss: float,
+        target_price: float,
+    ) -> float | None:
+        risk_distance = abs(entry_price - stop_loss)
+        if risk_distance <= 0:
+            return None
+
+        if side == SignalSide.LONG:
+            reward_distance = target_price - entry_price
+        elif side == SignalSide.SHORT:
+            reward_distance = entry_price - target_price
+        else:
+            return None
+
+        if reward_distance <= 0:
+            return None
+        return reward_distance / risk_distance
+
+    @classmethod
+    def _first_float(cls, *values: Any, default: float | None = None) -> float | None:
+        for value in values:
+            value_f = cls._safe_float(value)
+            if value_f is not None:
+                return value_f
+        return default
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, Enum):
+            value = value.value
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value_f
+
+    @staticmethod
+    def _enum_value(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, Enum):
+            return str(value.value)
+        return str(value)
+
+    @staticmethod
+    def _tier_min_rr(tier: str | None) -> float | None:
+        if tier is None:
+            return None
+        normalized = tier.lower().strip()
+        # Keep this map strategy-local. RiskManager remains the source of truth;
+        # these values are used only to keep strategy fallback RR compatible with
+        # the default risk tier profiles.
+        return {
+            "t0": 1.0,
+            "t1": 1.2,
+            "t2": 1.8,
+            "t3": 2.2,
+            "t4": 2.8,
+            "scalp": 1.2,
+            "base": 1.8,
+            "standard": 1.8,
+            "swing": 2.2,
+            "high_conviction": 2.8,
+        }.get(normalized)
+
+    @staticmethod
+    def _context_price(context: StrategyContext | None) -> float | None:
+        if context is None:
+            return None
+        for attr in ("price", "current_price", "last_price", "mark_price"):
+            value = getattr(context, attr, None)
+            value_f = StrategySignalMixin._safe_float(value)
+            if value_f is not None:
+                return value_f
+        try:
+            for key in ("price", "current_price", "last_price", "mark_price"):
+                value_f = StrategySignalMixin._safe_float(context.get_feature(key))
+                if value_f is not None:
+                    return value_f
+        except Exception:
+            return None
+        return None
 
     @staticmethod
     def _normalize_unit_interval(value: float, field_name: str) -> float:

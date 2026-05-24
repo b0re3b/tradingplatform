@@ -12,6 +12,7 @@ _EXPORTS: dict[str, str] = {
     "StrategySignalMixin": ".base_strategy",
     "StrategyValidationMixin": ".base_strategy",
     "StrategyRiskRewardMixin": ".base_strategy",
+    "StrategyRRProfile": ".base_strategy",
 
     # Orderflow
     "CvdDivergenceStrategy": ".orderflow",
@@ -108,6 +109,7 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:
     from .base_strategy import (
         StrategyRiskRewardMixin,
+        StrategyRRProfile,
         StrategySignalMixin,
         StrategyValidationMixin,
         TradingStrategy,

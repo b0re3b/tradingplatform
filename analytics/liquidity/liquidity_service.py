@@ -1205,6 +1205,30 @@ class LiquidityService:
             payload = cluster.to_event_payload()
             payload.update(self._scope_payload(context))
 
+            snapshot_payload = snapshot.to_event_payload()
+
+            payload.setdefault("current_price", snapshot.current_price)
+            payload.setdefault("last_price", snapshot.current_price)
+            payload.setdefault("reference_price", snapshot.current_price)
+            payload.setdefault("entry_reference_price", snapshot.current_price)
+            payload.setdefault("price", snapshot.current_price)
+            payload.setdefault("price_source", "liquidity_snapshot.current_price")
+            payload.setdefault(
+                "price_timestamp",
+                snapshot.timestamp.isoformat() if snapshot.timestamp else None,
+            )
+
+            payload.setdefault("snapshot", snapshot_payload)
+            payload.setdefault("liquidity_snapshot", snapshot_payload)
+            payload.setdefault("liquidity_map_snapshot", snapshot_payload)
+            payload.setdefault("map_snapshot", snapshot_payload)
+
+            payload.setdefault("stop_cluster", cluster.to_event_payload())
+            payload.setdefault("cluster", cluster.to_event_payload())
+            payload.setdefault("clusters", [cluster.to_event_payload()])
+            payload.setdefault("stop_clusters", [cluster.to_event_payload()])
+            payload.setdefault("liquidity_clusters", [cluster.to_event_payload()])
+
             accepted = await self._safe_emit(
                 topic=self._config.stop_cluster_detected_topic,
                 payload=payload,

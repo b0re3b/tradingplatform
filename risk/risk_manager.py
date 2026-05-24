@@ -1334,12 +1334,100 @@ class RiskManager:
 
     async def _handle_scheduler_job_failed(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}
-        job_name = payload.get("job_name", "unknown")
+        job_name = self._scheduler_job_name_from_payload(payload)
+
+        if self._should_ignore_scheduler_failure(job_name):
+            self._logger.info(
+                "Ignoring non-trading scheduler failure | job_name=%s",
+                job_name,
+                extra={
+                    "job_name": job_name,
+                    "reason": payload.get("reason") or payload.get("error"),
+                    "risk_action": "ignored",
+                },
+            )
+            return
+
+        if not self._is_critical_scheduler_failure(job_name):
+            self._logger.warning(
+                "Scheduler job failed but is not trading-critical | job_name=%s",
+                job_name,
+                extra={
+                    "job_name": job_name,
+                    "reason": payload.get("reason") or payload.get("error"),
+                    "risk_action": "not_promoted_to_halt",
+                },
+            )
+            return
 
         await self.on_execution_failure(
-            message=f"Scheduler job failed: {job_name}",
+            message=f"Trading-critical scheduler job failed: {job_name}",
             reason=CircuitBreakerReason.SYSTEM_ERROR_RATE,
         )
+
+    def _scheduler_job_name_from_payload(self, payload: dict[str, Any]) -> str:
+        for key in ("job_name", "name", "title", "job_id", "id"):
+            value = payload.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        return "unknown"
+
+    def _should_ignore_scheduler_failure(self, job_name: str) -> bool:
+        circuit_cfg = getattr(self._config, "circuit_breaker", None)
+        patterns = getattr(circuit_cfg, "scheduler_failure_ignored_jobs", ()) or ()
+        return self._job_name_matches_any(job_name, patterns)
+
+    def _is_critical_scheduler_failure(self, job_name: str) -> bool:
+        circuit_cfg = getattr(self._config, "circuit_breaker", None)
+
+        if circuit_cfg is not None and not bool(
+            getattr(circuit_cfg, "trigger_on_scheduler_job_failure", True)
+        ):
+            return False
+
+        patterns = getattr(circuit_cfg, "scheduler_failure_critical_jobs", ()) or ()
+        if not patterns:
+            return False
+
+        return self._job_name_matches_any(job_name, patterns)
+
+    @staticmethod
+    def _job_name_matches_any(job_name: str, patterns: Any) -> bool:
+        normalized = str(job_name or "").strip().lower()
+        if not normalized:
+            return False
+
+        if isinstance(patterns, str):
+            raw_patterns = (patterns,)
+        else:
+            try:
+                raw_patterns = tuple(patterns)
+            except TypeError:
+                raw_patterns = ()
+
+        for raw_pattern in raw_patterns:
+            pattern = str(raw_pattern or "").strip().lower()
+            if not pattern:
+                continue
+
+            if pattern == "*":
+                return True
+
+            if pattern.endswith("*") and normalized.startswith(pattern[:-1]):
+                return True
+
+            # Treat trailing dots as namespace prefixes: "news." matches
+            # "news.collect" and "news_ai_service." matches
+            # "news_ai_service.collect".
+            if pattern.endswith(".") and normalized.startswith(pattern):
+                return True
+
+            if normalized == pattern or normalized.startswith(pattern):
+                return True
+
+        return False
 
     async def _handle_manual_halt(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}

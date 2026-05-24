@@ -773,6 +773,8 @@ def extract_volume_delta(value: Any) -> float:
                 "volume_delta",
                 "volume_delta.volume_delta",
                 "delta.volume_delta",
+                "volume_delta.delta_ratio",  # <-- додати
+                "delta.delta_ratio",  # <-- додати
             ),
             default=0.0,
         ),

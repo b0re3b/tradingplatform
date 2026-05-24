@@ -1,15 +1,14 @@
 from __future__ import annotations
-from core.logger import get_logger
 
 import inspect
 import math
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Protocol
 
+from analytics.market_state_contract import build_state_backed_cache_bundle
 from core.event_bus import Event, EventBus, EventPriority, Subscription
+from core.logger import get_logger
 from core.scheduler import Scheduler
-from analytics.market_state_contract import build_state_backed_cache_bundle, MarketStateSnapshotSource
-
 from .base import BaseSpoofingAnalyzer
 from .config import SpoofingConfig
 from .enums import SpoofingComponent, SpoofingSide, SpoofingStatus
@@ -371,7 +370,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 "input_mode": "market_state",
                 "input_topics": list(self.config.production_source_topics),
                 "orderbook_cache_attached": self.orderbook_cache is not None,
-                "market_state_store_attached": self.market_state_store is not None,
+                "market_state_store_attached": self._market_state_store is not None,
                 "publish_updates": self.config.analyzer.publish_updates,
                 "publish_detected_only": self.config.analyzer.publish_detected_only,
                 "scope": "exchange:market_type:symbol:timeframe",

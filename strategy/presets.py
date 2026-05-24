@@ -912,6 +912,7 @@ WHALES_STRATEGIES: StrategyNames = (
     "whale_accumulation",
     "whale_distribution",
     "whale_liquidation_reversal",
+    "whale_large_trade",
 )
 
 HYBRID_STRATEGIES: StrategyNames = (
@@ -945,6 +946,7 @@ SCALPING_STRATEGIES: StrategyNames = (
     "whale_absorption",
     "whale_breakout",
     "liquidity_orderflow_reversal",
+    "whale_liquidation_reversal",
 )
 
 INTRADAY_STRATEGIES: StrategyNames = (
