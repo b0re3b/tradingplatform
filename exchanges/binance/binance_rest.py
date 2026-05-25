@@ -32,6 +32,35 @@ class BinanceSymbolUnavailableError(Exception):
         super().__init__(f"Binance symbol unavailable | code={code} symbol={symbol} message={message}")
 
 
+class BinanceNonRetryableRequestError(RuntimeError):
+    """Raised for Binance request errors that must never be retried.
+
+    Examples: precision/filter/min-notional/order-would-trigger errors.
+    Retrying these only delays execution and can keep risk reservations open
+    without any chance of success.
+    """
+
+    def __init__(
+        self,
+        *,
+        method: str,
+        path: str,
+        status: int | None,
+        code: int | None,
+        message: str,
+    ) -> None:
+        self.method = method
+        self.path = path
+        self.status = status
+        self.code = code
+        self.message = message
+        status_part = f" status={status}" if status is not None else ""
+        super().__init__(
+            f"Binance Futures REST error | method={method} path={path}"
+            f"{status_part} code={code} message={message}"
+        )
+
+
 @dataclass(slots=True)
 class BinanceFuturesRestClientConfig:
     """
@@ -62,6 +91,26 @@ class BinanceFuturesRestClientConfig:
     resync_time_error_codes: tuple[int, ...] = (-1021,)
     request_retries: int = 2
     retry_delay_seconds: float = 0.25
+
+    # Trading POST /fapi/v1/order must be fail-fast. Retrying a create-order
+    # timeout can create duplicate uncertainty, and retrying validation errors
+    # such as -1111 can never succeed without changing the request.
+    order_request_timeout_seconds: float = 5.0
+    order_request_retries: int = 0
+
+    # Binance validation/business errors that are not transient.
+    # They should propagate immediately to execution.OrderManager, which emits
+    # execution.order_rejected and releases the risk reservation.
+    non_retryable_error_codes: tuple[int, ...] = (
+        -1111,  # Precision is over the maximum defined for this asset.
+        -1013,  # Filter failure / invalid quantity / invalid price.
+        -2019,  # Margin is insufficient.
+        -2021,  # Order would immediately trigger.
+        -4003,
+        -4014,
+        -4023,
+        -4164,  # Min notional.
+    )
 
     emit_success_events: bool = False
     emit_error_events: bool = True
@@ -167,6 +216,18 @@ class BinanceFuturesRestClientConfig:
             resync_time_error_codes=defaults.resync_time_error_codes,
             request_retries=cls._env_int("BINANCE_REQUEST_RETRIES", "EXCHANGE_REQUEST_RETRIES", default=defaults.request_retries),
             retry_delay_seconds=cls._env_float("BINANCE_RETRY_DELAY_SECONDS", "EXCHANGE_RETRY_DELAY_SECONDS", default=defaults.retry_delay_seconds),
+            order_request_timeout_seconds=cls._env_float(
+                "BINANCE_ORDER_TIMEOUT_SECONDS",
+                "BINANCE_CREATE_ORDER_TIMEOUT_SECONDS",
+                "EXECUTION_ORDER_TIMEOUT_SECONDS",
+                default=defaults.order_request_timeout_seconds,
+            ),
+            order_request_retries=cls._env_int(
+                "BINANCE_ORDER_REQUEST_RETRIES",
+                "BINANCE_CREATE_ORDER_RETRIES",
+                "EXECUTION_ORDER_REQUEST_RETRIES",
+                default=defaults.order_request_retries,
+            ),
             emit_success_events=cls._env_bool("BINANCE_EMIT_SUCCESS_EVENTS", default=defaults.emit_success_events),
             emit_error_events=cls._env_bool("BINANCE_EMIT_ERROR_EVENTS", default=defaults.emit_error_events),
             allow_private_read_without_credentials=cls._env_bool(
@@ -221,6 +282,7 @@ class BinanceFuturesRestClientConfig:
                 "BINANCE_DERIVATIVE_SYMBOL_BLOCKLIST",
                 default=defaults.derivative_symbol_blocklist,
             ),
+            non_retryable_error_codes=defaults.non_retryable_error_codes,
         )
 
     @staticmethod
@@ -1654,6 +1716,9 @@ class BinanceRestClient:
             params=params,
             signed=True,
             auth_required=True,
+            timeout_seconds=self._rest_config.order_request_timeout_seconds,
+            request_retries=self._rest_config.order_request_retries,
+            retry_delay_seconds=self._rest_config.retry_delay_seconds,
         )
 
         normalized = self._normalize_order(payload)
@@ -1866,6 +1931,47 @@ class BinanceRestClient:
 
         return normalized
 
+    async def get_position_mode(
+        self,
+        *,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Read current Binance USD-M account position mode.
+
+        Returns:
+        - dual_side_position=False -> One-way mode
+        - dual_side_position=True  -> Hedge mode
+        """
+        payload = await self._request(
+            method="GET",
+            path="/fapi/v1/positionSide/dual",
+            params={
+                "recvWindow": recv_window or self._rest_config.recv_window,
+            },
+            signed=True,
+            auth_required=True,
+        )
+
+        raw_dual = payload.get("dualSidePosition")
+        dual_side_position = str(raw_dual).strip().lower() in {"true", "1", "yes", "on"}
+
+        normalized = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "dual_side_position": dual_side_position,
+            "raw_dual_side_position": raw_dual,
+            "timestamp": self._current_timestamp_ms(),
+        }
+
+        await self._emit_event(
+            "exchange.position_mode.snapshot",
+            normalized,
+            priority=EventPriority.LOW,
+        )
+
+        return normalized
+
     # ------------------------------------------------------------------
     # Endpoint routing helpers
     # ------------------------------------------------------------------
@@ -2006,6 +2112,32 @@ class BinanceRestClient:
                                 symbol=symbol_hint,
                             )
 
+                        if (
+                            isinstance(error_code, int)
+                            and error_code in self._rest_config.non_retryable_error_codes
+                        ):
+                            await self._handle_http_error(
+                                method=method,
+                                path=path,
+                                status=response.status,
+                                error_payload=error_payload,
+                            )
+                            self._logger.error(
+                                "Binance Futures REST non-retryable error | method=%s path=%s status=%s code=%s message=%s",
+                                method,
+                                path,
+                                response.status,
+                                error_code,
+                                error_payload.get("message"),
+                            )
+                            raise BinanceNonRetryableRequestError(
+                                method=method,
+                                path=path,
+                                status=response.status,
+                                code=error_code,
+                                message=str(error_payload.get("message") or ""),
+                            )
+
                         await self._handle_http_error(
                             method=method,
                             path=path,
@@ -2058,6 +2190,27 @@ class BinanceRestClient:
                                 symbol=symbol_hint,
                             )
 
+                        if code_i in self._rest_config.non_retryable_error_codes:
+                            await self._handle_business_error(
+                                method=method,
+                                path=path,
+                                payload=payload,
+                            )
+                            self._logger.error(
+                                "Binance Futures REST non-retryable business error | method=%s path=%s code=%s message=%s",
+                                method,
+                                path,
+                                code_i,
+                                payload.get("msg") or payload.get("message"),
+                            )
+                            raise BinanceNonRetryableRequestError(
+                                method=method,
+                                path=path,
+                                status=None,
+                                code=code_i,
+                                message=str(payload.get("msg") or payload.get("message") or ""),
+                            )
+
                         await self._handle_business_error(
                             method=method,
                             path=path,
@@ -2104,6 +2257,9 @@ class BinanceRestClient:
             except BinanceSymbolUnavailableError:
                 # Never retry — propagate immediately so callers can disable the symbol.
                 raise
+            except BinanceNonRetryableRequestError:
+                # Never retry validation/business errors such as -1111/-1013.
+                raise
             except asyncio.TimeoutError as exc:
                 last_error = exc
                 self._logger.warning(
@@ -2120,7 +2276,7 @@ class BinanceRestClient:
             except Exception as exc:
                 last_error = exc
 
-                if attempt >= self._rest_config.request_retries:
+                if attempt >= effective_retries:
                     self._logger.exception(
                         "Binance Futures REST request failed | method=%s path=%s attempts=%s",
                         method,

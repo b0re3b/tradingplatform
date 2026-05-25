@@ -233,7 +233,7 @@ class RiskManager:
                     name="risk_on_signal_generated",
                 ),
                 self._event_bus.subscribe(
-                    "account.*",
+                    "exchange.account.*",
                     self._handle_account_event,
                     name="risk_on_account_event",
                 ),
@@ -649,18 +649,44 @@ class RiskManager:
             symbol_multiplier=symbol_multiplier,
         )
 
-        risk_amount = risk_unit_snapshot.effective_risk_unit * tier_profile.risk_units
+        effective_risk_unit = float(
+            getattr(risk_unit_snapshot, "effective_risk_unit", 0.0) or 0.0
+        )
+        tier_risk_units = float(getattr(tier_profile, "risk_units", 0.0) or 0.0)
+        risk_amount = effective_risk_unit * tier_risk_units
 
-        if risk_amount <= 0 and self._order_increases_risk(request.order_intent):
+        # Opening/increasing orders must have a strictly positive effective risk
+        # amount.  A zero value usually means account equity was never
+        # initialized, especially when RiskUnitConfig.use_equity_for_r=True and
+        # exchange.account.updated / paper account bootstrap has not populated
+        # RiskState yet.  Do not apply this guard to reduce/close/protective
+        # intents: those may intentionally carry zero new open risk.
+        if self._order_increases_risk(request.order_intent) and (
+                not math.isfinite(risk_amount) or risk_amount <= 0.0
+        ):
+            state_equity = float(getattr(self._state, "equity", 0.0) or 0.0)
+            use_equity_for_r = bool(getattr(self._config.risk_unit, "use_equity_for_r", False))
+
+            if use_equity_for_r and state_equity <= 0.0:
+                reason = "Risk equity is zero; account state was not initialized"
+            elif effective_risk_unit <= 0.0:
+                reason = "Effective risk unit is zero"
+            elif tier_risk_units <= 0.0:
+                reason = "Tier risk units are zero"
+            else:
+                reason = "Effective risk amount is zero"
+
             decision = RiskDecision(
                 allowed=False,
                 decision=RiskDecisionType.DENY,
                 final_size=None,
                 final_leverage=final_leverage,
                 final_tier=tier_profile.final_tier,
-                final_risk_amount=risk_amount,
+                final_risk_amount=0.0,
+                final_margin=None,
+                final_notional=None,
                 risk_mode=self._state.risk_mode,
-                reason="Effective risk amount is zero",
+                reason=reason,
                 symbol=request.symbol,
                 side=request.side,
                 signal_id=request.signal_id,
@@ -668,7 +694,41 @@ class RiskManager:
                 order_intent=request.order_intent,
                 **RiskManager._pass_through_from_request(request),
                 violations=self._collect_violations(checks),
-                metadata=RiskManager._metadata_for_decision(request),
+                metadata=RiskManager._metadata_for_decision(
+                    request,
+                    risk_metadata={
+                        "zero_risk_guard": {
+                            "reason": reason,
+                            "risk_amount": risk_amount,
+                            "effective_risk_unit": effective_risk_unit,
+                            "tier_risk_units": tier_risk_units,
+                            "risk_amount_formula": "effective_risk_unit * tier_risk_units",
+                            "order_intent": request.order_intent.value,
+                        },
+                        "risk_unit_snapshot": risk_unit_snapshot,
+                        "tier_profile": tier_profile,
+                        "risk_state": {
+                            "balance": self._state.balance,
+                            "equity": self._state.equity,
+                            "free_balance": self._state.free_balance,
+                            "used_margin": self._state.used_margin,
+                            "risk_mode": (
+                                self._state.risk_mode.value
+                                if isinstance(self._state.risk_mode, Enum)
+                                else self._state.risk_mode
+                            ),
+                        },
+                        "risk_unit_config": {
+                            "use_equity_for_r": use_equity_for_r,
+                            "base_risk_unit_pct": getattr(
+                                self._config.risk_unit, "base_risk_unit_pct", None
+                            ),
+                            "min_risk_unit": getattr(
+                                self._config.risk_unit, "min_risk_unit", None
+                            ),
+                        },
+                    },
+                ),
                 checks=checks,
             )
             return finalize(decision)
@@ -1143,36 +1203,73 @@ class RiskManager:
         topic = getattr(event, "topic", "")
         payload = getattr(event, "payload", {}) or {}
 
-        if topic == "account.balance_updated":
+        # ── Повний snapshot акаунту від get_account_info() ───────────────────
+        # binance_rest емітує "exchange.account.updated" з ключами Binance API
+        # (total_wallet_balance, total_margin_balance, available_balance, …).
+        # Попередня версія читала "balance"/"equity"/… — ці ключі відсутні
+        # у payload і завжди давали None.
+        if topic in {"exchange.account.updated", "exchange.account.snapshot"}:
+            skipped = payload.get("skipped", False)
+            if skipped:
+                self._logger.debug(
+                    "Ignoring skipped exchange.account event | skip_reason=%s",
+                    payload.get("skip_reason"),
+                )
+                return
+            await self.on_account_update(
+                balance=self._to_float_or_none(payload.get("total_wallet_balance")),
+                equity=self._to_float_or_none(payload.get("total_margin_balance")),
+                free_balance=self._to_float_or_none(payload.get("available_balance")),
+                used_margin=self._to_float_or_none(payload.get("total_initial_margin")),
+                unrealized_pnl=self._to_float_or_none(payload.get("total_unrealized_profit")),
+                # realized_pnl — Binance /fapi/v2/account не повертає це поле
+            )
+            return
+
+        # ── Snapshot балансів по активах від get_balance() ───────────────────
+        # binance_rest емітує "exchange.account.balance.snapshot" зі списком
+        # {"balances": [{asset, balance, available_balance, …}, …]}.
+        # Попередньо цей топік не оброблявся взагалі.
+        if topic == "exchange.account.balance.snapshot":
+            skipped = payload.get("skipped", False)
+            if skipped:
+                return
+            balances: list[dict[str, Any]] = payload.get("balances") or []
+            usdt = next(
+                (b for b in balances if isinstance(b, dict) and b.get("asset") == "USDT"),
+                None,
+            )
+            if usdt is not None:
+                await self.on_account_update(
+                    balance=self._to_float_or_none(usdt.get("balance")),
+                    free_balance=self._to_float_or_none(usdt.get("available_balance")),
+                )
+            return
+
+        # ── Гранулярні топіки для WebSocket / інших адаптерів ────────────────
+        # binance_rest НЕ емітує ці топіки (він використовує крапку, а не
+        # underscore). Але інші адаптери (WS-стрім, mock) можуть їх емітувати,
+        # тому handlers залишаємо — вони нешкідливі і розширюють сумісність.
+        if topic == "exchange.account.balance_updated":
             await self.on_account_update(
                 balance=self._to_float_or_none(payload.get("balance")),
                 free_balance=self._to_float_or_none(payload.get("free_balance")),
             )
             return
 
-        if topic == "account.equity_updated":
+        if topic == "exchange.account.equity_updated":
             await self.on_account_update(
                 equity=self._to_float_or_none(payload.get("equity")),
                 unrealized_pnl=self._to_float_or_none(payload.get("unrealized_pnl")),
             )
             return
 
-        if topic == "account.margin_updated":
+        if topic == "exchange.account.margin_updated":
             await self.on_account_update(
                 used_margin=self._to_float_or_none(payload.get("used_margin")),
                 free_balance=self._to_float_or_none(payload.get("free_balance")),
             )
             return
-
-        if topic in {"account.updated", "account.snapshot"}:
-            await self.on_account_update(
-                balance=self._to_float_or_none(payload.get("balance")),
-                equity=self._to_float_or_none(payload.get("equity")),
-                free_balance=self._to_float_or_none(payload.get("free_balance")),
-                used_margin=self._to_float_or_none(payload.get("used_margin")),
-                realized_pnl=self._to_float_or_none(payload.get("realized_pnl")),
-                unrealized_pnl=self._to_float_or_none(payload.get("unrealized_pnl")),
-            )
 
     async def _handle_position_opened(self, event: Any) -> None:
         payload = getattr(event, "payload", {}) or {}

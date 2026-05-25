@@ -125,6 +125,13 @@ class BinanceOrderClientProtocol(Protocol):
     ) -> list[dict[str, Any]]:
         ...
 
+    async def get_position_mode(
+        self,
+        *,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        ...
+
 
 @dataclass(slots=True)
 class BinanceSymbolRules:
@@ -253,64 +260,6 @@ def _is_non_retryable_order_error(error: BaseException) -> bool:
     return code in _NON_RETRYABLE_BINANCE_CODES
 
 
-_RETRYABLE_ERROR_CLASS_NAMES: set[str] = {
-    "TimeoutError",
-    "ServerTimeoutError",
-    "ClientTimeout",
-    "ClientConnectionError",
-    "ClientConnectorError",
-    "ClientOSError",
-    "ServerDisconnectedError",
-    "ConnectionResetError",
-    "ConnectionError",
-    "OSError",
-}
-
-
-def _error_class_names(error: BaseException) -> set[str]:
-    names: set[str] = set()
-    current: type[BaseException] | None = type(error)
-    for cls in current.__mro__:
-        names.add(cls.__name__)
-    return names
-
-
-def _is_timeout_error(error: BaseException) -> bool:
-    return isinstance(error, asyncio.TimeoutError) or "TimeoutError" in _error_class_names(error)
-
-
-def _is_retryable_exchange_error(error: BaseException) -> bool:
-    if isinstance(error, NonRetryableOrderSubmitError) or _is_non_retryable_order_error(error):
-        return False
-
-    names = _error_class_names(error)
-    if names & _RETRYABLE_ERROR_CLASS_NAMES:
-        return True
-
-    text = str(error).lower()
-    retryable_markers = (
-        "timeout",
-        "temporarily unavailable",
-        "connection reset",
-        "connection refused",
-        "server disconnected",
-        "too many requests",
-        "429",
-        " 5",
-        "status=5",
-        "status 5",
-        "http 5",
-    )
-    return any(marker in text for marker in retryable_markers)
-
-
-def _compact_error(error: BaseException) -> str:
-    text = str(error).strip()
-    if text:
-        return f"{type(error).__name__}: {text}"
-    return type(error).__name__
-
-
 class OrderManager:
     """
     Binance USD-M Futures order bridge.
@@ -370,6 +319,8 @@ class OrderManager:
 
         self._symbol_rules_by_symbol: dict[str, BinanceSymbolRules] = {}
         self._symbol_rules_lock = asyncio.Lock()
+        self._position_mode_by_exchange: dict[str, bool] = {}
+        self._position_mode_lock = asyncio.Lock()
 
         self._stats = OrderManagerStats()
         self._running = False
@@ -624,23 +575,10 @@ class OrderManager:
         try:
             normalized_request = await self._normalize_order_request_for_exchange(request, client)
 
-            try:
-                payload = await self._with_retries(
-                    operation=lambda: client.create_order(**normalized_request.to_binance_params()),
-                    retries=self._config.submit_retries,
-                    retry_delay_seconds=self._config.retry_delay_seconds,
-                    operation_name="create_order",
-                )
-            except Exception as exc:
-                if _is_retryable_exchange_error(exc):
-                    reconciled = await self._reconcile_after_ambiguous_submit(
-                        request=normalized_request,
-                        client=client,
-                        cause=exc,
-                    )
-                    if reconciled is not None:
-                        return reconciled
-                raise
+            payload = await self._submit_create_order_with_mode_recovery(
+                normalized_request,
+                client,
+            )
 
             result = OrderResult.from_exchange_order(payload, request=normalized_request)
 
@@ -693,30 +631,24 @@ class OrderManager:
                 )
                 raise OrderSubmitError(f"Order rejected by exchange: {exc}") from exc
 
-            self._stats.register_failure(_compact_error(exc))
-
-            if _is_retryable_exchange_error(exc):
-                self._logger.warning(
-                    "Order submit failed after retry/reconcile | symbol=%s client_order_id=%s error=%s",
-                    request.symbol,
-                    request.client_order_id,
-                    _compact_error(exc),
-                )
-            else:
-                self._logger.exception(
-                    "Order submit failed | symbol=%s client_order_id=%s",
-                    request.symbol,
-                    request.client_order_id,
-                )
-
-            await self._emit_order_failed_from_request(
-                request,
-                reason=_compact_error(exc),
-                stage="submit",
-                retryable=_is_retryable_exchange_error(exc),
+            self._stats.register_failure(str(exc))
+            self._logger.exception(
+                "Order submit failed | symbol=%s client_order_id=%s",
+                request.symbol,
+                request.client_order_id,
             )
 
-            raise OrderSubmitError(f"Failed to submit order: {_compact_error(exc)}") from exc
+            await self._emit_event(
+                "execution.order_failed",
+                {
+                    **request.to_event_payload(),
+                    "error": str(exc),
+                    "failure_stage": "submit",
+                },
+                priority=EventPriority.CRITICAL,
+            )
+
+            raise OrderSubmitError(f"Failed to submit order: {exc}") from exc
 
     async def cancel_order(
         self,
@@ -1307,12 +1239,20 @@ class OrderManager:
         self,
         request: OrderRequest,
         client: BinanceOrderClientProtocol,
+        *,
+        force_refresh_position_mode: bool = False,
     ) -> OrderRequest:
         """Normalize quantity/price fields to Binance symbol filters before REST submit."""
         request.validate()
 
         if normalize_exchange(request.exchange) != "binance":
             return request
+
+        await self._normalize_position_side_for_account_mode(
+            request,
+            client,
+            force_refresh=force_refresh_position_mode,
+        )
 
         rules = await self._get_symbol_rules(client, request.symbol)
         original = {
@@ -1376,6 +1316,146 @@ class OrderManager:
             },
         )
         return request
+
+    async def _submit_create_order_with_mode_recovery(
+        self,
+        request: OrderRequest,
+        client: BinanceOrderClientProtocol,
+    ) -> dict[str, Any]:
+        try:
+            return await self._with_retries(
+                operation=lambda: client.create_order(**request.to_binance_params()),
+                retries=0,
+                retry_delay_seconds=self._config.retry_delay_seconds,
+                operation_name="create_order",
+            )
+        except Exception as exc:
+            if _extract_binance_error_code(exc) != -4061:
+                raise
+
+            self._logger.warning(
+                "Binance position mode mismatch detected; refreshing account mode and retrying once | symbol=%s client_order_id=%s error=%s",
+                request.symbol,
+                request.client_order_id,
+                str(exc),
+            )
+            await self._normalize_position_side_for_account_mode(
+                request,
+                client,
+                force_refresh=True,
+            )
+            return await self._with_retries(
+                operation=lambda: client.create_order(**request.to_binance_params()),
+                retries=0,
+                retry_delay_seconds=self._config.retry_delay_seconds,
+                operation_name="create_order",
+            )
+
+    async def _normalize_position_side_for_account_mode(
+        self,
+        request: OrderRequest,
+        client: BinanceOrderClientProtocol,
+        *,
+        force_refresh: bool = False,
+    ) -> None:
+        dual_side_position = await self._get_binance_dual_side_position(
+            request.exchange,
+            client,
+            force_refresh=force_refresh,
+        )
+        if dual_side_position is None:
+            return
+
+        original = request.position_side.value if request.position_side is not None else None
+
+        if dual_side_position:
+            if request.position_side is None:
+                raise NonRetryableOrderSubmitError(
+                    "Binance account is in hedge mode but request.position_side is missing",
+                    code=-4061,
+                    metadata={
+                        "exchange_mode": "hedge",
+                        "symbol": request.symbol,
+                    },
+                )
+            normalized = request.position_side.value
+        else:
+            # One-way mode expects positionSide=BOTH/omitted. Sending LONG/SHORT
+            # causes Binance error -4061. Omit it explicitly.
+            request.position_side = None
+            normalized = None
+
+        request.metadata = merge_metadata(
+            request.metadata,
+            {
+                "position_mode": {
+                    "exchange_mode": "hedge" if dual_side_position else "one_way",
+                    "request_position_side_original": original,
+                    "request_position_side_normalized": normalized,
+                }
+            },
+        )
+
+    async def _get_binance_dual_side_position(
+        self,
+        exchange: str,
+        client: BinanceOrderClientProtocol,
+        *,
+        force_refresh: bool = False,
+    ) -> bool | None:
+        exchange_n = normalize_exchange(exchange or self._config.default_exchange)
+        if exchange_n != "binance":
+            return None
+
+        if not force_refresh and exchange_n in self._position_mode_by_exchange:
+            return self._position_mode_by_exchange[exchange_n]
+
+        getter = getattr(client, "get_position_mode", None)
+        if not callable(getter):
+            return None
+
+        async with self._position_mode_lock:
+            if not force_refresh and exchange_n in self._position_mode_by_exchange:
+                return self._position_mode_by_exchange[exchange_n]
+
+            try:
+                payload = await getter()
+            except Exception as exc:
+                self._logger.warning(
+                    "Could not fetch Binance position mode; order request will keep original position_side | exchange=%s error=%s",
+                    exchange_n,
+                    str(exc),
+                )
+                return None
+
+            value = payload.get("dual_side_position") if isinstance(payload, Mapping) else None
+            if value is None and isinstance(payload, Mapping):
+                value = payload.get("dualSidePosition")
+
+            dual_side_position = self._to_bool_or_none(value)
+            if dual_side_position is None:
+                self._logger.warning(
+                    "Could not parse Binance position mode response | exchange=%s payload=%s",
+                    exchange_n,
+                    payload,
+                )
+                return None
+
+            self._position_mode_by_exchange[exchange_n] = dual_side_position
+            return dual_side_position
+
+    @staticmethod
+    def _to_bool_or_none(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return None
 
     async def _get_symbol_rules(
         self,
@@ -1569,144 +1649,6 @@ class OrderManager:
                 continue
         return None
 
-    async def _reconcile_after_ambiguous_submit(
-        self,
-        *,
-        request: OrderRequest,
-        client: BinanceOrderClientProtocol,
-        cause: BaseException,
-    ) -> OrderResult | None:
-        """
-        Resolve ambiguous create_order failures without blindly resubmitting.
-
-        Network timeouts around Binance create_order are dangerous: the order
-        may have been accepted but the REST response was lost. Because all
-        execution orders carry a deterministic client_order_id, the safe flow is
-        to fetch by origClientOrderId before deciding whether the submit failed.
-        """
-        if not self._config.submit_timeout_reconcile_enabled:
-            return None
-
-        if not request.client_order_id:
-            self._logger.warning(
-                "Cannot reconcile ambiguous submit without client_order_id | symbol=%s error=%s",
-                request.symbol,
-                _compact_error(cause),
-            )
-            return None
-
-        attempts = max(1, int(self._config.submit_timeout_reconcile_attempts))
-        delay = max(0.0, float(self._config.submit_timeout_reconcile_delay_seconds))
-
-        await self._emit_event(
-            "execution.order_submit_ambiguous",
-            {
-                **request.to_event_payload(),
-                "error": _compact_error(cause),
-                "failure_stage": "submit_ambiguous",
-                "reconcile_attempts": attempts,
-            },
-            priority=EventPriority.HIGH,
-        )
-
-        for attempt in range(1, attempts + 1):
-            if delay > 0 and attempt > 1:
-                await asyncio.sleep(delay)
-
-            try:
-                payload = await client.get_order(
-                    symbol=request.symbol,
-                    orig_client_order_id=request.client_order_id,
-                )
-                result = OrderResult.from_exchange_order(
-                    payload,
-                    request=request,
-                    metadata={
-                        "reconciled_after_ambiguous_submit": True,
-                        "ambiguous_submit_error": _compact_error(cause),
-                        "reconcile_attempt": attempt,
-                    },
-                )
-
-                async with self._lock:
-                    self._upsert_order_state(result)
-                    self._register_submit_stats(result)
-
-                self._logger.warning(
-                    "Order submit reconciled after ambiguous exchange error | symbol=%s client_order_id=%s status=%s attempt=%s error=%s",
-                    request.symbol,
-                    request.client_order_id,
-                    result.status.value,
-                    attempt,
-                    _compact_error(cause),
-                )
-
-                await self._emit_event(
-                    "execution.order_submit_reconciled",
-                    {
-                        **result.to_event_payload(),
-                        "failure_stage": "submit_reconcile",
-                        "reconcile_attempt": attempt,
-                        "ambiguous_submit_error": _compact_error(cause),
-                    },
-                    priority=EventPriority.CRITICAL,
-                )
-                await self._emit_order_submitted(result)
-                await self._emit_order_lifecycle_event(result)
-
-                return result
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as reconcile_exc:
-                if attempt >= attempts:
-                    self._logger.warning(
-                        "Order submit reconciliation did not find exchange order | symbol=%s client_order_id=%s attempts=%s submit_error=%s reconcile_error=%s",
-                        request.symbol,
-                        request.client_order_id,
-                        attempts,
-                        _compact_error(cause),
-                        _compact_error(reconcile_exc),
-                    )
-                    break
-
-                self._logger.warning(
-                    "Order submit reconciliation retry scheduled | symbol=%s client_order_id=%s attempt=%s attempts=%s error=%s",
-                    request.symbol,
-                    request.client_order_id,
-                    attempt,
-                    attempts,
-                    _compact_error(reconcile_exc),
-                )
-
-        return None
-
-
-    async def _emit_order_failed_from_request(
-        self,
-        request: OrderRequest,
-        *,
-        reason: str,
-        stage: str,
-        retryable: bool = False,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> None:
-        await self._emit_event(
-            "execution.order_failed",
-            {
-                **request.to_event_payload(),
-                "reason": reason,
-                "error": reason,
-                "failure_stage": stage,
-                "metadata": merge_metadata(
-                    request.metadata,
-                    metadata,
-                    {"retryable": retryable},
-                ),
-            },
-            priority=EventPriority.CRITICAL,
-        )
-
     async def _emit_order_rejected_from_request(
         self,
         request: OrderRequest,
@@ -1758,10 +1700,12 @@ class OrderManager:
                         metadata={"operation": operation_name},
                     ) from exc
 
-                # A retryable create_order error is ambiguous: Binance may
-                # have accepted the order but the REST response was lost. Do
-                # not blindly resubmit. The caller reconciles by client_order_id.
-                if operation_name == "create_order" and _is_retryable_exchange_error(exc):
+                # A timed-out create_order is ambiguous: Binance may have
+                # accepted it but the response was lost. Retrying blindly can
+                # create duplicate uncertainty or repeated client-order-id errors.
+                # Let the caller emit execution.order_failed and rely on the
+                # user-data stream / rare symbol-scoped reconciliation.
+                if operation_name == "create_order" and isinstance(exc, asyncio.TimeoutError):
                     raise
 
                 if attempt >= retries:
@@ -1772,7 +1716,7 @@ class OrderManager:
                     operation_name,
                     attempt + 1,
                     retries,
-                    _compact_error(exc),
+                    str(exc),
                 )
                 await asyncio.sleep(retry_delay_seconds)
 

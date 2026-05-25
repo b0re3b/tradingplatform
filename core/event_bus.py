@@ -145,15 +145,15 @@ class EventBus:
     # dropped under backpressure before they are allowed to evict critical
     # trading/system events from the shared queue.
     #
-    # signal.rejected is a *diagnostic* event — a high rejection rate should
-    # never deadlock the bus.  analytics.* and storage.* output events are also
-    # lossy: they must not block evaluators when the bus is saturated.
+    # Diagnostic analytics/storage output events are intentionally lossy: they
+    # must not block evaluators when the bus is saturated.  signal.rejected is
+    # intentionally *not* lossy by default because it is required for risk /
+    # execution debugging and rejection-reason aggregation.
     LOSSY_TOPIC_PREFIXES: tuple[str, ...] = (
         "market.trade",
         "market.trades.",
         "market.orderbook",
         "market.orderbook.",
-        "signal.rejected",
         "analytics.liquidity.",
         "analytics.liquidations.",
         "analytics.spoofing.",
@@ -174,6 +174,7 @@ class EventBus:
     PROTECTED_TOPIC_PREFIXES: tuple[str, ...] = (
         "signal.generated",
         "signal.confirmed",
+        "signal.rejected",
         "risk.",
         "execution.",
         "position.",
@@ -191,7 +192,9 @@ class EventBus:
         NoiseRule("system.scheduler.job_completed", 0.0, "scheduler_job_completed_suppressed"),
         NoiseRule("system.scheduler.job_skipped", 0.10, "scheduler_job_skipped_sampled"),
         NoiseRule("strategy.engine.batch_processed", 0.05, "strategy_batch_processed_sampled"),
-        NoiseRule("signal.rejected", 0.05, "signal_rejected_sampled"),
+        # Keep signal.rejected unsuppressed by default so rejection reason
+        # telemetry remains complete while debugging trading/risk/execution.
+        NoiseRule("signal.rejected", 1.0, "signal_rejected_unsuppressed"),
         NoiseRule("news.scored", 0.02, "news_scored_sampled"),
     )
 
@@ -620,7 +623,7 @@ class EventBus:
             ),
             NoiseRule(
                 "signal.rejected",
-                _env_float("EVENT_BUS_SIGNAL_REJECTED_SAMPLE_RATE", 0.05),
+                _env_float("EVENT_BUS_SIGNAL_REJECTED_SAMPLE_RATE", 1.0),
                 "signal_rejected_sampled",
             ),
             NoiseRule(
@@ -678,11 +681,17 @@ class EventBus:
         return counter % keep_every == 0
 
     def _record_suppressed_event(self, event: Event, *, reason: str) -> None:
-        self._inc_metric("dropped")
+        """Track intentionally suppressed noisy telemetry separately from drops.
+
+        Suppression is a planned backpressure/noise-control decision, not a
+        queue overflow or handler failure.  Counting it as ``dropped`` made the
+        EventFlowMonitor look unhealthy even when the bus was only filtering
+        scheduler/news telemetry.  Actual queue/middleware drops still use
+        _record_drop() or the middleware drop path and continue to increment
+        ``dropped`` / ``topic_dropped`` / ``drop_reasons``.
+        """
         self._inc_metric("noise_suppressed")
-        self._inc_nested_metric("topic_dropped", event.topic)
         self._inc_nested_metric("topic_suppressed", event.topic)
-        self._inc_nested_metric("drop_reasons", reason)
         self._inc_nested_metric("suppression_reasons", reason)
         self._metrics["queue_size"] = self._queue.qsize()
 

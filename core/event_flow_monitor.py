@@ -73,6 +73,14 @@ class EventFlowMonitorConfig:
     write_jsonl: bool = False
     jsonl_path: str = "logs/event_flow_monitor.jsonl"
 
+    # Log level policy.  Normal reports are INFO; WARNING is reserved for
+    # actual queue pressure, real drops, handler failures, or dispatch failures.
+    # Intentionally suppressed noise from EventBus is reported separately and
+    # does not by itself make the system unhealthy.
+    warning_queue_utilization: float = 0.50
+    warning_drop_delta: int = 1
+    warning_failed_delta: int = 1
+
     @classmethod
     def from_env(cls) -> "EventFlowMonitorConfig":
         return cls(
@@ -83,6 +91,9 @@ class EventFlowMonitorConfig:
             emit_system_event=_env_bool("EVENT_FLOW_MONITOR_EMIT_SYSTEM_EVENT", False),
             write_jsonl=_env_bool("EVENT_FLOW_MONITOR_WRITE_JSONL", False),
             jsonl_path=os.getenv("EVENT_FLOW_MONITOR_JSONL_PATH", "logs/event_flow_monitor.jsonl"),
+            warning_queue_utilization=_env_float("EVENT_FLOW_MONITOR_WARNING_QUEUE_UTILIZATION", 0.50),
+            warning_drop_delta=int(_env_float("EVENT_FLOW_MONITOR_WARNING_DROP_DELTA", 1)),
+            warning_failed_delta=int(_env_float("EVENT_FLOW_MONITOR_WARNING_FAILED_DELTA", 1)),
         )
 
 
@@ -115,6 +126,9 @@ class EventFlowMonitor:
         self._started_at = time.time()
         self._rejection_reasons: Counter[str] = Counter()
         self._last_rejection_reasons: Counter[str] = Counter()
+        self._last_eventbus_dropped = 0
+        self._last_eventbus_failed = 0
+        self._last_eventbus_noise_suppressed = 0
 
     async def start(self) -> None:
         if not self.config.enabled:
@@ -232,6 +246,20 @@ class EventFlowMonitor:
         top_dropped = dict(
             sorted(all_dropped.items(), key=lambda kv: kv[1], reverse=True)[:20]
         )
+        all_suppressed: dict[str, int] = stats.get("topic_suppressed", {})
+        top_suppressed = dict(
+            sorted(all_suppressed.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        )
+
+        dropped_total = int(stats.get("dropped", 0) or 0)
+        failed_total = int(stats.get("failed", 0) or 0)
+        suppressed_total = int(stats.get("noise_suppressed", 0) or 0)
+        dropped_delta = dropped_total - self._last_eventbus_dropped
+        failed_delta = failed_total - self._last_eventbus_failed
+        suppressed_delta = suppressed_total - self._last_eventbus_noise_suppressed
+        self._last_eventbus_dropped = dropped_total
+        self._last_eventbus_failed = failed_total
+        self._last_eventbus_noise_suppressed = suppressed_total
 
         payload: dict[str, Any] = {
             "timestamp": time.time(),
@@ -246,13 +274,19 @@ class EventFlowMonitor:
                 "published": stats.get("published", 0),
                 "processed": stats.get("processed", 0),
                 "failed": stats.get("failed", 0),
-                "dropped": stats.get("dropped", 0),
+                "dropped": dropped_total,
+                "dropped_delta": dropped_delta,
                 "retried": stats.get("retried", 0),
                 "drop_reasons": stats.get("drop_reasons", {}),
                 "topic_dropped": stats.get("topic_dropped", {}),
+                "noise_suppressed": suppressed_total,
+                "noise_suppressed_delta": suppressed_delta,
+                "suppression_reasons": stats.get("suppression_reasons", {}),
+                "topic_suppressed": stats.get("topic_suppressed", {}),
                 "handler_errors": stats.get("handler_errors", {}),
                 "top_published": top_published,
                 "top_dropped": top_dropped,
+                "top_suppressed": top_suppressed,
                 "rejection_reasons": rejection_reason_counts,
                 "rejection_reason_deltas": rejection_reason_deltas,
             },
@@ -262,20 +296,36 @@ class EventFlowMonitor:
             topic: value for topic, value in deltas.items() if value
         }
 
-        self.logger.warning(
-            "Event flow monitor | queue_size=%s queue_utilization=%.2f dropped=%s failed=%s"
-            " interval_counts=%s total_counts=%s drop_reasons=%s top_published=%s top_dropped=%s rejection_reason_deltas=%s handler_errors=%s",
+        handler_errors = payload["eventbus"]["handler_errors"]
+        should_warn = (
+            float(payload["eventbus"]["queue_utilization"] or 0.0) >= self.config.warning_queue_utilization
+            or dropped_delta >= self.config.warning_drop_delta
+            or failed_delta >= self.config.warning_failed_delta
+            or bool(handler_errors)
+        )
+        log = self.logger.warning if should_warn else self.logger.info
+        log(
+            "Event flow monitor | queue_size=%s queue_utilization=%.2f dropped=%s dropped_delta=%s failed=%s failed_delta=%s"
+            " noise_suppressed=%s noise_suppressed_delta=%s interval_counts=%s total_counts=%s"
+            " drop_reasons=%s suppression_reasons=%s top_published=%s top_dropped=%s top_suppressed=%s"
+            " rejection_reason_deltas=%s handler_errors=%s",
             payload["eventbus"]["queue_size"],
             payload["eventbus"]["queue_utilization"],
             payload["eventbus"]["dropped"],
+            dropped_delta,
             payload["eventbus"]["failed"],
+            failed_delta,
+            payload["eventbus"]["noise_suppressed"],
+            suppressed_delta,
             visible_deltas,
             counts,
             payload["eventbus"]["drop_reasons"],
+            payload["eventbus"]["suppression_reasons"],
             top_published,
             top_dropped,
+            top_suppressed,
             rejection_reason_deltas,
-            payload["eventbus"]["handler_errors"],
+            handler_errors,
         )
 
         if self.config.write_jsonl:

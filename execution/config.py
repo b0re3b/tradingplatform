@@ -1,9 +1,48 @@
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 
 from execution.enums import ExecutionMode, TimeInForce, WorkingType
 from execution.exceptions import ExecutionConfigurationError
+
+
+def _env_bool(*keys: str, default: bool = False) -> bool:
+    for key in keys:
+        value = os.getenv(key)
+        if value is None or not str(value).strip():
+            continue
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "disabled"}:
+            return False
+    return bool(default)
+
+
+def _env_float(*keys: str, default: float) -> float:
+    for key in keys:
+        value = os.getenv(key)
+        if value is None or not str(value).strip():
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return float(default)
+
+
+def _env_int(*keys: str, default: int) -> int:
+    for key in keys:
+        value = os.getenv(key)
+        if value is None or not str(value).strip():
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return int(default)
 
 
 def _require_positive_float(value: float | int, field_name: str) -> float:
@@ -64,24 +103,23 @@ class OrderManagerConfig:
 
     new_order_response_type: str = "RESULT"
 
-    submit_timeout_seconds: float = 10.0
-    cancel_timeout_seconds: float = 10.0
-    fetch_timeout_seconds: float = 10.0
+    # Order submit is the hot path. Binance may accept an order but the HTTP
+    # response can still time out, so do not retry create_order by default.
+    submit_timeout_seconds: float = 5.0
+    cancel_timeout_seconds: float = 5.0
+    fetch_timeout_seconds: float = 5.0
 
-    submit_retries: int = 2
-    cancel_retries: int = 2
-    retry_delay_seconds: float = 0.25
+    submit_retries: int = 0
+    cancel_retries: int = 0
+    retry_delay_seconds: float = 0.10
 
-    # Ambiguous create_order failures, especially network timeouts, are unsafe
-    # to retry blindly because Binance may have accepted the order while the
-    # response was lost. Reconcile by client_order_id before declaring failure.
-    submit_timeout_reconcile_enabled: bool = True
-    submit_timeout_reconcile_attempts: int = 3
-    submit_timeout_reconcile_delay_seconds: float = 0.75
-
-    reconcile_enabled: bool = True
-    reconcile_interval_seconds: float = 15.0
-    open_order_sync_interval_seconds: float = 20.0
+    # User stream is the primary source for order updates/fills. REST
+    # reconciliation is a rare recovery path, not the normal hot path.
+    reconcile_enabled: bool = False
+    full_account_reconciliation_enabled: bool = False
+    reconcile_interval_seconds: float = 300.0
+    open_order_sync_interval_seconds: float = 300.0
+    reconcile_timeout_seconds: float = 5.0
 
     emit_acknowledged_events: bool = True
     emit_partially_filled_events: bool = True
@@ -131,14 +169,6 @@ class OrderManagerConfig:
             self.retry_delay_seconds,
             "order_manager.retry_delay_seconds",
         )
-        self.submit_timeout_reconcile_attempts = _require_positive_int(
-            self.submit_timeout_reconcile_attempts,
-            "order_manager.submit_timeout_reconcile_attempts",
-        )
-        self.submit_timeout_reconcile_delay_seconds = _require_non_negative_float(
-            self.submit_timeout_reconcile_delay_seconds,
-            "order_manager.submit_timeout_reconcile_delay_seconds",
-        )
         self.reconcile_interval_seconds = _require_positive_float(
             self.reconcile_interval_seconds,
             "order_manager.reconcile_interval_seconds",
@@ -146,6 +176,10 @@ class OrderManagerConfig:
         self.open_order_sync_interval_seconds = _require_positive_float(
             self.open_order_sync_interval_seconds,
             "order_manager.open_order_sync_interval_seconds",
+        )
+        self.reconcile_timeout_seconds = _require_positive_float(
+            self.reconcile_timeout_seconds,
+            "order_manager.reconcile_timeout_seconds",
         )
         self.max_client_order_id_length = _require_positive_int(
             self.max_client_order_id_length,
@@ -178,9 +212,13 @@ class PositionManagerConfig:
     default_exchange: str = "binance"
     default_market_type: str = "usdm_futures"
 
-    reconcile_enabled: bool = True
-    reconcile_interval_seconds: float = 20.0
-    position_sync_interval_seconds: float = 20.0
+    # User stream ACCOUNT_UPDATE is the primary source. REST reconciliation
+    # should be disabled by default and used only as rare recovery/symbol-scoped sync.
+    reconcile_enabled: bool = False
+    full_account_reconciliation_enabled: bool = False
+    reconcile_interval_seconds: float = 300.0
+    position_sync_interval_seconds: float = 300.0
+    reconcile_timeout_seconds: float = 5.0
 
     stale_position_seconds: float = 60.0
 
@@ -207,6 +245,10 @@ class PositionManagerConfig:
         self.position_sync_interval_seconds = _require_positive_float(
             self.position_sync_interval_seconds,
             "position_manager.position_sync_interval_seconds",
+        )
+        self.reconcile_timeout_seconds = _require_positive_float(
+            self.reconcile_timeout_seconds,
+            "position_manager.reconcile_timeout_seconds",
         )
         self.stale_position_seconds = _require_positive_float(
             self.stale_position_seconds,
@@ -252,11 +294,12 @@ class SLTPManagerConfig:
     take_profit_order_timeout_seconds: float = 10.0
     cancel_timeout_seconds: float = 10.0
 
-    protective_order_retries: int = 2
-    retry_delay_seconds: float = 0.25
+    protective_order_retries: int = 0
+    retry_delay_seconds: float = 0.10
 
-    reconcile_enabled: bool = True
-    reconcile_interval_seconds: float = 30.0
+    reconcile_enabled: bool = False
+    full_account_reconciliation_enabled: bool = False
+    reconcile_interval_seconds: float = 300.0
 
     trailing_stop_enabled: bool = True
     min_trailing_callback_rate: float = 0.1
@@ -552,6 +595,75 @@ class ExecutionConfig:
         self.sltp_manager.default_market_type = self.default_market_type
 
 
+def build_execution_config_from_env() -> ExecutionConfig:
+    """Build ExecutionConfig from environment variables.
+
+    Defaults follow the REST/WS split:
+    - REST is used for submit/cancel/startup account seed/rare recovery;
+    - Binance user stream is expected to provide order/fill/account/position updates;
+    - full-account REST reconciliation is disabled unless explicitly enabled.
+    """
+    order = OrderManagerConfig(
+        submit_timeout_seconds=_env_float("ORDER_MANAGER_SUBMIT_TIMEOUT_SECONDS", "BINANCE_ORDER_TIMEOUT_SECONDS", default=5.0),
+        cancel_timeout_seconds=_env_float("ORDER_MANAGER_CANCEL_TIMEOUT_SECONDS", "BINANCE_CANCEL_TIMEOUT_SECONDS", default=5.0),
+        fetch_timeout_seconds=_env_float("ORDER_MANAGER_FETCH_TIMEOUT_SECONDS", "BINANCE_PRIVATE_READ_TIMEOUT_SECONDS", default=5.0),
+        submit_retries=_env_int("ORDER_MANAGER_SUBMIT_RETRIES", "BINANCE_ORDER_REQUEST_RETRIES", default=0),
+        cancel_retries=_env_int("ORDER_MANAGER_CANCEL_RETRIES", "BINANCE_CANCEL_REQUEST_RETRIES", default=0),
+        retry_delay_seconds=_env_float("ORDER_MANAGER_RETRY_DELAY_SECONDS", default=0.10),
+        reconcile_enabled=_env_bool("ORDER_MANAGER_RECONCILE_ENABLED", default=False),
+        full_account_reconciliation_enabled=_env_bool(
+            "ORDER_MANAGER_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+            "EXECUTION_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+            default=False,
+        ),
+        reconcile_interval_seconds=_env_float("ORDER_MANAGER_RECONCILE_INTERVAL_SECONDS", default=300.0),
+        open_order_sync_interval_seconds=_env_float("ORDER_MANAGER_OPEN_ORDER_SYNC_INTERVAL_SECONDS", default=300.0),
+        reconcile_timeout_seconds=_env_float("ORDER_MANAGER_RECONCILE_TIMEOUT_SECONDS", "BINANCE_PRIVATE_READ_TIMEOUT_SECONDS", default=5.0),
+    )
+
+    position = PositionManagerConfig(
+        reconcile_enabled=_env_bool("POSITION_MANAGER_RECONCILE_ENABLED", default=False),
+        full_account_reconciliation_enabled=_env_bool(
+            "POSITION_MANAGER_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+            "EXECUTION_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+            default=False,
+        ),
+        reconcile_interval_seconds=_env_float("POSITION_MANAGER_RECONCILE_INTERVAL_SECONDS", default=300.0),
+        position_sync_interval_seconds=_env_float("POSITION_MANAGER_POSITION_SYNC_INTERVAL_SECONDS", default=300.0),
+        reconcile_timeout_seconds=_env_float("POSITION_MANAGER_RECONCILE_TIMEOUT_SECONDS", "BINANCE_PRIVATE_READ_TIMEOUT_SECONDS", default=5.0),
+    )
+
+    sltp = SLTPManagerConfig(
+        protective_order_retries=_env_int("SLTP_MANAGER_PROTECTIVE_ORDER_RETRIES", default=0),
+        retry_delay_seconds=_env_float("SLTP_MANAGER_RETRY_DELAY_SECONDS", default=0.10),
+        reconcile_enabled=_env_bool("SLTP_MANAGER_RECONCILE_ENABLED", default=False),
+        full_account_reconciliation_enabled=_env_bool(
+            "SLTP_MANAGER_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+            "EXECUTION_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+            default=False,
+        ),
+        reconcile_interval_seconds=_env_float("SLTP_MANAGER_RECONCILE_INTERVAL_SECONDS", default=300.0),
+    )
+
+    trade_executor = TradeExecutorConfig(
+        reservation_grace_seconds=_env_float("TRADE_EXECUTOR_RESERVATION_GRACE_SECONDS", default=5.0),
+        execution_timeout_seconds=_env_float("TRADE_EXECUTOR_EXECUTION_TIMEOUT_SECONDS", default=30.0),
+        close_timeout_seconds=_env_float("TRADE_EXECUTOR_CLOSE_TIMEOUT_SECONDS", default=30.0),
+        reduce_timeout_seconds=_env_float("TRADE_EXECUTOR_REDUCE_TIMEOUT_SECONDS", default=30.0),
+        max_concurrent_executions=_env_int("TRADE_EXECUTOR_MAX_CONCURRENT_EXECUTIONS", default=10),
+    )
+
+    config = ExecutionConfig(
+        trade_executor=trade_executor,
+        order_manager=order,
+        position_manager=position,
+        sltp_manager=sltp,
+        smart_execution=SmartExecutionConfig(),
+    )
+    config.validate()
+    return config
+
+
 __all__ = [
     "ExecutionConfig",
     "TradeExecutorConfig",
@@ -559,4 +671,5 @@ __all__ = [
     "PositionManagerConfig",
     "SLTPManagerConfig",
     "SmartExecutionConfig",
+    "build_execution_config_from_env",
 ]

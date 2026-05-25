@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -41,6 +42,8 @@ from app.runtime import (
 from app.universe import discover_exchange_universe
 from data.market_restore import MarketRestoreConfig, MarketStateRestorer
 from data.market_models import MarketScope
+from exchanges.binance.binance_ws import BinanceWebSocketClient, BinanceWebSocketClientConfig
+from core.event_bus import EventPriority
 
 
 logger = get_logger(__name__, service="app.main", event_type="bootstrap")
@@ -166,6 +169,13 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "STORAGE_PARQUET_ENABLED",
         "STORAGE_PARQUET_DIR",
         "STORAGE_FLUSH_INTERVAL_SECONDS",
+        "BINANCE_ENABLE_PRIVATE_STREAM",
+        "BINANCE_EXECUTION_USER_STREAM_ENABLED",
+        "BINANCE_EXECUTION_WS_URL",
+        "BINANCE_EXECUTION_REST_URL",
+        "EXECUTION_FULL_ACCOUNT_RECONCILIATION_ENABLED",
+        "BINANCE_PRIVATE_READ_TIMEOUT_SECONDS",
+        "BINANCE_PRIVATE_READ_REQUEST_RETRIES",
         "STORAGE_BATCH_SIZE",
     ]
 
@@ -208,8 +218,8 @@ async def _start_analytics_component(component: Any) -> None:
         register() once, then start() once when available.
 
     This guarantees EventBus subscriptions and Scheduler jobs are installed for
-    Spoofing, Spreads, Funding/OI, Liquidations, Liquidity,
-    Orderflow and Whales without putting domain logic into app.
+    Spoofing, Spreads, Funding/OI, Liquidations, Liquidity, Orderflow and
+    Whales without putting domain logic into app.
     """
     has_register = callable(getattr(component, "register", None))
     has_start = callable(getattr(component, "start", None))
@@ -242,6 +252,61 @@ async def _start_analytics_component(component: Any) -> None:
     )
 
 
+
+class _BinanceExecutionUserStreamClient(BinanceWebSocketClient):
+    """Private-only Binance USD-M user stream used by execution.
+
+    The generic BinanceWebSocketClient is designed for public market-data
+    shards and starts a public loop unconditionally.  Execution needs exactly
+    one private user-data stream before StrategyEngine starts, without starting
+    another public market stream.  This thin runtime adapter reuses the
+    exchange client's listenKey/private-loop implementation while disabling the
+    public loop.
+    """
+
+    def _validate_config(self) -> None:
+        unsupported = set(self._streams) - self.SUPPORTED_STREAMS
+        if unsupported:
+            raise ValueError(f"Unsupported Binance streams: {sorted(unsupported)}")
+        if not self._ws_config.enable_private_stream:
+            raise ValueError("Execution user stream requires enable_private_stream=True")
+        self._require_private_stream_dependencies()
+
+    async def start(self) -> None:
+        if self._running:
+            self._logger.warning("Binance execution user stream already started")
+            return
+
+        self._running = True
+        self._started = True
+        await self._ensure_session()
+
+        self._logger.info(
+            "Starting Binance execution user stream | private_ws_url=%s execution_rest_url=%s",
+            self._ws_config.private_ws_base_url,
+            self._ws_config.execution_rest_url,
+        )
+
+        await self._emit_event(
+            "system.exchange.ws.started",
+            {
+                "exchange": self.EXCHANGE,
+                "channel": "private",
+                "private_stream": True,
+                "public_stream": False,
+                "private_ws_base_url": self._ws_config.private_ws_base_url,
+                "execution_rest_url": self._ws_config.execution_rest_url,
+                "purpose": "execution_user_stream",
+            },
+            priority=EventPriority.HIGH,
+        )
+
+        self._require_private_stream_dependencies()
+        self._private_task = asyncio.create_task(
+            self._run_private_loop(),
+            name="binance-execution-user-stream-loop",
+        )
+
 class TradingSystemRuntime:
     """
     Production bootstrap for the whole project.
@@ -250,11 +315,11 @@ class TradingSystemRuntime:
     1. core EventBus/Scheduler
     2. REST clients and symbol discovery
     3. sharded WS clients and data caches registration
-    4. analytics
-    5. startup warmup
-    6. strategy
-    7. risk
-    8. execution
+    4. analytics register/start for live state processing
+    5. risk + account equity seed
+    6. execution
+    7. Binance execution user stream
+    8. strategy
     9. Telegram observer
     10. live market stream
     11. derivative snapshot polling
@@ -280,6 +345,7 @@ class TradingSystemRuntime:
         self.telegram: Any | None = None
         self.news_service: Any | None = None
         self._market_stream: Any | None = None
+        self._execution_user_stream: Any | None = None
         self._derivative_snapshot_poll_job_id: str | None = None
         self._derivative_snapshot_poll_task: asyncio.Task[None] | None = None
         self._derivative_snapshot_poll_stop: asyncio.Event | None = None
@@ -380,6 +446,14 @@ class TradingSystemRuntime:
                 market_ingestion=market_ingestion,
             )
 
+            # Private execution/account updates are handled by one dedicated
+            # Binance execution user stream started before StrategyEngine.
+            # Do not let public market-data shards create duplicate listenKeys
+            # when BINANCE_ENABLE_PRIVATE_STREAM=true.
+            if self._execution_user_stream_enabled():
+                self._disable_private_streams_on_market_ws_clients()
+
+
             self.caches = build_data_caches(
                 self.config,
                 self.event_bus,
@@ -421,11 +495,12 @@ class TradingSystemRuntime:
             self.components.append(market_stream)
 
             # Register market stream now, but intentionally do not start WS clients yet.
-            # Live market starts only after analytics/strategy/risk/execution are ready.
+            # Historical REST warmup must populate state/analytics before live market
+            # events and before strategy/risk/execution are started.
             await register_component(market_stream)
 
         # ------------------------------------------------------------------
-        # Analytics
+        # Analytics + startup history
         # ------------------------------------------------------------------
         if self.settings.enable_analytics:
             analytics_components = build_analytics_components(
@@ -439,16 +514,101 @@ class TradingSystemRuntime:
                 market_scheduler=market_scheduler,
             )
 
+            # Analytics are started directly from live MarketState/MarketScheduler.
+            # Historical Parquet restore and REST startup warmup are intentionally
+            # disabled in this runtime path; inactive analytics domains must be
+            # excluded by RuntimeSettings/factories.
             for component in analytics_components:
                 self.components.append(component)
                 await _start_analytics_component(component)
 
-            # Start snapshot evaluation before live stream start.
+            # Start periodic state-snapshot evaluation for live dirty scopes.
             await start_component(market_scheduler)
+
+        # ------------------------------------------------------------------
+        # Risk account bootstrap
+        # ------------------------------------------------------------------
+        # Risk must be running and have a non-zero account equity before
+        # StrategyEngine can subscribe and emit signal.generated events.  The
+        # RiskUnit model calculates R from RiskState.equity by default; starting
+        # strategy first creates deterministic zero-risk rejections.
+        risk_manager: Any | None = None
+        execution_rest: Any | None = None
+
+        if self.settings.enable_execution:
+            # Must return binance_execution only. Do not allow fallback to market-data REST.
+            execution_rest = self._execution_rest_client("binance")
+            logger.info(
+                "Execution REST client resolved before trading startup | exchange=%s client=%s",
+                self.settings.execution_exchange,
+                execution_rest.__class__.__name__,
+            )
+
+        if self.settings.enable_risk:
+            risk_manager = build_risk_manager(self.event_bus, self.scheduler)
+            self.components.append(risk_manager)
+            await start_component(risk_manager)
+            logger.info("RiskManager started before execution/strategy startup")
+
+            await self._seed_risk_account_state(
+                risk_manager=risk_manager,
+                execution_rest=execution_rest,
+            )
+
+        # ------------------------------------------------------------------
+        # Execution
+        # ------------------------------------------------------------------
+        # Execution must start before StrategyEngine so OrderManager,
+        # PositionManager, SLTPManager and TradeExecutor are registered and
+        # subscribed to signal.confirmed before the first strategy signal can be
+        # approved by RiskManager.  Starting strategy first can make valid risk
+        # reservations expire before TradeExecutor handles them.
+        if self.settings.enable_execution:
+            if execution_rest is None:
+                execution_rest = self._execution_rest_client("binance")
+
+            execution_components = build_execution_components(
+                event_bus=self.event_bus,
+                scheduler=self.scheduler,
+                binance_rest=execution_rest,
+                settings=self.settings,
+            )
+
+            execution_component_names: list[str] = []
+            for component in execution_components:
+                execution_component_names.append(component.__class__.__name__)
+                self.components.append(component)
+                await start_component(component)
+
+            logger.info(
+                "Execution components started before StrategyEngine | components=%s",
+                execution_component_names,
+            )
+
+        # ------------------------------------------------------------------
+        # Execution private user stream
+        # ------------------------------------------------------------------
+        # Start Binance USD-M user-data stream before StrategyEngine so fills,
+        # order updates and account/position updates arrive through WS from the
+        # first order onward. Public market-data WS still starts later through
+        # MarketStream.
+        if self._execution_user_stream_enabled():
+            self._execution_user_stream = self._build_binance_execution_user_stream()
+            self.components.append(self._execution_user_stream)
+            await register_component(self._execution_user_stream)
+            await start_component(self._execution_user_stream)
+            logger.info("Binance execution user stream started before StrategyEngine")
+        elif self.settings.enable_execution:
+            logger.warning(
+                "Binance execution user stream is disabled; execution will rely on REST reconciliation for order/position updates"
+            )
 
         # ------------------------------------------------------------------
         # Strategy
         # ------------------------------------------------------------------
+        # Strategy starts only after RiskManager has equity and execution is
+        # ready to receive signal.confirmed. This prevents both zero-risk
+        # rejections and expired-risk-reservation races.
         if self.settings.enable_strategy:
             strategy_engine = build_strategy_engine(
                 event_bus=self.event_bus,
@@ -458,32 +618,7 @@ class TradingSystemRuntime:
             )
             self.components.append(strategy_engine)
             await start_component(strategy_engine)
-
-        # ------------------------------------------------------------------
-        # Risk
-        # ------------------------------------------------------------------
-        if self.settings.enable_risk:
-            risk_manager = build_risk_manager(self.event_bus, self.scheduler)
-            self.components.append(risk_manager)
-            await start_component(risk_manager)
-
-        # ------------------------------------------------------------------
-        # Execution
-        # ------------------------------------------------------------------
-        if self.settings.enable_execution:
-            # Must return binance_execution only. Do not allow fallback to market-data REST.
-            execution_rest = self._execution_rest_client("binance")
-
-            execution_components = build_execution_components(
-                event_bus=self.event_bus,
-                scheduler=self.scheduler,
-                binance_rest=execution_rest,
-                settings=self.settings,
-            )
-
-            for component in execution_components:
-                self.components.append(component)
-                await start_component(component)
+            logger.info("StrategyEngine started after RiskManager and execution components")
 
         # ------------------------------------------------------------------
         # Telegram observer
@@ -538,6 +673,208 @@ class TradingSystemRuntime:
 
         self._started = True
 
+    async def _seed_risk_account_state(
+        self,
+        *,
+        risk_manager: Any,
+        execution_rest: Any | None,
+    ) -> None:
+        """Initialize RiskState account values before StrategyEngine starts.
+
+        In live/testnet/demo modes the source of truth is Binance USD-M Futures
+        account info from the execution REST client. In paper/backtest modes we
+        seed a deterministic simulated account balance so the rest of the real
+        risk pipeline can run without private Binance calls.
+        """
+        mode = str(getattr(self.settings, "execution_mode", "paper") or "paper").strip().lower()
+        paper_modes = {"paper", "paper_trading", "sim", "simulation", "backtest", "backtesting"}
+
+        if mode in paper_modes:
+            balance = self._env_float_any(
+                "RISK_PAPER_BALANCE",
+                "PAPER_ACCOUNT_BALANCE",
+                "BACKTEST_INITIAL_BALANCE",
+                "EXECUTION_PAPER_BALANCE",
+                default=1000.0,
+            )
+            equity = self._env_float_any(
+                "RISK_PAPER_EQUITY",
+                "PAPER_ACCOUNT_EQUITY",
+                "BACKTEST_INITIAL_EQUITY",
+                "EXECUTION_PAPER_EQUITY",
+                default=balance,
+            )
+            free_balance = self._env_float_any(
+                "RISK_PAPER_FREE_BALANCE",
+                "PAPER_ACCOUNT_FREE_BALANCE",
+                "EXECUTION_PAPER_FREE_BALANCE",
+                default=equity,
+            )
+
+            if equity <= 0.0 or free_balance < 0.0 or balance < 0.0:
+                raise RuntimeError(
+                    "Risk paper account seed failed: balance/equity/free_balance must be positive "
+                    f"| balance={balance} equity={equity} free_balance={free_balance}"
+                )
+
+            await risk_manager.on_account_update(
+                balance=balance,
+                equity=equity,
+                free_balance=free_balance,
+                used_margin=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+            )
+            logger.info(
+                "Risk account state seeded for paper mode | balance=%s equity=%s free_balance=%s",
+                balance,
+                equity,
+                free_balance,
+            )
+            return
+
+        if execution_rest is None:
+            raise RuntimeError(
+                "Risk account seed failed: execution REST client is missing. "
+                "Risk must be seeded before StrategyEngine starts."
+            )
+
+        try:
+            account = await execution_rest.get_account_info()
+        except Exception as exc:
+            raise RuntimeError(
+                "Risk account seed failed: Binance account snapshot request failed. "
+                "Fix execution REST connectivity/credentials before starting strategy."
+            ) from exc
+
+        if not isinstance(account, dict):
+            raise RuntimeError(f"Risk account seed failed: invalid account payload type | account={account!r}")
+
+        if account.get("skipped"):
+            raise RuntimeError(
+                "Risk account seed failed: Binance account snapshot was skipped "
+                f"| reason={account.get('skip_reason')}"
+            )
+
+        balance = self._coerce_float(account.get("total_wallet_balance"), field_name="total_wallet_balance")
+        equity = self._coerce_float(account.get("total_margin_balance"), field_name="total_margin_balance")
+        free_balance = self._coerce_float(account.get("available_balance"), field_name="available_balance")
+        used_margin = self._coerce_float(account.get("total_initial_margin"), field_name="total_initial_margin", default=0.0)
+        unrealized_pnl = self._coerce_float(account.get("total_unrealized_profit"), field_name="total_unrealized_profit", default=0.0)
+
+        if equity <= 0.0:
+            raise RuntimeError(
+                "Risk account seed failed: Binance account equity is zero. "
+                f"wallet_balance={balance} margin_balance={equity} available_balance={free_balance}"
+            )
+
+        await risk_manager.on_account_update(
+            balance=balance,
+            equity=equity,
+            free_balance=free_balance,
+            used_margin=used_margin,
+            unrealized_pnl=unrealized_pnl,
+        )
+        logger.info(
+            "Risk account state seeded from Binance account | balance=%s equity=%s free_balance=%s used_margin=%s unrealized_pnl=%s",
+            balance,
+            equity,
+            free_balance,
+            used_margin,
+            unrealized_pnl,
+        )
+
+    @staticmethod
+    def _coerce_float(value: Any, *, field_name: str, default: float | None = None) -> float:
+        if value is None:
+            if default is not None:
+                return float(default)
+            raise RuntimeError(f"Risk account seed failed: missing account field {field_name}")
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Risk account seed failed: invalid account field {field_name}={value!r}") from exc
+        if not math.isfinite(result):
+            raise RuntimeError(f"Risk account seed failed: non-finite account field {field_name}={value!r}")
+        return result
+
+    @staticmethod
+    def _env_float_any(*names: str, default: float) -> float:
+        for name in names:
+            raw = os.getenv(name)
+            if raw is None or not raw.strip():
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if math.isfinite(value):
+                return value
+        return float(default)
+
+
+    def _execution_user_stream_enabled(self) -> bool:
+        """Return whether the dedicated Binance execution user stream should run."""
+        if not self.settings.enable_execution:
+            return False
+        if str(self.settings.execution_exchange).lower() != "binance":
+            return False
+
+        # Prefer explicit execution-user-stream switch, then fall back to the
+        # existing Binance private stream setting used by RuntimeSettings.
+        explicit = os.getenv("BINANCE_EXECUTION_USER_STREAM_ENABLED")
+        if explicit is not None and explicit.strip():
+            return explicit.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+        explicit = os.getenv("EXECUTION_USER_STREAM_ENABLED")
+        if explicit is not None and explicit.strip():
+            return explicit.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+
+        return bool(getattr(self.settings, "binance_enable_private_stream", False))
+
+    def _disable_private_streams_on_market_ws_clients(self) -> None:
+        """Prevent public market-data WS shards from creating private listenKeys."""
+        disabled: list[str] = []
+        for name, client in self.ws_clients.items():
+            ws_config = getattr(client, "_ws_config", None)
+            if ws_config is None:
+                continue
+            if bool(getattr(ws_config, "enable_private_stream", False)):
+                setattr(ws_config, "enable_private_stream", False)
+                disabled.append(str(name))
+
+        if disabled:
+            logger.info(
+                "Disabled private streams on market-data WS clients; dedicated execution user stream will be used | clients=%s",
+                disabled,
+            )
+
+    def _build_binance_execution_user_stream(self) -> Any:
+        """Build one private-only Binance user stream for execution updates."""
+        ws_config = BinanceWebSocketClientConfig.from_core_config(
+            config=self.config,
+            symbols=[],
+            streams=[],
+            depth_level=str(getattr(self.settings, "binance_ws_depth_level", "20")),
+            kline_interval=str(getattr(self.settings, "binance_ws_kline_interval", "1m")),
+            enable_private_stream=True,
+            orderbook_emit_min_interval_ms=int(getattr(self.settings, "binance_orderbook_emit_min_interval_ms", 250)),
+            orderbook_batch_max_size=int(getattr(self.settings, "binance_orderbook_batch_max_size", 500)),
+            trade_emit_min_interval_ms=int(getattr(self.settings, "binance_trade_emit_min_interval_ms", 250)),
+            trade_batch_max_size=int(getattr(self.settings, "binance_trade_batch_max_size", 1000)),
+        )
+        ws_config.symbols = []
+        ws_config.streams = []
+        ws_config.enable_private_stream = True
+
+        return _BinanceExecutionUserStreamClient(
+            config=self.config,
+            event_bus=self.event_bus,
+            scheduler=self.scheduler,
+            ws_config=ws_config,
+            market_ingestion=None,
+        )
+
     def _startup_warmup_enabled(self) -> bool:
         return (
             bool(self.settings.startup_warmup_enabled)
@@ -547,7 +884,7 @@ class TradingSystemRuntime:
         )
 
     def _startup_warmup_timeframes(self) -> list[str]:
-        """Return timeframes used during startup history hydration."""
+        """Return every timeframe needed during startup history hydration."""
         configured: list[str] = []
         configured.extend(str(tf).strip() for tf in self.settings.startup_warmup_timeframes if str(tf).strip())
 
@@ -784,7 +1121,7 @@ class TradingSystemRuntime:
         """Best-effort explicit warmup hook for analyzers that can rebuild from MarketStateStore.
 
         State-driven analyzers normally receive snapshots through MarketScheduler.
-        Some domain analyzers may also expose an
+        Some domain analyzers may expose an
         explicit warmup_from_market_state() method to rebuild child-module state
         from restored candles before strategy/risk/execution are started.
         """
@@ -819,6 +1156,7 @@ class TradingSystemRuntime:
             warmed,
             skipped,
         )
+
 
     @staticmethod
     def _first_present(payload: Any, *keys: str) -> Any:
@@ -921,8 +1259,9 @@ class TradingSystemRuntime:
         """Force REST warmup candles into the shared MarketStateStore.
 
         Some exchange REST adapters already ingest klines as a side effect, while
-        others only return rows. Re-ingesting normalized candles is safe for
-        MarketStateStore because candles are keyed by open_time_ms.
+        others only return rows.  Re-ingesting normalized candles is safe for
+        MarketStateStore because candles are keyed by open_time_ms; it removes
+        startup ingestion ambiguity.
         """
         if self.market_ingestion is None or not candles:
             return 0
@@ -1200,7 +1539,7 @@ class TradingSystemRuntime:
         - Analytics are registered/started.
         - Strategy/risk/execution/Telegram/news are NOT started yet.
 
-        This lets analytics build initial state without
+        This lets analytics components build initial state without
         producing live strategy/risk/execution side effects.
         """
         if not self._startup_warmup_enabled():
@@ -1426,7 +1765,7 @@ class TradingSystemRuntime:
                 await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
 
         # Candle warmup writes directly into MarketStateStore through
-        # MarketIngestionService. Price-action/liquidity receive restored scopes
+        # MarketIngestionService. Analytics/liquidity receive restored scopes
         # through MarketScheduler snapshots before strategy/risk/execution start.
         kline_jobs = [(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
         for start in range(0, len(kline_jobs), batch_size):
@@ -1467,12 +1806,12 @@ class TradingSystemRuntime:
         if self.settings.startup_warmup_required:
             if kline_jobs and kline_success <= 0:
                 raise RuntimeError(
-                    "Startup warmup failed: no historical candles were loaded for analytics"
+                    "Startup warmup failed: no historical candles were loaded for analytics/liquidity"
                 )
             if kline_failed:
                 raise RuntimeError(
                     "Startup warmup failed: some candle scopes do not have enough history "
-                    f"for analytics | failed_count={len(kline_failed)} examples={kline_failed[:20]}"
+                    f"for analytics/liquidity | failed_count={len(kline_failed)} examples={kline_failed[:20]}"
                 )
 
             if symbols and funding_success <= 0:

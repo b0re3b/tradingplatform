@@ -682,6 +682,28 @@ class BinanceWebSocketClient:
 
         event_type = data.get("e")
 
+        # Binance USD-M Futures user data stream events.
+        # These are the primary source of order/fill/account/position updates
+        # for execution.  REST should only submit/cancel orders, seed account
+        # state on startup, and perform rare/symbol-scoped reconciliation.
+        if event_type == "ORDER_TRADE_UPDATE":
+            await self._publish_order_trade_update_event(data)
+            return
+
+        if event_type == "ACCOUNT_UPDATE":
+            await self._publish_account_update_event(data)
+            return
+
+        if event_type == "MARGIN_CALL":
+            await self._publish_margin_call_event(data)
+            return
+
+        if event_type == "listenKeyExpired":
+            await self._publish_listen_key_expired_event(data)
+            return
+
+        # Backward-compatible spot-style/private payloads kept for legacy tests
+        # or adapters that still emit these names.
         if event_type == "executionReport":
             await self._publish_execution_report_event(data)
             return
@@ -1275,6 +1297,308 @@ class BinanceWebSocketClient:
     # ------------------------------------------------------------------
     # Event publishers: private exchange updates
     # ------------------------------------------------------------------
+
+    async def _publish_order_trade_update_event(self, data: dict[str, Any]) -> None:
+        """
+        Publish Binance USD-M Futures ORDER_TRADE_UPDATE as the canonical
+        exchange.order.updated event consumed by execution.OrderManager.
+
+        Binance futures user stream payload shape:
+            {"e": "ORDER_TRADE_UPDATE", "E": ..., "T": ..., "o": {...}}
+
+        The resulting payload intentionally mirrors BinanceRestClient
+        normalized order fields so OrderResult.from_exchange_order() can parse
+        REST responses and WS updates through the same path.
+        """
+        order = data.get("o")
+        if not isinstance(order, dict):
+            self._logger.debug("Malformed Binance ORDER_TRADE_UPDATE payload: missing o")
+            return
+
+        symbol = str(order.get("s") or "").upper().strip()
+        if not symbol:
+            self._logger.debug("Malformed Binance ORDER_TRADE_UPDATE payload: missing symbol")
+            return
+
+        avg_price = self._safe_float(order.get("ap"))
+        last_price = self._safe_float(order.get("L"))
+        order_price = self._safe_float(order.get("p"))
+        stop_price = self._safe_float(order.get("sp"))
+        original_qty = self._safe_float(order.get("q"))
+        last_executed_qty = self._safe_float(order.get("l"))
+        cumulative_filled_qty = self._safe_float(order.get("z"))
+        last_quote_qty = None
+        if last_price is not None and last_executed_qty is not None:
+            last_quote_qty = last_price * last_executed_qty
+
+        payload = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "source": self.SOURCE,
+            "symbol": symbol,
+            "exchange_symbol": symbol,
+
+            # OrderResult / execution.utils compatible names.
+            "order_id": str(order.get("i")) if order.get("i") is not None else None,
+            "orderId": order.get("i"),
+            "client_order_id": order.get("c"),
+            "clientOrderId": order.get("c"),
+            "side": order.get("S"),
+            "type": order.get("o"),
+            "orig_type": order.get("ot"),
+            "status": order.get("X"),
+            "time_in_force": order.get("f"),
+            "price": order_price,
+            "avg_price": avg_price,
+            "orig_qty": original_qty,
+            "quantity": original_qty,
+            "executed_qty": cumulative_filled_qty,
+            "executed_quantity": cumulative_filled_qty,
+            "cum_qty": cumulative_filled_qty,
+            "cumQty": cumulative_filled_qty,
+            "cum_quote": self._safe_float(order.get("b")),
+            "last_executed_qty": last_executed_qty,
+            "last_executed_price": last_price,
+            "last_quote_qty": last_quote_qty,
+            "stop_price": stop_price,
+            "stopPrice": stop_price,
+            "position_side": order.get("ps"),
+            "positionSide": order.get("ps"),
+            "reduce_only": order.get("R"),
+            "reduceOnly": order.get("R"),
+            "close_position": order.get("cp"),
+            "closePosition": order.get("cp"),
+            "working_type": order.get("wt"),
+            "workingType": order.get("wt"),
+
+            # Futures stream specific diagnostics/fill fields.
+            "execution_type": order.get("x"),
+            "order_status": order.get("X"),
+            "order_reject_reason": order.get("r"),
+            "trade_id": str(order.get("t")) if order.get("t") is not None else None,
+            "commission": self._safe_float(order.get("n")),
+            "commission_asset": order.get("N"),
+            "maker": order.get("m"),
+            "realized_pnl": self._safe_float(order.get("rp")),
+            "bid_notional": self._safe_float(order.get("b")),
+            "ask_notional": self._safe_float(order.get("a")),
+            "trade_time": order.get("T"),
+            "transaction_time": order.get("T") or data.get("T"),
+            "update_time": order.get("T") or data.get("T") or data.get("E"),
+            "time": order.get("T") or data.get("T") or data.get("E"),
+            "event_time": data.get("E"),
+            "event_type": data.get("e"),
+            "raw": data,
+            "metadata": {
+                "source": self.SOURCE,
+                "stream_event": "ORDER_TRADE_UPDATE",
+                "execution_type": order.get("x"),
+                "order_status": order.get("X"),
+                "raw": data,
+                "raw_order": order,
+            },
+        }
+
+        await self._emit_event(
+            "exchange.order.updated",
+            payload,
+            priority=EventPriority.CRITICAL,
+        )
+
+        # Optional lower-level stream event for observability.  OrderManager
+        # consumes exchange.order.updated, so this topic is not required for the
+        # trading path.
+        await self._emit_event(
+            "exchange.order.trade_update",
+            payload,
+            priority=EventPriority.HIGH,
+        )
+
+    async def _publish_account_update_event(self, data: dict[str, Any]) -> None:
+        """
+        Publish Binance USD-M Futures ACCOUNT_UPDATE as account + position
+        exchange events.
+
+        PositionManager already consumes exchange.positions.snapshot, so this
+        method emits symbol-normalized position snapshots from the user stream.
+        RiskManager consumes exchange.account.* and can update account equity
+        from the best values present in the stream. REST get_account_info()
+        remains the startup source of truth.
+        """
+        account = data.get("a")
+        if not isinstance(account, dict):
+            self._logger.debug("Malformed Binance ACCOUNT_UPDATE payload: missing a")
+            return
+
+        balances_raw = account.get("B", [])
+        positions_raw = account.get("P", [])
+        if not isinstance(balances_raw, list):
+            balances_raw = []
+        if not isinstance(positions_raw, list):
+            positions_raw = []
+
+        balances: list[dict[str, Any]] = []
+        for item in balances_raw:
+            if not isinstance(item, dict):
+                continue
+            wallet_balance = self._safe_float(item.get("wb"))
+            cross_wallet_balance = self._safe_float(item.get("cw"))
+            balance_change = self._safe_float(item.get("bc"))
+            balances.append(
+                {
+                    "asset": item.get("a"),
+                    "wallet_balance": wallet_balance,
+                    "balance": wallet_balance,
+                    "cross_wallet_balance": cross_wallet_balance,
+                    "available_balance": cross_wallet_balance,
+                    "balance_change": balance_change,
+                    "raw": item,
+                }
+            )
+
+        positions: list[dict[str, Any]] = []
+        total_unrealized_pnl = 0.0
+        for item in positions_raw:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("s") or "").upper().strip()
+            if not symbol:
+                continue
+
+            position_amt = self._safe_float(item.get("pa")) or 0.0
+            unrealized_pnl = self._safe_float(item.get("up")) or 0.0
+            total_unrealized_pnl += unrealized_pnl
+
+            positions.append(
+                {
+                    "exchange": self.EXCHANGE,
+                    "market_type": "usdm_futures",
+                    "symbol": symbol,
+                    "exchange_symbol": symbol,
+                    "position_amt": position_amt,
+                    "positionAmt": position_amt,
+                    "entry_price": self._safe_float(item.get("ep")),
+                    "entryPrice": self._safe_float(item.get("ep")),
+                    "break_even_price": self._safe_float(item.get("bep")),
+                    "breakEvenPrice": self._safe_float(item.get("bep")),
+                    "unrealized_profit": unrealized_pnl,
+                    "unRealizedProfit": unrealized_pnl,
+                    "margin_type": item.get("mt"),
+                    "marginType": item.get("mt"),
+                    "isolated_margin": self._safe_float(item.get("iw")) or 0.0,
+                    "isolatedMargin": self._safe_float(item.get("iw")) or 0.0,
+                    "position_side": item.get("ps"),
+                    "positionSide": item.get("ps"),
+                    "update_time": data.get("E"),
+                    "updateTime": data.get("E"),
+                    "raw": item,
+                    "metadata": {
+                        "source": self.SOURCE,
+                        "stream_event": "ACCOUNT_UPDATE",
+                        "update_reason": account.get("m"),
+                    },
+                }
+            )
+
+        # Prefer USDT balance as the USD-M account equity proxy.  If the stream
+        # contains only another asset, fall back to the first balance.
+        usdt_balance = next((b for b in balances if str(b.get("asset") or "").upper() == "USDT"), None)
+        primary_balance = usdt_balance or (balances[0] if balances else {})
+        wallet_balance = self._safe_float(primary_balance.get("wallet_balance"))
+        cross_wallet_balance = self._safe_float(primary_balance.get("cross_wallet_balance"))
+        total_margin_balance = (
+            wallet_balance + total_unrealized_pnl
+            if wallet_balance is not None
+            else None
+        )
+
+        common = {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "source": self.SOURCE,
+            "event_time": data.get("E"),
+            "transaction_time": data.get("T"),
+            "update_reason": account.get("m"),
+            "raw": data,
+        }
+
+        await self._emit_event(
+            "exchange.account.position_updated",
+            {
+                **common,
+                "balances": balances,
+                "positions": positions,
+                "count": len(positions),
+            },
+            priority=EventPriority.HIGH,
+        )
+
+        await self._emit_event(
+            "exchange.positions.snapshot",
+            {
+                **common,
+                "symbol": None,
+                "positions": positions,
+                "count": len(positions),
+                "snapshot_time": self._current_timestamp_ms(),
+                "source_event": "ACCOUNT_UPDATE",
+            },
+            priority=EventPriority.HIGH,
+        )
+
+        await self._emit_event(
+            "exchange.account.updated",
+            {
+                **common,
+                "fee_tier": None,
+                "can_trade": True,
+                "total_initial_margin": None,
+                "total_maint_margin": None,
+                "total_wallet_balance": wallet_balance,
+                "total_unrealized_profit": total_unrealized_pnl,
+                "total_margin_balance": total_margin_balance,
+                "total_position_initial_margin": None,
+                "total_open_order_initial_margin": None,
+                "total_cross_wallet_balance": cross_wallet_balance,
+                "total_cross_unrealized_pnl": total_unrealized_pnl,
+                "available_balance": cross_wallet_balance,
+                "max_withdraw_amount": None,
+                "assets": balances,
+                "positions": positions,
+                "snapshot_time": self._current_timestamp_ms(),
+                "source_event": "ACCOUNT_UPDATE",
+            },
+            priority=EventPriority.HIGH,
+        )
+
+    async def _publish_margin_call_event(self, data: dict[str, Any]) -> None:
+        await self._emit_event(
+            "exchange.account.margin_call",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "source": self.SOURCE,
+                "event_time": data.get("E"),
+                "cross_wallet_balance": self._safe_float(data.get("cw")),
+                "positions": data.get("p", []),
+                "raw": data,
+            },
+            priority=EventPriority.CRITICAL,
+        )
+
+    async def _publish_listen_key_expired_event(self, data: dict[str, Any]) -> None:
+        self._listen_key = None
+        await self._remove_listen_key_keepalive_job()
+        await self._emit_event(
+            "system.exchange.listen_key.expired",
+            {
+                "exchange": self.EXCHANGE,
+                "market_type": "usdm_futures",
+                "source": self.SOURCE,
+                "event_time": data.get("E"),
+            },
+            priority=EventPriority.HIGH,
+        )
 
     async def _publish_execution_report_event(self, data: dict[str, Any]) -> None:
         """
