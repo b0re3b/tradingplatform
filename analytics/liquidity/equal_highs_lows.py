@@ -53,7 +53,7 @@ class PivotPoint:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -112,7 +112,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -180,7 +180,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -226,23 +226,64 @@ class EqualHighsLowsDetector:
 
         try:
             highs, lows, closes = extract_hlc(candles_list)
-            self._validate_ohlc(
-                highs=highs,
-                lows=lows,
-                closes=closes,
+        except Exception as exc:
+            self._logger.warning(
+                "Failed to extract OHLC for equal highs/lows detection | exchange=%s market_type=%s symbol=%s timeframe=%s candles_count=%s error=%s",
+                exchange,
+                market_type,
+                symbol,
+                timeframe,
+                len(candles_list),
+                exc,
             )
-        except Exception:
-            self._logger.exception(
-                "Failed to extract OHLC for equal highs/lows detection",
+            return []
+
+        valid_points: list[tuple[Any, float, float, float]] = []
+        invalid_points = 0
+        for candle, high, low, close in zip(candles_list, highs, lows, closes):
+            if high <= 0 or low <= 0 or close <= 0 or high < low:
+                invalid_points += 1
+                continue
+            valid_points.append((candle, high, low, close))
+
+        if invalid_points > 0 and self._logger.isEnabledFor(10):
+            self._logger.debug(
+                "Dropped invalid OHLC points for equal highs/lows detection",
                 extra={
                     "exchange": exchange,
                     "market_type": market_type,
                     "symbol": symbol,
                     "timeframe": timeframe,
-                    "candles_count": len(candles_list),
+                    "invalid_points": invalid_points,
+                    "total_points": len(candles_list),
                 },
             )
-            raise
+
+        if len(valid_points) < minimum_candles:
+            return []
+
+        candles_list = [entry[0] for entry in valid_points]
+        highs = [entry[1] for entry in valid_points]
+        lows = [entry[2] for entry in valid_points]
+        closes = [entry[3] for entry in valid_points]
+
+        try:
+            self._validate_ohlc(
+                highs=highs,
+                lows=lows,
+                closes=closes,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "Invalid OHLC after sanitation for equal highs/lows detection | exchange=%s market_type=%s symbol=%s timeframe=%s candles_count=%s error=%s",
+                exchange,
+                market_type,
+                symbol,
+                timeframe,
+                len(candles_list),
+                exc,
+            )
+            return []
 
         resolved_current_price = self._resolve_current_price(
             current_price=current_price,
@@ -343,7 +384,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -378,7 +419,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -406,7 +447,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -457,7 +498,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -512,7 +553,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -575,7 +616,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -648,7 +689,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -698,7 +739,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -791,7 +832,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -862,7 +903,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -917,7 +958,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -956,7 +997,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1004,7 +1045,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1080,7 +1121,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1128,7 +1169,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1189,7 +1230,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1234,7 +1275,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1266,7 +1307,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1294,7 +1335,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1322,7 +1363,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1345,7 +1386,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1367,7 +1408,7 @@ class EqualHighsLowsDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }

@@ -1045,11 +1045,14 @@ class TelegramFormatter:
         )
 
     def _liquidity_specs(self, event_name: str) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+        level_paths = ("level", "price_level", "liquidity_level")
+        if not event_name.endswith(".map.updated"):
+            level_paths = (*level_paths, "price")
         return (
             ("Event", ("liquidity_event", "event_type", "type", "reason"), "text"),
             ("Bias", ("bias",), "text"),
             ("Side", ("side", "direction", "sweep_side"), "text"),
-            ("Level", ("level", "price_level", "liquidity_level", "price"), "price"),
+            ("Level", level_paths, "price"),
             ("Current Price", ("current_price", "last_price", "price", "mid_price"), "price"),
             ("Sweep", ("sweep_detected", "swept", "is_swept", "detected"), "bool"),
             ("Sweep Risk Up", ("sweep_risk_up", "up_sweep_risk", "sweep_risk.up"), "number"),

@@ -84,7 +84,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -140,7 +140,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -175,7 +175,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -200,7 +200,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -225,7 +225,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -250,7 +250,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -274,7 +274,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -308,7 +308,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -361,7 +361,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -400,7 +400,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -431,7 +431,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -469,7 +469,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -523,7 +523,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -569,7 +569,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -593,7 +593,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -624,7 +624,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -696,7 +696,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -742,7 +742,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -780,7 +780,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -808,7 +808,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -837,7 +837,7 @@ class LiquidityTimeframeState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -880,7 +880,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -912,7 +912,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -950,7 +950,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -984,7 +984,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1015,7 +1015,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1045,7 +1045,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1085,7 +1085,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1121,7 +1121,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1167,7 +1167,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1229,7 +1229,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1266,7 +1266,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1298,7 +1298,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1328,7 +1328,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1367,7 +1367,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1391,7 +1391,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1415,7 +1415,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1439,7 +1439,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1463,7 +1463,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1487,7 +1487,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1521,7 +1521,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1557,7 +1557,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1593,7 +1593,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1625,7 +1625,7 @@ class LiquidityState:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }

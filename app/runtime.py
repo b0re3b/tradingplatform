@@ -196,7 +196,7 @@ class RuntimeSettings:
     orderflow_default_market_type: str = "usdm_futures"
     orderflow_default_timeframe: str = "1m"
     liquidity_candles_updated_topics: list[str] = field(default_factory=lambda: ["market.candles.updated"])
-    liquidity_min_candles_for_snapshot: int = 5
+    liquidity_min_candles_for_snapshot: int = 30
 
     market_scheduler_interval_seconds: float = 1.0
     market_scheduler_batch_size: int = 100
@@ -343,7 +343,7 @@ class RuntimeSettings:
             orderflow_default_market_type=env_str("ORDERFLOW_DEFAULT_MARKET_TYPE", env_str("ANALYTICS_MARKET_TYPE", "usdm_futures")),
             orderflow_default_timeframe=env_str("ORDERFLOW_DEFAULT_TIMEFRAME", env_str("MARKET_DATA_PRIMARY_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")),
             liquidity_candles_updated_topics=env_list("LIQUIDITY_CANDLES_UPDATED_TOPICS", ["market.candles.updated"]),
-            liquidity_min_candles_for_snapshot=max(1, env_int("LIQUIDITY_MIN_CANDLES_FOR_SNAPSHOT", 5)),
+            liquidity_min_candles_for_snapshot=max(30, env_int("LIQUIDITY_MIN_CANDLES_FOR_SNAPSHOT", 30)),
 
             market_scheduler_interval_seconds=max(0.05, env_float("MARKET_SCHEDULER_INTERVAL_SECONDS", 1.0)),
             market_scheduler_batch_size=max(1, env_int("MARKET_SCHEDULER_BATCH_SIZE", 100)),

@@ -1080,6 +1080,13 @@ class PositionManager:
             if value is not None:
                 return value
 
+            for nested_key in ("strategy", "risk", "payload", "signal"):
+                nested = metadata.get(nested_key)
+                if isinstance(nested, Mapping):
+                    value = nested.get(key)
+                    if value is not None:
+                        return value
+
         return default
 
     @staticmethod

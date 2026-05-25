@@ -309,6 +309,11 @@ class SLTPManager:
     async def place_protective_orders(self, plan: SLTPPlan) -> list[ProtectiveOrderState]:
         """
         Place SL/TP/trailing orders for one position via OrderManager.
+
+        Protective orders are submitted independently. If one side fails
+        (for example TP is rejected as immediately-triggering), the other
+        side must still be tracked and kept active instead of losing the
+        already-created order state.
         """
         if not self._config.enabled:
             return []
@@ -316,15 +321,36 @@ class SLTPManager:
         plan.validate()
 
         created: list[ProtectiveOrderState] = []
+        failures: list[dict[str, Any]] = []
+
+        async def submit_one(sltp_type: SLTPType, callback: Any) -> None:
+            try:
+                created.append(await callback(plan))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._stats.register_failure(str(exc))
+                failures.append(
+                    {
+                        "sltp_type": sltp_type.value,
+                        "error": str(exc),
+                    }
+                )
+                self._logger.exception(
+                    "Failed to place protective order | symbol=%s side=%s type=%s",
+                    plan.symbol,
+                    plan.position_side.value,
+                    sltp_type.value,
+                )
 
         if plan.stop_loss is not None:
-            created.append(await self._place_stop_loss(plan))
+            await submit_one(SLTPType.STOP_LOSS, self._place_stop_loss)
 
         if plan.take_profit is not None:
-            created.append(await self._place_take_profit(plan))
+            await submit_one(SLTPType.TAKE_PROFIT, self._place_take_profit)
 
         if plan.trailing_callback_rate is not None:
-            created.append(await self._place_trailing_stop(plan))
+            await submit_one(SLTPType.TRAILING_STOP, self._place_trailing_stop)
 
         async with self._lock:
             key = self._position_key(plan.position_id, plan.symbol, plan.position_side)
@@ -332,14 +358,28 @@ class SLTPManager:
             existing.extend(created)
 
         await self._emit_event(
-            "execution.sltp.place_completed",
+            "execution.sltp.place_completed" if not failures else "execution.sltp.place_partial",
             {
                 **plan.to_event_payload(),
                 "protective_orders_count": len(created),
                 "protective_orders": [state.snapshot() for state in created],
+                "failures": failures,
             },
             priority=EventPriority.HIGH,
         )
+
+        if failures:
+            await self._emit_event(
+                "execution.sltp.place_failed",
+                {
+                    **plan.to_event_payload(),
+                    "protective_orders_count": len(created),
+                    "protective_orders": [state.snapshot() for state in created],
+                    "failures": failures,
+                    "reason": "partial_protective_order_failure",
+                },
+                priority=EventPriority.HIGH,
+            )
 
         return created
 
@@ -738,9 +778,11 @@ class SLTPManager:
             if not symbol or side is None:
                 return
 
+            symbol_n = normalize_symbol(str(symbol))
+
             async with self._lock:
                 states = self._matching_protective_orders(
-                    symbol=normalize_symbol(str(symbol)),
+                    symbol=symbol_n,
                     position_side=side,
                     position_id=position_id,
                     sltp_type=None,
@@ -752,13 +794,45 @@ class SLTPManager:
                     state.updated_at = now_ts()
                     state.metadata["resized_from_position_update"] = True
 
+                has_stop = any(state.sltp_type is SLTPType.STOP_LOSS for state in states)
+                has_take_profit = any(state.sltp_type is SLTPType.TAKE_PROFIT for state in states)
+
+            # Important recovery path:
+            # A position may first appear from exchange.positions.snapshot without
+            # risk metadata, so position.opened has no stop_loss/take_profit and
+            # auto placement is skipped. When the later execution.order_filled or
+            # correlated order update enriches the PositionState with protective
+            # levels, this position.updated event must backfill missing SL/TP.
+            stop_loss = safe_float(payload.get("stop_loss"))
+            take_profit = safe_float(payload.get("take_profit"))
+
+            if (stop_loss is not None and not has_stop) or (take_profit is not None and not has_take_profit):
+                plan = self._plan_from_position_payload(
+                    {
+                        **payload,
+                        "stop_loss": stop_loss if not has_stop else None,
+                        "take_profit": take_profit if not has_take_profit else None,
+                    }
+                )
+                if plan is not None:
+                    plan.metadata = merge_metadata(
+                        plan.metadata,
+                        {
+                            "source_event": "position.updated",
+                            "recovery_reason": "missing_protective_orders",
+                            "had_stop_loss_order": has_stop,
+                            "had_take_profit_order": has_take_profit,
+                        },
+                    )
+                    await self.place_protective_orders(plan)
+
             await self._emit_event(
                 "execution.sltp.resized",
                 {
                     **base_execution_payload(
                         exchange=payload.get("exchange") or self._config.default_exchange,
                         market_type=payload.get("market_type") or self._config.default_market_type,
-                        symbol=str(symbol),
+                        symbol=symbol_n,
                         signal_id=payload.get("signal_id"),
                         strategy_name=payload.get("strategy_name"),
                         reservation_id=payload.get("reservation_id"),

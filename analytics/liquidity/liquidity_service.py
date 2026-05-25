@@ -5,12 +5,12 @@ import asyncio
 import inspect
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from core.event_bus import Event, EventBus, EventPriority, Subscription
 from core.logger import get_logger
 from core.scheduler import Scheduler
-from analytics.market_state_contract import MarketStateSnapshotSource, snapshot_candles
+from analytics.market_state_contract import MarketStateSnapshotSource
 
 from analytics.liquidity.config import LiquidityConfig
 from analytics.liquidity.enums import SweepStatus
@@ -34,7 +34,7 @@ from analytics.liquidity.models import (
     utc_now,
 )
 from .state import LiquidityState
-from .utils import get_candle_close, get_first_value, safe_float
+from .utils import get_candle_close, get_candle_high, get_candle_low, get_first_value, safe_float
 
 
 @dataclass(slots=True)
@@ -547,23 +547,8 @@ class LiquidityService:
         if snapshot is None:
             self._stats.skipped_no_context += 1
             return None
-        candles = snapshot_candles(snapshot, timeframe=timeframe)
-        orderbook = getattr(snapshot, "orderbook", None)
-        current_price = (
-            getattr(snapshot, "last_price", None)
-            or getattr(snapshot, "mark_price", None)
-            or getattr(orderbook, "mid_price", None)
-        )
-        await self._on_candles_updated({
-            "exchange": exchange,
-            "market_type": market_type,
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "candles": list(candles or []),
-            "current_price": current_price,
-            "source_topic": "market_state.snapshot",
-        })
-        return await self.rebuild_snapshot(
+        return await self._process_market_snapshot_data(
+            snapshot=snapshot,
             exchange=exchange,
             market_type=market_type,
             symbol=symbol,
@@ -599,12 +584,64 @@ class LiquidityService:
         )
         if not symbol:
             return None
-        return await self.process_market_state_snapshot(
+        return await self._process_market_snapshot_data(
+            snapshot=snapshot,
             exchange=str(exchange),
             market_type=str(market_type),
             symbol=str(symbol).upper(),
             timeframe=str(timeframe),
         )
+
+    async def _process_market_snapshot_data(
+        self,
+        *,
+        snapshot: Any,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+        force: bool = False,
+    ) -> LiquidityMapSnapshot | None:
+        candles = self._snapshot_candles(snapshot, timeframe=timeframe)
+        if not candles:
+            self._stats.skipped_not_enough_data += 1
+            return None
+
+        current_price = self._resolve_snapshot_current_price(
+            snapshot=snapshot,
+            candles=candles,
+        )
+        if current_price is None or current_price <= 0:
+            self._stats.skipped_not_enough_data += 1
+            return None
+
+        key = self.make_key(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            timeframe=timeframe,
+        )
+        if not self._config.should_process_key(key):
+            self._stats.skipped_by_scope_filter += 1
+            return None
+
+        event_ts = self._extract_event_timestamp(snapshot) or utc_now()
+        lock = self._get_lock(key)
+
+        async with lock:
+            context = self._get_or_create_context_from_key(key)
+            context.candles = candles[-self._config.max_candles_per_context :]
+            context.current_price = current_price
+            context.orderbook = self._snapshot_orderbook(snapshot)
+            context.touch(event_ts)
+
+            state = self._state.get_or_create_key(key)
+            state.record_candle_processed(ts=event_ts)
+
+            return await self._rebuild_context_snapshot_locked(
+                context=context,
+                force=force,
+            )
 
     def get_state(self) -> LiquidityState:
         return self._state
@@ -1529,6 +1566,129 @@ class LiquidityService:
             symbol=symbol,
             timeframe=timeframe,
         )
+
+    # ------------------------------------------------------------------
+    # MarketSnapshot adapters
+    # ------------------------------------------------------------------
+
+    def _snapshot_candles(self, snapshot: Any, *, timeframe: str) -> list[Any]:
+        container = getattr(snapshot, "candles", None)
+        if container is None and isinstance(snapshot, Mapping):
+            container = snapshot.get("candles")
+        if container is None:
+            return []
+
+        selected = None
+        if isinstance(container, Mapping):
+            selected = container.get(timeframe) or container.get(str(timeframe))
+            if selected is None and container:
+                selected = next(iter(container.values()))
+        else:
+            selected = container
+
+        candles = self._extract_items(selected, "candles")
+        valid: list[Any] = []
+        for candle in candles:
+            high = safe_float(get_candle_high(candle), default=0.0) or 0.0
+            low = safe_float(get_candle_low(candle), default=0.0) or 0.0
+            close = safe_float(get_candle_close(candle), default=0.0) or 0.0
+            if high > 0 and low > 0 and close > 0 and high >= low:
+                valid.append(candle)
+        return valid
+
+    def _snapshot_orderbook(self, snapshot: Any) -> dict[str, list[Any]]:
+        orderbook = getattr(snapshot, "orderbook", None)
+        if orderbook is None and isinstance(snapshot, Mapping):
+            orderbook = snapshot.get("orderbook")
+        if orderbook is None:
+            return {"bids": [], "asks": []}
+
+        bids = self._extract_items(orderbook, "bids")
+        asks = self._extract_items(orderbook, "asks")
+        return {
+            "bids": self._normalize_orderbook_levels(bids),
+            "asks": self._normalize_orderbook_levels(asks),
+        }
+
+    def _resolve_snapshot_current_price(
+        self,
+        *,
+        snapshot: Any,
+        candles: Sequence[Any],
+    ) -> float | None:
+        latest_close = self._latest_valid_candle_close(candles)
+        if latest_close is not None:
+            return latest_close
+
+        orderbook = getattr(snapshot, "orderbook", None)
+        candidates = (
+            getattr(snapshot, "current_price", None),
+            getattr(snapshot, "reference_price", None),
+            getattr(snapshot, "last_price", None),
+            getattr(snapshot, "mark_price", None),
+            getattr(orderbook, "mid_price", None),
+        )
+        if isinstance(snapshot, Mapping):
+            candidates = (
+                snapshot.get("current_price"),
+                snapshot.get("reference_price"),
+                snapshot.get("last_price"),
+                snapshot.get("mark_price"),
+            )
+        for candidate in candidates:
+            price = safe_float(candidate, default=0.0) or 0.0
+            if price > 0:
+                return price
+        return None
+
+    @staticmethod
+    def _latest_valid_candle_close(candles: Sequence[Any]) -> float | None:
+        for candle in reversed(candles):
+            price = safe_float(get_candle_close(candle), default=0.0) or 0.0
+            if price > 0:
+                return price
+        return None
+
+    @staticmethod
+    def _extract_items(container: Any, key: str) -> list[Any]:
+        if container is None:
+            return []
+        value = None
+        if isinstance(container, Mapping):
+            value = container.get(key) or container.get("items") or container.get("window")
+        if value is None:
+            value = getattr(container, key, None)
+        if value is None:
+            value = getattr(container, "items", None)
+        if value is None:
+            value = getattr(container, "window", None)
+        if value is None:
+            value = container
+        if isinstance(value, Mapping):
+            return list(value.values())
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return list(value)
+        return []
+
+    @staticmethod
+    def _normalize_orderbook_levels(levels: Sequence[Any]) -> list[Any]:
+        normalized: list[Any] = []
+        for level in levels:
+            if isinstance(level, Mapping):
+                price = safe_float(level.get("price"), default=0.0) or 0.0
+                quantity = safe_float(
+                    level.get("quantity") or level.get("qty") or level.get("size"),
+                    default=0.0,
+                ) or 0.0
+            elif isinstance(level, Sequence) and not isinstance(level, (str, bytes, bytearray)) and len(level) >= 2:
+                price = safe_float(level[0], default=0.0) or 0.0
+                quantity = safe_float(level[1], default=0.0) or 0.0
+            else:
+                price = safe_float(getattr(level, "price", None), default=0.0) or 0.0
+                quantity = safe_float(getattr(level, "quantity", None), default=0.0) or 0.0
+            if price > 0 and quantity > 0:
+                normalized.append({"price": price, "quantity": quantity})
+        return normalized
 
     # ------------------------------------------------------------------
     # Payload helpers

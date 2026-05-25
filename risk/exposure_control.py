@@ -211,8 +211,14 @@ class ExposureControl:
         )
 
         if violations:
+            violation_details = [
+                f"{v.violation_type.value}(current={v.current_value:.4f},limit={v.limit_value:.4f})"
+                for v in violations
+                if v.current_value is not None and v.limit_value is not None
+            ] or [v.violation_type.value for v in violations]
+
             self._logger.warning(
-                "Exposure check failed | symbol=%s side=%s violations=%s open_risk_r=%s margin_pct=%s total_exposure_pct=%s pending_reservations=%s",
+                "Exposure check failed | symbol=%s side=%s violations=%s open_risk_r=%s margin_pct=%s total_exposure_pct=%s pending_reservations=%s details=%s",
                 request.symbol,
                 request.side.value,
                 len(violations),
@@ -220,11 +226,22 @@ class ExposureControl:
                 projected_margin_pct,
                 projected_total_exposure_pct,
                 self._pending_reservations_count(state),
+                violation_details,
                 extra={
                     "symbol": request.symbol,
                     "side": request.side.value,
                     "risk_mode": risk_mode.value,
                     "pending_reservations": self._pending_reservations_count(state),
+                    "violation_types": [v.violation_type.value for v in violations],
+                    "violation_details": [
+                        {
+                            "type": v.violation_type.value,
+                            "current": v.current_value,
+                            "limit": v.limit_value,
+                            "message": v.message,
+                        }
+                        for v in violations
+                    ],
                 },
             )
             return RiskCheckResult(

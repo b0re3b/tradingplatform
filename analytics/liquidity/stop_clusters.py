@@ -56,7 +56,7 @@ class OrderbookLevel:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -124,7 +124,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -170,7 +170,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -200,7 +200,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -224,7 +224,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -248,7 +248,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -275,7 +275,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -311,7 +311,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -337,7 +337,7 @@ class StopClusterCandidate:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -392,7 +392,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -447,7 +447,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -566,7 +566,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -607,7 +607,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -666,7 +666,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -740,7 +740,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -782,7 +782,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -827,7 +827,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -891,7 +891,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -930,7 +930,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -969,7 +969,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1002,7 +1002,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1037,7 +1037,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1074,7 +1074,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1152,7 +1152,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1220,7 +1220,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1292,7 +1292,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1339,7 +1339,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1406,7 +1406,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1450,7 +1450,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1496,7 +1496,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1537,7 +1537,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1609,7 +1609,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1653,7 +1653,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1776,7 +1776,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1817,7 +1817,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1857,7 +1857,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1907,7 +1907,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -1973,7 +1973,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2007,7 +2007,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2058,7 +2058,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2106,7 +2106,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2154,7 +2154,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2199,7 +2199,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2243,7 +2243,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2276,7 +2276,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2309,7 +2309,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2361,7 +2361,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2387,7 +2387,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2410,7 +2410,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2432,7 +2432,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2463,7 +2463,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2497,7 +2497,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -2534,7 +2534,7 @@ class StopClustersDetector:
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }

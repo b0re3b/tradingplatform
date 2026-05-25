@@ -462,7 +462,12 @@ class TradingSystemRuntime:
                 market_ingestion=market_ingestion,
             )
 
-            if self.settings.startup_warmup_persist_enabled:
+            # Live Parquet/event persistence is independent from the removed
+            # startup warmup/history preload path.  Do not gate storage by
+            # STARTUP_WARMUP_PERSIST_ENABLED: analytics, strategy, signal,
+            # execution and storage events still need to be persisted during
+            # normal live runtime.
+            if self._live_parquet_storage_enabled():
                 self.parquet_storage = build_parquet_storage(
                     self.config,
                     self.event_bus,
@@ -474,11 +479,11 @@ class TradingSystemRuntime:
                 self.components.append(self.parquet_storage)
                 await register_component(self.parquet_storage)
                 await start_component(self.parquet_storage)
-                self._validate_startup_storage_ready()
+                self._validate_live_storage_ready()
 
-            elif self.settings.startup_warmup_persist_required and self._startup_warmup_enabled():
+            elif self._live_parquet_storage_required():
                 raise RuntimeError(
-                    "STARTUP_WARMUP_PERSIST_REQUIRED=true but STARTUP_WARMUP_PERSIST_ENABLED=false"
+                    "STORAGE_PARQUET_REQUIRED=true but STORAGE_PARQUET_ENABLED=false"
                 )
 
             market_stream = build_market_stream(
@@ -514,16 +519,22 @@ class TradingSystemRuntime:
                 market_scheduler=market_scheduler,
             )
 
-            # Analytics are started directly from live MarketState/MarketScheduler.
-            # Historical Parquet restore and REST startup warmup are intentionally
-            # disabled in this runtime path; inactive analytics domains must be
-            # excluded by RuntimeSettings/factories.
+            # Analytics must be registered before historical hydration so restored
+            # candles/funding/OI/liquidations can be converted into analytics
+            # events before strategy/risk/execution start. This is especially
+            # important for liquidity: it only evaluates candle/warmup dirty
+            # scopes and requires enough candles to build a snapshot.
             for component in analytics_components:
                 self.components.append(component)
                 await _start_analytics_component(component)
 
-            # Start periodic state-snapshot evaluation for live dirty scopes.
+            # Start periodic state-snapshot evaluation for live dirty scopes, then
+            # hydrate MarketStateStore and force one-shot scheduler evaluations.
+            # Both helpers are internally guarded by RuntimeSettings, so disabled
+            # deployments still skip them cleanly.
             await start_component(market_scheduler)
+            await self._load_startup_parquet_history(universe)
+            await self._run_startup_warmup(universe)
 
         # ------------------------------------------------------------------
         # Risk account bootstrap
@@ -952,6 +963,80 @@ class TradingSystemRuntime:
             if client is not None:
                 result[str(exchange).lower()] = client
         return result
+
+    @staticmethod
+    def _env_bool_any(*names: str, default: bool = False) -> bool:
+        for name in names:
+            raw = os.getenv(name)
+            if raw is None or not raw.strip():
+                continue
+            normalized = raw.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on", "enabled"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off", "disabled"}:
+                return False
+        return bool(default)
+
+    def _live_parquet_storage_enabled(self) -> bool:
+        """Return whether live event persistence should be started.
+
+        This is intentionally separate from startup warmup persistence.
+        STARTUP_WARMUP_* controls historical preload only; STORAGE_PARQUET_*
+        controls ongoing persistence of analytics/strategy/execution events.
+        """
+        storage = getattr(self.config, "storage", None)
+        config_default = bool(
+            getattr(storage, "parquet_enabled", False)
+            or getattr(storage, "enabled", False)
+            or getattr(storage, "storage_parquet_enabled", False)
+        )
+        return self._env_bool_any(
+            "STORAGE_PARQUET_ENABLED",
+            "PARQUET_STORAGE_ENABLED",
+            "EVENT_PERSISTENCE_ENABLED",
+            default=config_default,
+        )
+
+    def _live_parquet_storage_required(self) -> bool:
+        storage = getattr(self.config, "storage", None)
+        config_default = bool(
+            getattr(storage, "parquet_required", False)
+            or getattr(storage, "required", False)
+        )
+        return self._env_bool_any(
+            "STORAGE_PARQUET_REQUIRED",
+            "PARQUET_STORAGE_REQUIRED",
+            "EVENT_PERSISTENCE_REQUIRED",
+            default=config_default,
+        )
+
+    def _validate_live_storage_ready(self) -> None:
+        if self.parquet_storage is None:
+            if self._live_parquet_storage_required():
+                raise RuntimeError("Live Parquet storage is required but ParquetStorage was not created")
+            return
+
+        stats_method = getattr(self.parquet_storage, "stats", None)
+        stats = stats_method() if callable(stats_method) else {}
+        enabled = bool(stats.get("enabled", True))
+        started = bool(stats.get("started", False))
+        registered = bool(stats.get("registered", False))
+
+        if self._live_parquet_storage_required():
+            if not enabled:
+                raise RuntimeError("Live Parquet storage is required but ParquetStorage is disabled")
+            if not registered or not started:
+                raise RuntimeError(
+                    f"Live Parquet storage is required but ParquetStorage is not ready: {stats}"
+                )
+
+        logger.info(
+            "Live Parquet storage ready | enabled=%s registered=%s started=%s root_dir=%s",
+            enabled,
+            registered,
+            started,
+            stats.get("root_dir"),
+        )
 
     def _validate_startup_storage_ready(self) -> None:
         if not self.settings.startup_warmup_persist_enabled:

@@ -341,6 +341,14 @@ class RiskDecision:
     side: PositionSide | None = None
     order_intent: OrderIntent | None = None
 
+    # Protective levels must remain first-class on the approved decision.
+    # Execution may receive either the serialized signal.confirmed payload or a
+    # RiskDecision object directly; keeping these fields here prevents SL/TP
+    # loss on object-based handoff paths.
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+
     # Pass-through source contract. These fields are copied from
     # RiskEvaluationRequest so every downstream event has one stable shape.
     event_version: str = "1.0"

@@ -39,7 +39,7 @@ class LiquiditySide(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -64,7 +64,7 @@ class LiquiditySide(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -89,7 +89,7 @@ class LiquiditySide(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -137,7 +137,7 @@ class LiquidityLevelType(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -166,7 +166,7 @@ class LiquidityLevelType(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -195,7 +195,7 @@ class LiquidityLevelType(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -227,7 +227,7 @@ class LiquidityLevelType(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -257,7 +257,7 @@ class LiquidityLevelType(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -298,7 +298,7 @@ class LiquidityStatus(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -323,7 +323,7 @@ class LiquidityStatus(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -363,7 +363,7 @@ class SweepStatus(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -388,7 +388,7 @@ class SweepStatus(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -413,7 +413,7 @@ class SweepStatus(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -452,7 +452,7 @@ class ClusterStrength(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -482,7 +482,7 @@ class ClusterStrength(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }
@@ -517,7 +517,7 @@ class LiquidityBias(str, Enum):
                     if isinstance(_v, (list, tuple, set, frozenset))
                     else {"type": type(_v).__name__}
                 )
-                for _k, _v in locals().items()
+                for _k, _v in (locals().items() if _analytics_logger.isEnabledFor(10) else ())
                 if _k not in {"self", "cls", "_analytics_logger", "_analytics_class_name", "_analytics_args"}
                 and not _k.startswith("_analytics")
             }

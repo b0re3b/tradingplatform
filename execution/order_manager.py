@@ -87,6 +87,16 @@ class BinanceOrderClientProtocol(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    async def cancel_algo_order(
+        self,
+        *,
+        symbol: str | None = None,
+        algo_id: int | str | None = None,
+        client_algo_id: str | None = None,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        ...
+
     async def cancel_all_open_orders(
         self,
         *,
@@ -194,6 +204,7 @@ _NON_RETRYABLE_BINANCE_CODES: set[int] = {
     -4014,  # Price not increased by tick size.
     -4023,  # Quantity not increased by step size.
     -4164,  # Order's notional must be no smaller than minimum.
+    -4120,  # Order type moved to Algo Order API endpoint.
 }
 
 
@@ -580,7 +591,19 @@ class OrderManager:
                 client,
             )
 
-            result = OrderResult.from_exchange_order(payload, request=normalized_request)
+            submit_metadata: dict[str, Any] | None = None
+            if bool(payload.get("algo_order")):
+                submit_metadata = {
+                    "algo_order": True,
+                    "algo_id": payload.get("algo_id") or payload.get("order_id"),
+                    "client_algo_id": payload.get("client_algo_id") or payload.get("client_order_id"),
+                }
+
+            result = OrderResult.from_exchange_order(
+                payload,
+                request=normalized_request,
+                metadata=submit_metadata,
+            )
 
             async with self._lock:
                 self._upsert_order_state(result)
@@ -682,16 +705,40 @@ class OrderManager:
             )
 
         try:
-            payload = await self._with_retries(
-                operation=lambda: client.cancel_order(
-                    symbol=symbol_n,
-                    order_id=int(order_id) if order_id is not None else None,
-                    orig_client_order_id=client_order_id,
-                ),
-                retries=self._config.cancel_retries,
-                retry_delay_seconds=self._config.retry_delay_seconds,
-                operation_name="cancel_order",
-            )
+            is_algo_order = bool(state and state.metadata.get("algo_order"))
+            if is_algo_order:
+                algo_id_value: str | int | None = order_id
+                client_algo_id_value: str | None = client_order_id
+                if algo_id_value is None and state is not None:
+                    algo_id_value = (
+                        state.metadata.get("algo_id")
+                        or state.order_id
+                    )
+                if client_algo_id_value is None and state is not None:
+                    metadata_client_algo_id = state.metadata.get("client_algo_id")
+                    if metadata_client_algo_id is not None:
+                        client_algo_id_value = str(metadata_client_algo_id)
+                payload = await self._with_retries(
+                    operation=lambda: client.cancel_algo_order(
+                        symbol=symbol_n,
+                        algo_id=algo_id_value,
+                        client_algo_id=client_algo_id_value,
+                    ),
+                    retries=self._config.cancel_retries,
+                    retry_delay_seconds=self._config.retry_delay_seconds,
+                    operation_name="cancel_algo_order",
+                )
+            else:
+                payload = await self._with_retries(
+                    operation=lambda: client.cancel_order(
+                        symbol=symbol_n,
+                        order_id=int(order_id) if order_id is not None else None,
+                        orig_client_order_id=client_order_id,
+                    ),
+                    retries=self._config.cancel_retries,
+                    retry_delay_seconds=self._config.retry_delay_seconds,
+                    operation_name="cancel_order",
+                )
 
             dummy_request = self._request_from_state_or_cancel_args(
                 state=state,
@@ -1379,6 +1426,19 @@ class OrderManager:
                     },
                 )
             normalized = request.position_side.value
+
+            # Binance USD-M Futures hedge mode does not accept reduceOnly
+            # together with positionSide=LONG/SHORT. For hedge-mode exits, the
+            # closing side + positionSide already targets the leg to reduce.
+            if request.reduce_only:
+                request.metadata = merge_metadata(
+                    request.metadata,
+                    {
+                        "binance_reduce_only_removed": True,
+                        "binance_reduce_only_removed_reason": "hedge_mode_position_side",
+                    },
+                )
+                request.reduce_only = False
         else:
             # One-way mode expects positionSide=BOTH/omitted. Sending LONG/SHORT
             # causes Binance error -4061. Omit it explicitly.

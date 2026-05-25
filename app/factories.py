@@ -504,7 +504,8 @@ def build_analytics_components(
     """
     liquidity_config = LiquidityConfig(
         candles_updated_input_topics=tuple(settings.liquidity_candles_updated_topics),
-        min_candles_for_snapshot=settings.liquidity_min_candles_for_snapshot,
+        orderbook_input_topics=(),
+        min_candles_for_snapshot=max(30, settings.liquidity_min_candles_for_snapshot),
     )
     liquidity_map = LiquidityMap(config=liquidity_config)
 
@@ -634,7 +635,7 @@ def build_analytics_components(
         evaluator_kwargs={
             "exchange": settings.analytics_exchange,
             "market_type": settings.analytics_market_type,
-            "dirty_reasons": {"candle", "candle_closed", "trade", "trades_batch", "orderbook", "orderbook_resync_required", "rest_snapshot", "warmup"},
+            "dirty_reasons": {"candle", "candle_closed", "warmup"},
         },
     )
 

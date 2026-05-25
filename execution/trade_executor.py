@@ -1077,6 +1077,30 @@ class TradeExecutor:
         risk_mode = self._risk_mode_from_raw(payload.get("risk_mode") or RiskMode.NORMAL)
         margin_mode = self._margin_mode_from_raw(payload.get("margin_mode") or MarginMode.ISOLATED)
 
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), Mapping) else {}
+        strategy_metadata = metadata.get("strategy") if isinstance(metadata.get("strategy"), Mapping) else {}
+
+        def first_float(*keys: str) -> float | None:
+            for key in keys:
+                value = payload.get(key)
+                if value is not None:
+                    parsed = safe_float(value)
+                    if parsed is not None:
+                        return parsed
+            for key in keys:
+                value = metadata.get(key)
+                if value is not None:
+                    parsed = safe_float(value)
+                    if parsed is not None:
+                        return parsed
+            for key in keys:
+                value = strategy_metadata.get(key)
+                if value is not None:
+                    parsed = safe_float(value)
+                    if parsed is not None:
+                        return parsed
+            return None
+
         intent = ExecutionIntent(
             exchange=normalize_exchange(payload.get("exchange") or self._config.default_exchange),
             market_type=normalize_market_type(payload.get("market_type") or self._config.default_market_type),
@@ -1089,9 +1113,9 @@ class TradeExecutor:
             final_risk_amount=final_risk_amount or 0.0,
             final_margin=final_margin or 0.0,
             final_notional=final_notional or 0.0,
-            entry_price=safe_float(payload.get("entry_price")),
-            stop_loss=safe_float(payload.get("stop_loss")),
-            take_profit=safe_float(payload.get("take_profit")),
+            entry_price=first_float("entry_price"),
+            stop_loss=first_float("stop_loss"),
+            take_profit=first_float("take_profit"),
             signal_id=payload.get("signal_id"),
             strategy_name=payload.get("strategy_name"),
             reservation_id=payload.get("reservation_id"),
@@ -1101,7 +1125,7 @@ class TradeExecutor:
             reduce_only=bool(payload.get("reduce_only", False) or order_intent.reduces_risk),
             close_position=bool(payload.get("close_position", False)),
             metadata=merge_metadata(
-                payload.get("metadata"),
+                metadata,
                 {
                     "source_event": "signal.confirmed",
                     "raw_decision": payload.get("decision"),

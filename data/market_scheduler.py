@@ -164,11 +164,6 @@ class MarketScheduler:
         "liquidity": frozenset({
             DirtyReason.CANDLE.value,
             DirtyReason.CANDLE_CLOSED.value,
-            DirtyReason.TRADE.value,
-            DirtyReason.TRADES_BATCH.value,
-            DirtyReason.ORDERBOOK.value,
-            DirtyReason.ORDERBOOK_RESYNC_REQUIRED.value,
-            DirtyReason.REST_SNAPSHOT.value,
             DirtyReason.WARMUP.value,
         }),
         "orderflow": frozenset({DirtyReason.TRADE.value, DirtyReason.TRADES_BATCH.value, DirtyReason.ORDERBOOK.value}),

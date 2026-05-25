@@ -1663,11 +1663,47 @@ class BinanceRestClient:
         """
 
         symbol = symbol.upper()
+        normalized_type = order_type.upper()
+
+        # Binance moved conditional trigger order types to /fapi/v1/algoOrder.
+        # Keep /fapi/v1/order for market/limit style orders.
+        if normalized_type in {
+            "STOP",
+            "STOP_MARKET",
+            "TAKE_PROFIT",
+            "TAKE_PROFIT_MARKET",
+            "TRAILING_STOP_MARKET",
+        }:
+            normalized = await self._create_conditional_algo_order(
+                symbol=symbol,
+                side=side,
+                order_type=normalized_type,
+                quantity=quantity,
+                price=price,
+                position_side=position_side,
+                time_in_force=time_in_force,
+                reduce_only=reduce_only,
+                client_algo_id=new_client_order_id,
+                trigger_price=stop_price,
+                close_position=close_position,
+                activate_price=activation_price,
+                callback_rate=callback_rate,
+                working_type=working_type,
+                price_protect=price_protect,
+                new_order_resp_type=new_order_resp_type,
+                recv_window=recv_window,
+            )
+            await self._emit_event(
+                "exchange.order.submitted",
+                normalized,
+                priority=EventPriority.CRITICAL,
+            )
+            return normalized
 
         params: dict[str, Any] = {
             "symbol": symbol,
             "side": side.upper(),
-            "type": order_type.upper(),
+            "type": normalized_type,
             "recvWindow": recv_window or self._rest_config.recv_window,
         }
 
@@ -1731,6 +1767,74 @@ class BinanceRestClient:
 
         return normalized
 
+    async def _create_conditional_algo_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: float | None,
+        price: float | None,
+        position_side: str | None,
+        time_in_force: str | None,
+        reduce_only: bool | None,
+        client_algo_id: str | None,
+        trigger_price: float | None,
+        close_position: bool | None,
+        activate_price: float | None,
+        callback_rate: float | None,
+        working_type: str | None,
+        price_protect: bool | None,
+        new_order_resp_type: str | None,
+        recv_window: int | None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": order_type.upper(),
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+
+        if position_side is not None:
+            params["positionSide"] = position_side.upper()
+        if time_in_force is not None:
+            params["timeInForce"] = time_in_force.upper()
+        if quantity is not None:
+            params["quantity"] = self._format_number(quantity)
+        if price is not None:
+            params["price"] = self._format_number(price)
+        if trigger_price is not None:
+            params["triggerPrice"] = self._format_number(trigger_price)
+        if working_type is not None:
+            params["workingType"] = working_type.upper()
+        if price_protect is not None:
+            params["priceProtect"] = self._bool_str(price_protect)
+        if reduce_only is not None:
+            params["reduceOnly"] = self._bool_str(reduce_only)
+        if close_position is not None:
+            params["closePosition"] = self._bool_str(close_position)
+        if activate_price is not None:
+            params["activatePrice"] = self._format_number(activate_price)
+        if callback_rate is not None:
+            params["callbackRate"] = self._format_number(callback_rate)
+        if client_algo_id is not None:
+            params["clientAlgoId"] = client_algo_id
+        if new_order_resp_type is not None:
+            params["newOrderRespType"] = new_order_resp_type.upper()
+
+        payload = await self._request(
+            method="POST",
+            path="/fapi/v1/algoOrder",
+            params=params,
+            signed=True,
+            auth_required=True,
+            timeout_seconds=self._rest_config.order_request_timeout_seconds,
+            request_retries=self._rest_config.order_request_retries,
+            retry_delay_seconds=self._rest_config.retry_delay_seconds,
+        )
+        return self._normalize_algo_order(payload)
+
     async def cancel_order(
         self,
         *,
@@ -1770,6 +1874,44 @@ class BinanceRestClient:
             priority=EventPriority.CRITICAL,
         )
 
+        return normalized
+
+    async def cancel_algo_order(
+        self,
+        *,
+        symbol: str | None = None,
+        algo_id: int | str | None = None,
+        client_algo_id: str | None = None,
+        recv_window: int | None = None,
+    ) -> dict[str, Any]:
+        if algo_id is None and client_algo_id is None:
+            raise ValueError("Either algo_id or client_algo_id must be provided")
+
+        params: dict[str, Any] = {
+            "recvWindow": recv_window or self._rest_config.recv_window,
+        }
+        if symbol:
+            params["symbol"] = str(symbol).upper()
+        if algo_id is not None:
+            params["algoId"] = str(algo_id)
+        if client_algo_id is not None:
+            params["clientAlgoId"] = client_algo_id
+
+        payload = await self._request(
+            method="DELETE",
+            path="/fapi/v1/algoOrder",
+            params=params,
+            signed=True,
+            auth_required=True,
+        )
+
+        normalized = self._normalize_algo_cancel(payload, symbol=str(symbol).upper() if symbol else None)
+
+        await self._emit_event(
+            "exchange.order.cancelled",
+            normalized,
+            priority=EventPriority.CRITICAL,
+        )
         return normalized
 
     async def cancel_all_open_orders(
@@ -2596,6 +2738,76 @@ class BinanceRestClient:
             "price_protect": payload.get("priceProtect"),
             "update_time": payload.get("updateTime"),
             "time": payload.get("time"),
+        }
+
+    def _normalize_algo_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        algo_status = payload.get("algoStatus") or payload.get("status") or "NEW"
+        normalized_status = str(algo_status).strip().upper() if algo_status is not None else "UNKNOWN"
+        if not normalized_status:
+            normalized_status = "UNKNOWN"
+
+        return {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol"),
+            "order_id": payload.get("algoId"),
+            "algo_id": payload.get("algoId"),
+            "client_order_id": payload.get("clientAlgoId"),
+            "client_algo_id": payload.get("clientAlgoId"),
+            "price": self._safe_float(payload.get("price")),
+            "avg_price": self._safe_float(payload.get("avgPrice")),
+            "orig_qty": self._safe_float(payload.get("quantity") or payload.get("origQty")),
+            "executed_qty": self._safe_float(payload.get("executedQty")),
+            "cum_qty": self._safe_float(payload.get("cumQty")),
+            "cum_quote": self._safe_float(payload.get("cumQuote")),
+            "cumulative_quote_qty": self._safe_float(payload.get("cumQuote")),
+            "status": normalized_status,
+            "time_in_force": payload.get("timeInForce"),
+            "type": payload.get("orderType") or payload.get("type"),
+            "orig_type": payload.get("orderType") or payload.get("type"),
+            "side": payload.get("side"),
+            "position_side": payload.get("positionSide"),
+            "reduce_only": payload.get("reduceOnly"),
+            "close_position": payload.get("closePosition"),
+            "stop_price": self._safe_float(payload.get("triggerPrice") or payload.get("stopPrice")),
+            "working_type": payload.get("workingType"),
+            "price_protect": payload.get("priceProtect"),
+            "update_time": payload.get("updateTime"),
+            "time": payload.get("createTime"),
+            "algo_order": True,
+        }
+
+    def _normalize_algo_cancel(
+        self,
+        payload: dict[str, Any],
+        *,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        algo_id = payload.get("algoId")
+        client_algo_id = payload.get("clientAlgoId")
+        algo_status = payload.get("algoStatus") or payload.get("status") or payload.get("msg")
+        status_text = str(algo_status).strip().upper() if algo_status is not None else ""
+        normalized_status = "CANCELED"
+        if status_text in {"REJECTED", "EXPIRED", "EXPIRED_IN_MATCH", "FILLED", "PARTIALLY_FILLED", "NEW", "UNKNOWN"}:
+            normalized_status = status_text
+
+        return {
+            "exchange": self.EXCHANGE,
+            "market_type": "usdm_futures",
+            "symbol": payload.get("symbol") or symbol,
+            "order_id": algo_id,
+            "algo_id": algo_id,
+            "client_order_id": client_algo_id,
+            "client_algo_id": client_algo_id,
+            "status": normalized_status,
+            "type": payload.get("orderType") or payload.get("type"),
+            "side": payload.get("side"),
+            "position_side": payload.get("positionSide"),
+            "update_time": payload.get("updateTime"),
+            "time": payload.get("createTime"),
+            "algo_order": True,
+            "raw_code": payload.get("code"),
+            "raw_message": payload.get("msg"),
         }
 
     def _normalize_user_trade(
