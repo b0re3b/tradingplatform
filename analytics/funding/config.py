@@ -416,7 +416,7 @@ class FundingAnalyzerConfig:
     parquet_dataset_name: str = "analytics_funding"
 
     parquet_flush_interval_sec: float = 30.0
-    parquet_flush_timeout_sec: float = 10.0
+    parquet_flush_timeout_sec: float = 120.0
     parquet_flush_batch_size: int = 250
     parquet_flush_job_name: str = "analytics.funding.parquet_flush"
 

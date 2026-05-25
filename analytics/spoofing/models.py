@@ -49,17 +49,46 @@ def unix_ts() -> float:
     return time.time()
 
 
-def ensure_utc(dt: datetime | None = None) -> datetime:
+def ensure_utc(dt: datetime | int | float | str | None = None) -> datetime:
     """
-    Нормалізує datetime до timezone-aware UTC.
+    Нормалізує datetime / epoch timestamp до timezone-aware UTC.
+
+    Market state snapshots can carry timestamps as epoch milliseconds, while
+    historical/manual code often passes datetime.  Keep this helper permissive
+    so dataclass post-init normalization never crashes on scheduler payloads.
     """
     if dt is None:
         return utc_now()
 
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
-    return dt.astimezone(timezone.utc)
+    if isinstance(dt, (int, float)) and not isinstance(dt, bool):
+        value = float(dt)
+        abs_value = abs(value)
+        if abs_value >= 1_000_000_000_000_000_000:
+            value /= 1_000_000_000.0
+        elif abs_value >= 1_000_000_000_000_000:
+            value /= 1_000_000.0
+        elif abs_value >= 1_000_000_000_000:
+            value /= 1_000.0
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+
+    if isinstance(dt, str):
+        text = dt.strip()
+        if not text:
+            return utc_now()
+        try:
+            return ensure_utc(float(text))
+        except ValueError:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+
+    return utc_now()
 
 
 def _normalize_symbol(symbol: object) -> str:

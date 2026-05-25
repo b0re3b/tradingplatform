@@ -27,7 +27,7 @@ class BinanceWebSocketClientConfig:
 
     # Public market-data combined stream URL. Keep this on production for real
     # analytics even if execution/private user-data stream is demo/testnet.
-    public_ws_url: str = "wss://fstream.binance.com/stream"
+    public_ws_url: str = "wss://fstream.binance.com/market/stream"
 
     # Private execution/user-data stream base URL. Keep this on testnet/demo until
     # live trading is explicitly enabled.
@@ -148,7 +148,7 @@ class BinanceWebSocketClientConfig:
         use_all_market_forceorder = (
             os.getenv("BINANCE_WS_FORCEORDER_ALL_MARKET")
             or os.getenv("MARKET_DATA_LIQUIDATIONS_ALL_MARKET")
-            or "false"
+            or "true"
         ).strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
         normalized = [item.strip().lower().replace("-", "_") for item in raw_streams if item and item.strip()]
@@ -172,9 +172,12 @@ class BinanceWebSocketClientConfig:
         mode = (env_name or "").strip().lower()
         if kind == "public":
             if mode in {"real", "prod", "production", "live"}:
-                return "wss://fstream.binance.com/stream"
+                return "wss://fstream.binance.com/market/stream"
             if mode in {"test", "testnet", "sandbox", "paper", "demo"}:
-                return "wss://stream.binancefuture.com/stream"
+                # Keep public market data on production by default: testnet liquidation streams
+                # are often empty and make liquidation analytics look dead. Use an explicit
+                # BINANCE_MARKET_DATA_WS_URL/MARKET_DATA_WS_URL to force testnet market streams.
+                return "wss://fstream.binance.com/market/stream"
             return default.rstrip("/")
 
         if mode in {"real", "prod", "production", "live"}:
@@ -315,6 +318,25 @@ class BinanceWebSocketClient:
 
 
         self._validate_config()
+
+    def set_market_ingestion(self, ingestion: MarketIngestionService | None) -> None:
+        """Attach the state-driven market ingestion service after construction.
+
+        MarketStream wires exchange adapters generically via this public setter.
+        Keeping the runtime value in ``_market_ingestion`` preserves the adapter's
+        internal attribute convention while avoiding fallback publication of raw
+        market events when the state store is expected to be the canonical path.
+        """
+        self._market_ingestion = ingestion
+        self._logger.info(
+            "Binance WS market ingestion %s",
+            "attached" if ingestion is not None else "cleared",
+        )
+
+    @property
+    def market_ingestion(self) -> MarketIngestionService | None:
+        """Return the currently attached market ingestion service."""
+        return self._market_ingestion
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1185,6 +1207,7 @@ class BinanceWebSocketClient:
         notional = price * notional_qty if price is not None and notional_qty is not None else None
         timestamp_ms = order.get("T") or data.get("E")
         raw_side = order.get("S")
+        event_id = f"{self.EXCHANGE}:forceorder:{symbol}:{timestamp_ms}:{raw_side}:{price}:{notional_qty}"
 
         payload = {
             "exchange": self.EXCHANGE,
@@ -1211,12 +1234,16 @@ class BinanceWebSocketClient:
             "trade_time": order.get("T"),
             "event_time": data.get("E"),
             "timestamp_ms": timestamp_ms,
+            "event_id": event_id,
+            "trade_id": event_id,
+            "order_id": event_id,
             "source": self.SOURCE,
             "metadata": {
                 "raw": data,
                 "raw_order": order,
                 "raw_side": raw_side,
                 "stream": stream_name or "forceorder",
+                "event_id": event_id,
                 "notional_usd": notional,
                 "avg_price": avg_price,
                 "limit_price": limit_price,
@@ -1410,7 +1437,16 @@ class BinanceWebSocketClient:
             raise RuntimeError("No Binance public streams configured")
 
         streams = "/".join(stream_names)
-        return f"{self._ws_config.public_ws_url}?streams={streams}"
+        base_url = self._ws_config.public_ws_url.rstrip("/")
+
+        # Binance USD-M Futures now routes market streams via /market.  Accept
+        # either a full combined-stream URL (.../market/stream or legacy .../stream)
+        # or a category base URL (.../market) from env/config.
+        if base_url.endswith("/stream"):
+            return f"{base_url}?streams={streams}"
+        if base_url.endswith("/market") or base_url.endswith("/public"):
+            return f"{base_url}/stream?streams={streams}"
+        return f"{base_url}/market/stream?streams={streams}"
 
     async def _ensure_session(self) -> None:
         if self._session is not None and not self._session.closed:

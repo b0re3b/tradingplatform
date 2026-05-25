@@ -879,23 +879,21 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             return value.strip().lower() in {"1", "true", "yes", "y", "closed"}
         return bool(value)
 
-    def _new_closed_candles_from_snapshot(self, snapshot: Any) -> list[dict[str, Any]]:
+    def _closed_candle_window_from_snapshot(self, snapshot: Any) -> list[dict[str, Any]]:
+        """Return the full ordered closed-candle window from MarketStateStore.
+
+        Price-action modules need sequence context, not a single isolated candle.
+        MarketStateStore snapshots already contain the retained candle history for
+        the scope, including parquet-restored history and live closed candles.
+        This helper normalizes that full window and deduplicates by open time.
+        """
         candles = [self._candle_mapping(item) for item in snapshot_candles(snapshot, timeframe=self.timeframe)]
         normalized: list[tuple[int, dict[str, Any]]] = []
         for candle in candles:
-            if not candle:
-                continue
-            # Price-action modules should react to stable candle-close data.  Open
-            # candle updates can revise OHLC and create false pivots/signals.
-            if not self._candle_is_closed(candle):
+            if not candle or not self._candle_is_closed(candle):
                 continue
             open_time_ms = self._candle_int(candle, "open_time_ms", "open_time", "start", "t", "timestamp_ms", "timestamp")
             if open_time_ms is None:
-                continue
-            if (
-                self._last_processed_candle_open_time_ms is not None
-                and open_time_ms <= self._last_processed_candle_open_time_ms
-            ):
                 continue
             candle.setdefault("exchange", self.exchange)
             candle.setdefault("market_type", self.market_type)
@@ -904,13 +902,21 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             candle.setdefault("timeframe", self.timeframe)
             normalized.append((open_time_ms, candle))
 
-        normalized.sort(key=lambda item: item[0])
-        # Deduplicate by open time inside one snapshot.  Keep the latest dict for
-        # the candle, but preserve chronological processing order.
         deduped: dict[int, dict[str, Any]] = {}
-        for open_time_ms, candle in normalized:
+        for open_time_ms, candle in sorted(normalized, key=lambda item: item[0]):
             deduped[open_time_ms] = candle
         return [deduped[key] for key in sorted(deduped)]
+
+    def _new_closed_candles_from_snapshot(self, snapshot: Any) -> list[dict[str, Any]]:
+        full_window = self._closed_candle_window_from_snapshot(snapshot)
+        if self._last_processed_candle_open_time_ms is None:
+            return full_window
+        return [
+            candle
+            for candle in full_window
+            if (self._candle_int(candle, "open_time_ms", "open_time", "start", "t", "timestamp_ms", "timestamp") or -1)
+            > self._last_processed_candle_open_time_ms
+        ]
 
     def _mark_candles_processed(self, candles: list[Mapping[str, Any]]) -> None:
         if not candles:
@@ -921,6 +927,65 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             if open_time_ms is not None and (latest is None or open_time_ms > latest):
                 latest = open_time_ms
         self._last_processed_candle_open_time_ms = latest
+
+
+    async def warmup_from_market_state(self) -> dict[str, Any]:
+        """Hydrate all child price-action modules from restored closed candles.
+
+        This method is intended to be called after parquet/REST candle restore and
+        before live strategy evaluation.  It passes the full retained closed-candle
+        sequence from MarketStateStore to every child module, then marks the latest
+        restored candle as processed so subsequent live scheduler ticks only trigger
+        when a newer closed candle arrives.
+        """
+        source = getattr(self, "_state_snapshot_source", None)
+        if source is None:
+            return {"processed": False, "reason": "market_state_store_not_configured"}
+
+        snapshot = await source.snapshot(
+            exchange=self.exchange,
+            market_type=self.market_type,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+        )
+        candles = self._closed_candle_window_from_snapshot(snapshot) if snapshot is not None else []
+        if not candles:
+            return {"processed": False, "reason": "no_closed_candles_in_market_state"}
+
+        updated: list[str] = []
+        for module_name, module in (
+            ("market_structure", self.market_structure),
+            ("support_resistance", self.support_resistance),
+            ("fair_value_gap", self.fair_value_gap),
+            ("liquidity_levels", self.liquidity_levels),
+            ("trend", self.trend),
+        ):
+            if module is None:
+                continue
+            update = getattr(module, "update", None)
+            if not callable(update):
+                continue
+            try:
+                result = update(candles=candles)
+            except TypeError:
+                result = update(candles)
+            self._child_update_counts[module_name] = self._child_update_counts.get(module_name, 0) + 1
+            self._last_child_payloads[module_name] = result if isinstance(result, dict) else {"result": result}
+            updated.append(module_name)
+
+        await self.publish_composite_update(
+            updated_module=updated[-1] if updated else None,
+            source_topic="market_state.warmup",
+        )
+        self._mark_candles_processed(candles)
+        self._initial_market_state_evaluation_completed = True
+        return {
+            "processed": True,
+            "updated_modules": updated,
+            "candles": len(candles),
+            "input_mode": "market_state_closed_candle_window",
+            "warmup": True,
+        }
 
     async def process_market_state_snapshot(self) -> dict[str, Any]:
         """Evaluate this price-action scope from MarketStateStore candles.
@@ -940,10 +1005,14 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             symbol=self.symbol,
             timeframe=self.timeframe,
         )
-        candles = self._new_closed_candles_from_snapshot(snapshot) if snapshot is not None else []
-        if not candles:
+        full_window = self._closed_candle_window_from_snapshot(snapshot) if snapshot is not None else []
+        new_candles = self._new_closed_candles_from_snapshot(snapshot) if snapshot is not None else []
+        if not full_window:
+            return {"processed": False, "reason": "no_closed_candles_in_market_state"}
+        if not new_candles:
             return {"processed": False, "reason": "no_new_closed_candles"}
 
+        candles = full_window
         updated: list[str] = []
         for module_name, module in (
             ("market_structure", self.market_structure),
@@ -969,8 +1038,14 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             updated_module=updated[-1] if updated else None,
             source_topic="market_state.snapshot",
         )
-        self._mark_candles_processed(candles)
-        return {"processed": True, "updated_modules": updated, "candles": len(candles)}
+        self._mark_candles_processed(new_candles)
+        return {
+            "processed": True,
+            "updated_modules": updated,
+            "candles": len(candles),
+            "new_closed_candles": len(new_candles),
+            "input_mode": "market_state_closed_candle_window",
+        }
 
     async def process_market_snapshot(self, snapshot: Any) -> dict[str, Any]:
         """MarketScheduler-compatible evaluator callback.
@@ -1014,10 +1089,14 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
                 },
             }
 
-        candles = self._new_closed_candles_from_snapshot(snapshot)
-        if not candles:
+        full_window = self._closed_candle_window_from_snapshot(snapshot)
+        new_candles = self._new_closed_candles_from_snapshot(snapshot)
+        if not full_window:
+            return {"processed": False, "reason": "no_closed_candles_in_market_state"}
+        if not new_candles:
             return {"processed": False, "reason": "no_new_closed_candles"}
 
+        candles = full_window
         updated: list[str] = []
         for module_name, module in (
             ("market_structure", self.market_structure),
@@ -1043,8 +1122,14 @@ class PriceActionAnalyzer(BasePriceActionModule[PriceActionCompositeState]):
             updated_module=updated[-1] if updated else None,
             source_topic="market_state.snapshot",
         )
-        self._mark_candles_processed(candles)
-        return {"processed": True, "updated_modules": updated, "candles": len(candles)}
+        self._mark_candles_processed(new_candles)
+        return {
+            "processed": True,
+            "updated_modules": updated,
+            "candles": len(candles),
+            "new_closed_candles": len(new_candles),
+            "input_mode": "market_state_closed_candle_window",
+        }
 
     # ------------------------------------------------------------------
     # EventBus handlers for child module updates

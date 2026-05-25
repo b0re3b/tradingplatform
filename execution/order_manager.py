@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
@@ -47,6 +50,9 @@ class BinanceOrderClientProtocol(Protocol):
 
     The concrete implementation is exchanges.binance.binance_rest.BinanceRestClient.
     """
+
+    async def get_exchange_info(self, symbol: str | None = None) -> dict[str, Any]:
+        ...
 
     async def create_order(
         self,
@@ -120,6 +126,191 @@ class BinanceOrderClientProtocol(Protocol):
         ...
 
 
+@dataclass(slots=True)
+class BinanceSymbolRules:
+    """
+    Exchange-level trading constraints for one Binance USD-M Futures symbol.
+
+    OrderManager is the execution boundary that adapts internal OrderRequest
+    values to exchange filters. Risk/strategy should never have to know
+    Binance stepSize/tickSize/precision details.
+    """
+
+    symbol: str
+    tick_size: Decimal | None = None
+    step_size: Decimal | None = None
+    market_step_size: Decimal | None = None
+    min_qty: Decimal | None = None
+    market_min_qty: Decimal | None = None
+    max_qty: Decimal | None = None
+    market_max_qty: Decimal | None = None
+    min_notional: Decimal | None = None
+    price_precision: int | None = None
+    quantity_precision: int | None = None
+    raw: dict[str, Any] | None = None
+
+    @property
+    def effective_step_size(self) -> Decimal | None:
+        return self.step_size
+
+    def effective_qty_step(self, *, order_type: OrderType) -> Decimal | None:
+        if order_type is OrderType.MARKET and self.market_step_size is not None:
+            return self.market_step_size
+        return self.step_size
+
+    def effective_min_qty(self, *, order_type: OrderType) -> Decimal | None:
+        if order_type is OrderType.MARKET and self.market_min_qty is not None:
+            return self.market_min_qty
+        return self.min_qty
+
+    def effective_max_qty(self, *, order_type: OrderType) -> Decimal | None:
+        if order_type is OrderType.MARKET and self.market_max_qty is not None:
+            return self.market_max_qty
+        return self.max_qty
+
+
+class NonRetryableOrderSubmitError(OrderSubmitError):
+    """Raised for exchange/order validation errors that must not be retried."""
+
+    def __init__(self, message: str, *, code: int | None = None, metadata: dict[str, Any] | None = None) -> None:
+        self.code = code
+        self.metadata = dict(metadata or {})
+        super().__init__(message)
+
+
+_NON_RETRYABLE_BINANCE_CODES: set[int] = {
+    -1111,  # Precision is over the maximum defined for this asset.
+    -1013,  # Filter failure / invalid quantity / invalid price.
+    -2019,  # Margin is insufficient.
+    -2021,  # Order would immediately trigger.
+    -4003,  # Quantity less than zero / invalid quantity family.
+    -4014,  # Price not increased by tick size.
+    -4023,  # Quantity not increased by step size.
+    -4164,  # Order's notional must be no smaller than minimum.
+}
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        value_d = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if value_d <= 0:
+        return None
+    return value_d
+
+
+def _decimal_from_positive(value: float | int | Decimal, field_name: str) -> Decimal:
+    try:
+        value_d = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise NonRetryableOrderSubmitError(f"{field_name} must be a valid decimal: {value!r}") from exc
+    if value_d <= 0:
+        raise NonRetryableOrderSubmitError(f"{field_name} must be > 0: {value!r}")
+    return value_d
+
+
+def _round_down_to_step_decimal(value: Decimal, step: Decimal | None) -> Decimal:
+    if step is None or step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _round_down_to_precision_decimal(value: Decimal, precision: int | None) -> Decimal:
+    if precision is None or precision < 0:
+        return value
+    quantum = Decimal("1").scaleb(-int(precision))
+    return value.quantize(quantum, rounding=ROUND_DOWN)
+
+
+def _decimal_to_float(value: Decimal) -> float:
+    return float(format(value.normalize(), "f"))
+
+
+def _extract_binance_error_code(error: BaseException) -> int | None:
+    if isinstance(error, NonRetryableOrderSubmitError):
+        return error.code
+    text = str(error)
+    match = re.search(r"code=([-]?\d+)", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    match = re.search(r"\b([-]\d{3,5})\b", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _is_non_retryable_order_error(error: BaseException) -> bool:
+    code = _extract_binance_error_code(error)
+    return code in _NON_RETRYABLE_BINANCE_CODES
+
+
+_RETRYABLE_ERROR_CLASS_NAMES: set[str] = {
+    "TimeoutError",
+    "ServerTimeoutError",
+    "ClientTimeout",
+    "ClientConnectionError",
+    "ClientConnectorError",
+    "ClientOSError",
+    "ServerDisconnectedError",
+    "ConnectionResetError",
+    "ConnectionError",
+    "OSError",
+}
+
+
+def _error_class_names(error: BaseException) -> set[str]:
+    names: set[str] = set()
+    current: type[BaseException] | None = type(error)
+    for cls in current.__mro__:
+        names.add(cls.__name__)
+    return names
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    return isinstance(error, asyncio.TimeoutError) or "TimeoutError" in _error_class_names(error)
+
+
+def _is_retryable_exchange_error(error: BaseException) -> bool:
+    if isinstance(error, NonRetryableOrderSubmitError) or _is_non_retryable_order_error(error):
+        return False
+
+    names = _error_class_names(error)
+    if names & _RETRYABLE_ERROR_CLASS_NAMES:
+        return True
+
+    text = str(error).lower()
+    retryable_markers = (
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "server disconnected",
+        "too many requests",
+        "429",
+        " 5",
+        "status=5",
+        "status 5",
+        "http 5",
+    )
+    return any(marker in text for marker in retryable_markers)
+
+
+def _compact_error(error: BaseException) -> str:
+    text = str(error).strip()
+    if text:
+        return f"{type(error).__name__}: {text}"
+    return type(error).__name__
+
+
 class OrderManager:
     """
     Binance USD-M Futures order bridge.
@@ -176,6 +367,9 @@ class OrderManager:
 
         self._orders_by_order_id: dict[str, OrderState] = {}
         self._orders_by_client_order_id: dict[str, OrderState] = {}
+
+        self._symbol_rules_by_symbol: dict[str, BinanceSymbolRules] = {}
+        self._symbol_rules_lock = asyncio.Lock()
 
         self._stats = OrderManagerStats()
         self._running = False
@@ -293,6 +487,11 @@ class OrderManager:
                     "exchange.order.cancelled",
                     self._handle_exchange_order_update,
                     name="execution_order_manager_on_exchange_order_cancelled",
+                ),
+                self._event_bus.subscribe(
+                    "exchange.order.updated",
+                    self._handle_exchange_order_update,
+                    name="execution_order_manager_on_exchange_order_updated",
                 ),
                 self._event_bus.subscribe(
                     "exchange.open_orders.snapshot",
@@ -423,14 +622,27 @@ class OrderManager:
         )
 
         try:
-            payload = await self._with_retries(
-                operation=lambda: client.create_order(**request.to_binance_params()),
-                retries=self._config.submit_retries,
-                retry_delay_seconds=self._config.retry_delay_seconds,
-                operation_name="create_order",
-            )
+            normalized_request = await self._normalize_order_request_for_exchange(request, client)
 
-            result = OrderResult.from_exchange_order(payload, request=request)
+            try:
+                payload = await self._with_retries(
+                    operation=lambda: client.create_order(**normalized_request.to_binance_params()),
+                    retries=self._config.submit_retries,
+                    retry_delay_seconds=self._config.retry_delay_seconds,
+                    operation_name="create_order",
+                )
+            except Exception as exc:
+                if _is_retryable_exchange_error(exc):
+                    reconciled = await self._reconcile_after_ambiguous_submit(
+                        request=normalized_request,
+                        client=client,
+                        cause=exc,
+                    )
+                    if reconciled is not None:
+                        return reconciled
+                raise
+
+            result = OrderResult.from_exchange_order(payload, request=normalized_request)
 
             async with self._lock:
                 self._upsert_order_state(result)
@@ -443,25 +655,68 @@ class OrderManager:
 
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except NonRetryableOrderSubmitError as exc:
             self._stats.register_failure(str(exc))
-            self._logger.exception(
-                "Order submit failed | symbol=%s client_order_id=%s",
+            self._logger.warning(
+                "Order submit rejected before/at exchange validation | symbol=%s client_order_id=%s code=%s reason=%s",
                 request.symbol,
                 request.client_order_id,
+                exc.code,
+                str(exc),
             )
 
-            await self._emit_event(
-                "execution.order_failed",
-                {
-                    **request.to_event_payload(),
-                    "error": str(exc),
-                    "failure_stage": "submit",
-                },
-                priority=EventPriority.CRITICAL,
+            await self._emit_order_rejected_from_request(
+                request,
+                reason=str(exc),
+                stage="submit_validation",
+                code=exc.code,
+                metadata=exc.metadata,
             )
 
-            raise OrderSubmitError(f"Failed to submit order: {exc}") from exc
+            raise OrderSubmitError(f"Order rejected: {exc}") from exc
+        except Exception as exc:
+            if _is_non_retryable_order_error(exc):
+                code = _extract_binance_error_code(exc)
+                self._stats.register_failure(str(exc))
+                self._logger.warning(
+                    "Order submit rejected by Binance with non-retryable validation error | symbol=%s client_order_id=%s code=%s error=%s",
+                    request.symbol,
+                    request.client_order_id,
+                    code,
+                    str(exc),
+                )
+                await self._emit_order_rejected_from_request(
+                    request,
+                    reason=str(exc),
+                    stage="exchange_validation",
+                    code=code,
+                )
+                raise OrderSubmitError(f"Order rejected by exchange: {exc}") from exc
+
+            self._stats.register_failure(_compact_error(exc))
+
+            if _is_retryable_exchange_error(exc):
+                self._logger.warning(
+                    "Order submit failed after retry/reconcile | symbol=%s client_order_id=%s error=%s",
+                    request.symbol,
+                    request.client_order_id,
+                    _compact_error(exc),
+                )
+            else:
+                self._logger.exception(
+                    "Order submit failed | symbol=%s client_order_id=%s",
+                    request.symbol,
+                    request.client_order_id,
+                )
+
+            await self._emit_order_failed_from_request(
+                request,
+                reason=_compact_error(exc),
+                stage="submit",
+                retryable=_is_retryable_exchange_error(exc),
+            )
+
+            raise OrderSubmitError(f"Failed to submit order: {_compact_error(exc)}") from exc
 
     async def cancel_order(
         self,
@@ -951,6 +1206,27 @@ class OrderManager:
                     client_order_id=result.client_order_id,
                 )
                 previous_status = previous_state.status if previous_state else None
+
+                if previous_state is not None:
+                    # Binance user-data stream updates do not carry internal
+                    # strategy/risk metadata. Preserve it from the local state
+                    # created at submit_order(), otherwise execution.order_filled
+                    # would lose reservation_id/signal_id and RiskManager could
+                    # not confirm/release pending reservations reliably.
+                    result.execution_id = result.execution_id or previous_state.execution_id
+                    result.leg_id = result.leg_id or previous_state.leg_id
+                    result.signal_id = result.signal_id or previous_state.signal_id
+                    result.strategy_name = result.strategy_name or previous_state.strategy_name
+                    result.reservation_id = result.reservation_id or previous_state.reservation_id
+                    result.reduce_only = result.reduce_only if result.reduce_only is not None else previous_state.reduce_only
+                    result.close_position = result.close_position if result.close_position is not None else previous_state.close_position
+                    result.position_side = result.position_side or previous_state.position_side
+                    result.metadata = merge_metadata(
+                        previous_state.metadata,
+                        result.metadata,
+                        {"source_event": payload.get("source_event") or "exchange.order.updated"},
+                    )
+
                 self._upsert_order_state(result)
                 self._stats.register_update(result)
 
@@ -1026,6 +1302,437 @@ class OrderManager:
 
         return client
 
+
+    async def _normalize_order_request_for_exchange(
+        self,
+        request: OrderRequest,
+        client: BinanceOrderClientProtocol,
+    ) -> OrderRequest:
+        """Normalize quantity/price fields to Binance symbol filters before REST submit."""
+        request.validate()
+
+        if normalize_exchange(request.exchange) != "binance":
+            return request
+
+        rules = await self._get_symbol_rules(client, request.symbol)
+        original = {
+            "quantity": request.quantity,
+            "price": request.price,
+            "stop_price": request.stop_price,
+            "activation_price": request.activation_price,
+        }
+
+        if request.quantity is not None:
+            quantity = self._normalize_quantity(
+                value=request.quantity,
+                rules=rules,
+                order_type=request.order_type,
+            )
+            request.quantity = quantity
+
+        if request.price is not None:
+            request.price = self._normalize_price(
+                value=request.price,
+                rules=rules,
+            )
+
+        if request.stop_price is not None:
+            request.stop_price = self._normalize_price(
+                value=request.stop_price,
+                rules=rules,
+            )
+
+        if request.activation_price is not None:
+            request.activation_price = self._normalize_price(
+                value=request.activation_price,
+                rules=rules,
+            )
+
+        self._validate_exchange_constraints(request, rules)
+
+        request.metadata = merge_metadata(
+            request.metadata,
+            {
+                "exchange_normalization": {
+                    "symbol": rules.symbol,
+                    "original": original,
+                    "normalized": {
+                        "quantity": request.quantity,
+                        "price": request.price,
+                        "stop_price": request.stop_price,
+                        "activation_price": request.activation_price,
+                    },
+                    "filters": {
+                        "tick_size": str(rules.tick_size) if rules.tick_size is not None else None,
+                        "step_size": str(rules.step_size) if rules.step_size is not None else None,
+                        "market_step_size": str(rules.market_step_size) if rules.market_step_size is not None else None,
+                        "min_qty": str(rules.min_qty) if rules.min_qty is not None else None,
+                        "market_min_qty": str(rules.market_min_qty) if rules.market_min_qty is not None else None,
+                        "min_notional": str(rules.min_notional) if rules.min_notional is not None else None,
+                        "price_precision": rules.price_precision,
+                        "quantity_precision": rules.quantity_precision,
+                    },
+                }
+            },
+        )
+        return request
+
+    async def _get_symbol_rules(
+        self,
+        client: BinanceOrderClientProtocol,
+        symbol: str,
+    ) -> BinanceSymbolRules:
+        symbol_n = normalize_symbol(symbol)
+        cached = self._symbol_rules_by_symbol.get(symbol_n)
+        if cached is not None:
+            return cached
+
+        async with self._symbol_rules_lock:
+            cached = self._symbol_rules_by_symbol.get(symbol_n)
+            if cached is not None:
+                return cached
+
+            try:
+                payload = await client.get_exchange_info(symbol=symbol_n)
+            except TypeError:
+                payload = await client.get_exchange_info()
+            except Exception as exc:
+                self._logger.warning(
+                    "Could not fetch Binance symbol filters; submitting without exchange normalization may fail | symbol=%s error=%s",
+                    symbol_n,
+                    str(exc),
+                )
+                rules = BinanceSymbolRules(symbol=symbol_n)
+                self._symbol_rules_by_symbol[symbol_n] = rules
+                return rules
+
+            rules = self._parse_symbol_rules(symbol_n, payload)
+            self._symbol_rules_by_symbol[symbol_n] = rules
+            self._logger.info(
+                "Binance symbol rules cached | symbol=%s tick_size=%s step_size=%s min_qty=%s min_notional=%s price_precision=%s quantity_precision=%s",
+                symbol_n,
+                rules.tick_size,
+                rules.step_size,
+                rules.min_qty,
+                rules.min_notional,
+                rules.price_precision,
+                rules.quantity_precision,
+            )
+            return rules
+
+    def _parse_symbol_rules(self, symbol: str, payload: Mapping[str, Any]) -> BinanceSymbolRules:
+        symbols = payload.get("symbols") if isinstance(payload, Mapping) else None
+        symbol_info: dict[str, Any] | None = None
+
+        if isinstance(symbols, list):
+            for item in symbols:
+                if isinstance(item, Mapping) and str(item.get("symbol") or "").upper() == symbol:
+                    symbol_info = dict(item)
+                    break
+
+        if symbol_info is None and isinstance(payload, Mapping) and str(payload.get("symbol") or "").upper() == symbol:
+            symbol_info = dict(payload)
+
+        if symbol_info is None:
+            return BinanceSymbolRules(symbol=symbol, raw=dict(payload) if isinstance(payload, Mapping) else None)
+
+        filters_by_type: dict[str, Mapping[str, Any]] = {}
+        for item in symbol_info.get("filters", []) or []:
+            if isinstance(item, Mapping):
+                filter_type = str(item.get("filterType") or "").upper()
+                if filter_type:
+                    filters_by_type[filter_type] = item
+
+        price_filter = filters_by_type.get("PRICE_FILTER", {})
+        lot_size = filters_by_type.get("LOT_SIZE", {})
+        market_lot_size = filters_by_type.get("MARKET_LOT_SIZE", {})
+        min_notional_filter = filters_by_type.get("MIN_NOTIONAL", {})
+        notional_filter = filters_by_type.get("NOTIONAL", {})
+
+        min_notional = (
+            _decimal_or_none(notional_filter.get("minNotional"))
+            or _decimal_or_none(min_notional_filter.get("notional"))
+            or _decimal_or_none(min_notional_filter.get("minNotional"))
+        )
+
+        return BinanceSymbolRules(
+            symbol=symbol,
+            tick_size=_decimal_or_none(price_filter.get("tickSize")),
+            step_size=_decimal_or_none(lot_size.get("stepSize")),
+            market_step_size=_decimal_or_none(market_lot_size.get("stepSize")),
+            min_qty=_decimal_or_none(lot_size.get("minQty")),
+            market_min_qty=_decimal_or_none(market_lot_size.get("minQty")),
+            max_qty=_decimal_or_none(lot_size.get("maxQty")),
+            market_max_qty=_decimal_or_none(market_lot_size.get("maxQty")),
+            min_notional=min_notional,
+            price_precision=self._safe_int_or_none(symbol_info.get("pricePrecision")),
+            quantity_precision=self._safe_int_or_none(symbol_info.get("quantityPrecision")),
+            raw=symbol_info,
+        )
+
+    @staticmethod
+    def _safe_int_or_none(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _normalize_quantity(
+        self,
+        *,
+        value: float,
+        rules: BinanceSymbolRules,
+        order_type: OrderType,
+    ) -> float:
+        quantity = _decimal_from_positive(value, "quantity")
+        step = rules.effective_qty_step(order_type=order_type)
+        quantity = _round_down_to_step_decimal(quantity, step)
+        quantity = _round_down_to_precision_decimal(quantity, rules.quantity_precision)
+
+        min_qty = rules.effective_min_qty(order_type=order_type)
+        if min_qty is not None and quantity < min_qty:
+            raise NonRetryableOrderSubmitError(
+                f"Order quantity below Binance minQty after rounding | symbol={rules.symbol} quantity={quantity} min_qty={min_qty}",
+                code=-1013,
+                metadata={"quantity": str(quantity), "min_qty": str(min_qty)},
+            )
+
+        max_qty = rules.effective_max_qty(order_type=order_type)
+        if max_qty is not None and quantity > max_qty:
+            raise NonRetryableOrderSubmitError(
+                f"Order quantity above Binance maxQty | symbol={rules.symbol} quantity={quantity} max_qty={max_qty}",
+                code=-1013,
+                metadata={"quantity": str(quantity), "max_qty": str(max_qty)},
+            )
+
+        if quantity <= 0:
+            raise NonRetryableOrderSubmitError(
+                f"Order quantity rounded to zero | symbol={rules.symbol} original_quantity={value}",
+                code=-1013,
+                metadata={"original_quantity": value},
+            )
+
+        return _decimal_to_float(quantity)
+
+    def _normalize_price(self, *, value: float, rules: BinanceSymbolRules) -> float:
+        price = _decimal_from_positive(value, "price")
+        price = _round_down_to_step_decimal(price, rules.tick_size)
+        price = _round_down_to_precision_decimal(price, rules.price_precision)
+        if price <= 0:
+            raise NonRetryableOrderSubmitError(
+                f"Order price rounded to zero | symbol={rules.symbol} original_price={value}",
+                code=-1013,
+                metadata={"original_price": value},
+            )
+        return _decimal_to_float(price)
+
+    def _validate_exchange_constraints(self, request: OrderRequest, rules: BinanceSymbolRules) -> None:
+        if request.close_position and request.quantity is None:
+            return
+
+        if request.quantity is None:
+            return
+
+        min_notional = rules.min_notional
+        if min_notional is None:
+            return
+
+        reference_price = self._reference_price_for_notional(request)
+        if reference_price is None or reference_price <= 0:
+            # Binance will validate market orders using current mark/last price.
+            # If we do not have a reliable reference price, do not invent one.
+            return
+
+        notional = Decimal(str(request.quantity)) * Decimal(str(reference_price))
+        if notional < min_notional:
+            raise NonRetryableOrderSubmitError(
+                f"Order notional below Binance minimum | symbol={request.symbol} notional={notional} min_notional={min_notional}",
+                code=-4164,
+                metadata={"notional": str(notional), "min_notional": str(min_notional), "reference_price": reference_price},
+            )
+
+    @staticmethod
+    def _reference_price_for_notional(request: OrderRequest) -> float | None:
+        for value in (
+            request.price,
+            request.stop_price,
+            request.activation_price,
+            request.metadata.get("entry_price"),
+            request.metadata.get("reference_price"),
+            request.metadata.get("final_entry_price"),
+            request.metadata.get("mark_price"),
+        ):
+            try:
+                if value is not None and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def _reconcile_after_ambiguous_submit(
+        self,
+        *,
+        request: OrderRequest,
+        client: BinanceOrderClientProtocol,
+        cause: BaseException,
+    ) -> OrderResult | None:
+        """
+        Resolve ambiguous create_order failures without blindly resubmitting.
+
+        Network timeouts around Binance create_order are dangerous: the order
+        may have been accepted but the REST response was lost. Because all
+        execution orders carry a deterministic client_order_id, the safe flow is
+        to fetch by origClientOrderId before deciding whether the submit failed.
+        """
+        if not self._config.submit_timeout_reconcile_enabled:
+            return None
+
+        if not request.client_order_id:
+            self._logger.warning(
+                "Cannot reconcile ambiguous submit without client_order_id | symbol=%s error=%s",
+                request.symbol,
+                _compact_error(cause),
+            )
+            return None
+
+        attempts = max(1, int(self._config.submit_timeout_reconcile_attempts))
+        delay = max(0.0, float(self._config.submit_timeout_reconcile_delay_seconds))
+
+        await self._emit_event(
+            "execution.order_submit_ambiguous",
+            {
+                **request.to_event_payload(),
+                "error": _compact_error(cause),
+                "failure_stage": "submit_ambiguous",
+                "reconcile_attempts": attempts,
+            },
+            priority=EventPriority.HIGH,
+        )
+
+        for attempt in range(1, attempts + 1):
+            if delay > 0 and attempt > 1:
+                await asyncio.sleep(delay)
+
+            try:
+                payload = await client.get_order(
+                    symbol=request.symbol,
+                    orig_client_order_id=request.client_order_id,
+                )
+                result = OrderResult.from_exchange_order(
+                    payload,
+                    request=request,
+                    metadata={
+                        "reconciled_after_ambiguous_submit": True,
+                        "ambiguous_submit_error": _compact_error(cause),
+                        "reconcile_attempt": attempt,
+                    },
+                )
+
+                async with self._lock:
+                    self._upsert_order_state(result)
+                    self._register_submit_stats(result)
+
+                self._logger.warning(
+                    "Order submit reconciled after ambiguous exchange error | symbol=%s client_order_id=%s status=%s attempt=%s error=%s",
+                    request.symbol,
+                    request.client_order_id,
+                    result.status.value,
+                    attempt,
+                    _compact_error(cause),
+                )
+
+                await self._emit_event(
+                    "execution.order_submit_reconciled",
+                    {
+                        **result.to_event_payload(),
+                        "failure_stage": "submit_reconcile",
+                        "reconcile_attempt": attempt,
+                        "ambiguous_submit_error": _compact_error(cause),
+                    },
+                    priority=EventPriority.CRITICAL,
+                )
+                await self._emit_order_submitted(result)
+                await self._emit_order_lifecycle_event(result)
+
+                return result
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as reconcile_exc:
+                if attempt >= attempts:
+                    self._logger.warning(
+                        "Order submit reconciliation did not find exchange order | symbol=%s client_order_id=%s attempts=%s submit_error=%s reconcile_error=%s",
+                        request.symbol,
+                        request.client_order_id,
+                        attempts,
+                        _compact_error(cause),
+                        _compact_error(reconcile_exc),
+                    )
+                    break
+
+                self._logger.warning(
+                    "Order submit reconciliation retry scheduled | symbol=%s client_order_id=%s attempt=%s attempts=%s error=%s",
+                    request.symbol,
+                    request.client_order_id,
+                    attempt,
+                    attempts,
+                    _compact_error(reconcile_exc),
+                )
+
+        return None
+
+
+    async def _emit_order_failed_from_request(
+        self,
+        request: OrderRequest,
+        *,
+        reason: str,
+        stage: str,
+        retryable: bool = False,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self._emit_event(
+            "execution.order_failed",
+            {
+                **request.to_event_payload(),
+                "reason": reason,
+                "error": reason,
+                "failure_stage": stage,
+                "metadata": merge_metadata(
+                    request.metadata,
+                    metadata,
+                    {"retryable": retryable},
+                ),
+            },
+            priority=EventPriority.CRITICAL,
+        )
+
+    async def _emit_order_rejected_from_request(
+        self,
+        request: OrderRequest,
+        *,
+        reason: str,
+        stage: str,
+        code: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self._emit_event(
+            "execution.order_rejected",
+            {
+                **request.to_event_payload(),
+                "reason": reason,
+                "error": reason,
+                "code": code,
+                "failure_stage": stage,
+                "metadata": merge_metadata(
+                    request.metadata,
+                    metadata,
+                    {"non_retryable": True, "binance_code": code},
+                ),
+            },
+            priority=EventPriority.CRITICAL,
+        )
+
     async def _with_retries(
         self,
         *,
@@ -1044,6 +1751,19 @@ class OrderManager:
             except Exception as exc:
                 last_error = exc
 
+                if _is_non_retryable_order_error(exc):
+                    raise NonRetryableOrderSubmitError(
+                        str(exc),
+                        code=_extract_binance_error_code(exc),
+                        metadata={"operation": operation_name},
+                    ) from exc
+
+                # A retryable create_order error is ambiguous: Binance may
+                # have accepted the order but the REST response was lost. Do
+                # not blindly resubmit. The caller reconciles by client_order_id.
+                if operation_name == "create_order" and _is_retryable_exchange_error(exc):
+                    raise
+
                 if attempt >= retries:
                     break
 
@@ -1052,7 +1772,7 @@ class OrderManager:
                     operation_name,
                     attempt + 1,
                     retries,
-                    str(exc),
+                    _compact_error(exc),
                 )
                 await asyncio.sleep(retry_delay_seconds)
 

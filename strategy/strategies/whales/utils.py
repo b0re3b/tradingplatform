@@ -1016,12 +1016,21 @@ def extract_imbalance_ratio(value: Any) -> float:
 
 def extract_pressure_score(value: Any) -> float:
     payload = unwrap_analytics_payload(value)
+
+    # analytics.whales.whale_pressure does not always emit an explicit
+    # pressure_score. For that canonical event, imbalance_ratio is the
+    # normalized strength of the dominant whale pressure and must be accepted
+    # as the pressure score fallback. Without this, pressure-only whale
+    # snapshots unwrap correctly but every pressure strategy sees score=0.0.
     return unit_score(
         first_non_empty(
             payload.get("pressure_score"),
             payload.get("score"),
             payload.get("confidence"),
+            payload.get("imbalance_ratio"),
+            payload.get("pressure_imbalance_ratio"),
             get_path(payload, "metadata.pressure_score"),
+            get_path(payload, "metadata.imbalance_ratio"),
         )
     )
 
@@ -1158,18 +1167,34 @@ def extract_liquidation_notional(value: Any) -> float:
 
 def extract_trade_count(value: Any) -> int:
     payload = unwrap_analytics_payload(value)
-    return max(
-        0,
-        first_int(
-            payload.get("trade_count"),
-            payload.get("large_trade_count"),
-            payload.get("count"),
-            payload.get("trades_count"),
-            get_path(payload, "metadata.trade_count"),
-            default=0,
-        )
-        or 0,
+
+    explicit_count = first_int(
+        payload.get("trade_count"),
+        payload.get("large_trade_count"),
+        payload.get("count"),
+        payload.get("trades_count"),
+        get_path(payload, "metadata.trade_count"),
+        default=None,
     )
+    if explicit_count is not None:
+        return max(0, explicit_count)
+
+    # WhalePressureSignal/WhalePressureRecord expose side-specific counts,
+    # not a single trade_count. Strategy filters use snapshot.trade_count, so
+    # sum the side counts as the canonical activity count fallback.
+    buy_count = first_int(
+        payload.get("buy_trade_count"),
+        payload.get("buy_trades_count"),
+        get_path(payload, "metadata.buy_trade_count"),
+        default=0,
+    ) or 0
+    sell_count = first_int(
+        payload.get("sell_trade_count"),
+        payload.get("sell_trades_count"),
+        get_path(payload, "metadata.sell_trade_count"),
+        default=0,
+    ) or 0
+    return max(0, buy_count + sell_count)
 
 
 def extract_large_trade_notional(value: Any) -> float:

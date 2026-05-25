@@ -72,6 +72,13 @@ class OrderManagerConfig:
     cancel_retries: int = 2
     retry_delay_seconds: float = 0.25
 
+    # Ambiguous create_order failures, especially network timeouts, are unsafe
+    # to retry blindly because Binance may have accepted the order while the
+    # response was lost. Reconcile by client_order_id before declaring failure.
+    submit_timeout_reconcile_enabled: bool = True
+    submit_timeout_reconcile_attempts: int = 3
+    submit_timeout_reconcile_delay_seconds: float = 0.75
+
     reconcile_enabled: bool = True
     reconcile_interval_seconds: float = 15.0
     open_order_sync_interval_seconds: float = 20.0
@@ -123,6 +130,14 @@ class OrderManagerConfig:
         self.retry_delay_seconds = _require_non_negative_float(
             self.retry_delay_seconds,
             "order_manager.retry_delay_seconds",
+        )
+        self.submit_timeout_reconcile_attempts = _require_positive_int(
+            self.submit_timeout_reconcile_attempts,
+            "order_manager.submit_timeout_reconcile_attempts",
+        )
+        self.submit_timeout_reconcile_delay_seconds = _require_non_negative_float(
+            self.submit_timeout_reconcile_delay_seconds,
+            "order_manager.submit_timeout_reconcile_delay_seconds",
         )
         self.reconcile_interval_seconds = _require_positive_float(
             self.reconcile_interval_seconds,

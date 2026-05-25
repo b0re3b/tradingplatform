@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -139,6 +140,12 @@ class NewsAIService:
         self._last_success_at = None
         self._last_error: str | None = None
         self._last_result: NewsServiceRunResult | None = None
+
+        self._publish_history: deque[tuple[Any, str]] = deque()
+        self._current_cycle_publish_counts: dict[str, int] | None = None
+        self._suppressed_publish_counts: dict[str, int] = {}
+        self._last_bot_alert_at = None
+        self._total_suppressed_publications = 0
 
     @property
     def is_registered(self) -> bool:
@@ -280,6 +287,8 @@ class NewsAIService:
 
             errors: list[str] = []
             processing_results: list[NewsProcessingResult] = []
+            self._current_cycle_publish_counts = {}
+            cycle_suppressed_before = self._total_suppressed_publications
 
             collected_count = 0
             raw_unique_count = 0
@@ -347,6 +356,37 @@ class NewsAIService:
                     normalized_duplicate_count,
                 ) = self._filter_new_normalized_candidates(normalized_items)
                 normalized_unique_count = len(normalized_unique_items)
+
+                scoring_work_skipped_count = 0
+                if len(normalized_unique_items) > self.config.max_items_to_score_per_cycle:
+                    scoring_work_skipped_count = (
+                        len(normalized_unique_items) - self.config.max_items_to_score_per_cycle
+                    )
+                    normalized_unique_items = normalized_unique_items[
+                        : self.config.max_items_to_score_per_cycle
+                    ]
+
+                    processing_results.append(
+                        NewsProcessingResult(
+                            stage=NewsProcessingStage.SCORE,
+                            started_at=started_at,
+                            finished_at=utc_now(),
+                            raw_count=normalized_unique_count,
+                            processed_count=len(normalized_unique_items),
+                            duplicate_count=0,
+                            failed_count=0,
+                            skipped_count=scoring_work_skipped_count,
+                            errors=(),
+                            metadata={
+                                "component": "NewsAIService",
+                                "reason": "max_items_to_score_per_cycle",
+                                "max_items_to_score_per_cycle": (
+                                    self.config.max_items_to_score_per_cycle
+                                ),
+                                "dedup_commit": False,
+                            },
+                        )
+                    )
 
                 if normalized_duplicate_count:
                     processing_results.append(
@@ -459,9 +499,16 @@ class NewsAIService:
                         "deduplicator_stats": self.deduplicator.stats(),
                         "raw_duplicate_count": raw_duplicate_count,
                         "normalized_duplicate_count": normalized_duplicate_count,
+                        "scoring_work_skipped_count": scoring_work_skipped_count,
+                        "max_items_to_score_per_cycle": self.config.max_items_to_score_per_cycle,
                         "llm_enabled": self.config.llm.enabled,
                         "dedup_commit_stage": "after_successful_scoring",
                         "scored_item_count": len(scored_items),
+                        "publication_counts": dict(self._current_cycle_publish_counts or {}),
+                        "suppressed_publication_count": (
+                            self._total_suppressed_publications - cycle_suppressed_before
+                        ),
+                        "suppressed_publications_by_topic": dict(self._suppressed_publish_counts),
                     },
                 )
 
@@ -553,6 +600,21 @@ class NewsAIService:
                 return result
 
             finally:
+                if self.config.publish_suppressed_summary_event:
+                    try:
+                        await self._emit_suppressed_summary(
+                            cycle_suppressed_before=cycle_suppressed_before,
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Failed to publish news publication-limit summary",
+                            extra={
+                                "service_name": self.config.service_name,
+                                "error_type": exc.__class__.__name__,
+                                "error": str(exc),
+                            },
+                        )
+                self._current_cycle_publish_counts = None
                 self._running = False
 
     async def run_now(self) -> NewsServiceRunResult:
@@ -580,6 +642,9 @@ class NewsAIService:
             "total_processed": self._total_processed,
             "total_scored": self._total_scored,
             "total_high_impact": self._total_high_impact,
+            "total_suppressed_publications": self._total_suppressed_publications,
+            "suppressed_publications_by_topic": dict(self._suppressed_publish_counts),
+            "publish_window_size": len(self._publish_history),
             "last_run_at": self._last_run_at.isoformat() if self._last_run_at else None,
             "last_success_at": (
                 self._last_success_at.isoformat()
@@ -802,7 +867,12 @@ class NewsAIService:
         payload: dict[str, Any],
         *,
         priority: EventPriority = EventPriority.NORMAL,
+        apply_publication_limits: bool = True,
     ) -> None:
+        if apply_publication_limits and not self._allow_publication(topic):
+            self._record_suppressed_publication(topic)
+            return
+
         try:
             await self.event_bus.emit(
                 topic,
@@ -810,6 +880,7 @@ class NewsAIService:
                 priority=priority,
                 source=self.config.service_name,
             )
+            self._record_published_event(topic)
         except Exception as exc:
             raise NewsPublishError(
                 f"Failed to publish news event '{topic}'",
@@ -823,6 +894,129 @@ class NewsAIService:
                 ),
                 cause=exc,
             ) from exc
+
+    async def _emit_suppressed_summary(
+        self,
+        *,
+        cycle_suppressed_before: int,
+    ) -> None:
+        suppressed_count = self._total_suppressed_publications - cycle_suppressed_before
+        if suppressed_count <= 0:
+            return
+
+        await self._emit(
+            "system.news_ai_service.publication_limited",
+            {
+                "service_name": self.config.service_name,
+                "suppressed_count": suppressed_count,
+                "suppressed_by_topic_total": dict(self._suppressed_publish_counts),
+                "cycle_publication_counts": dict(self._current_cycle_publish_counts or {}),
+                "limits": {
+                    "max_published_events_per_cycle": self.config.max_published_events_per_cycle,
+                    "max_published_events_per_hour": self.config.max_published_events_per_hour,
+                    "max_scored_events_per_cycle": self.config.max_scored_events_per_cycle,
+                    "max_scored_events_per_hour": self.config.max_scored_events_per_hour,
+                    "max_high_impact_events_per_cycle": self.config.max_high_impact_events_per_cycle,
+                    "max_high_impact_events_per_hour": self.config.max_high_impact_events_per_hour,
+                    "max_bot_alerts_per_cycle": self.config.max_bot_alerts_per_cycle,
+                    "max_bot_alerts_per_hour": self.config.max_bot_alerts_per_hour,
+                    "min_seconds_between_bot_alerts": self.config.min_seconds_between_bot_alerts,
+                },
+            },
+            priority=EventPriority.LOW,
+            apply_publication_limits=False,
+        )
+
+    def _allow_publication(self, topic: str) -> bool:
+        if not self._is_limited_topic(topic):
+            return True
+
+        self._prune_publish_history()
+
+        if self._cycle_count("__all__") >= self.config.max_published_events_per_cycle:
+            return False
+
+        if self._hour_count("__all__") >= self.config.max_published_events_per_hour:
+            return False
+
+        if topic == "news.scored":
+            if self._cycle_count(topic) >= self.config.max_scored_events_per_cycle:
+                return False
+            if self._hour_count(topic) >= self.config.max_scored_events_per_hour:
+                return False
+
+        high_impact_topics = {"news.high_impact", "dashboard.news_update", "bot.news_alert"}
+        if topic in high_impact_topics:
+            if self._cycle_count(topic) >= self.config.max_high_impact_events_per_cycle:
+                return False
+            if self._hour_count(topic) >= self.config.max_high_impact_events_per_hour:
+                return False
+
+        if topic == "bot.news_alert":
+            if self._cycle_count(topic) >= self.config.max_bot_alerts_per_cycle:
+                return False
+            if self._hour_count(topic) >= self.config.max_bot_alerts_per_hour:
+                return False
+            if self._last_bot_alert_at is not None:
+                elapsed = (utc_now() - self._last_bot_alert_at).total_seconds()
+                if elapsed < self.config.min_seconds_between_bot_alerts:
+                    return False
+
+        return True
+
+    def _is_limited_topic(self, topic: str) -> bool:
+        return topic.startswith("news.") or topic in {
+            "dashboard.news_update",
+            "bot.news_alert",
+        }
+
+    def _record_published_event(self, topic: str) -> None:
+        if not self._is_limited_topic(topic):
+            return
+
+        now = utc_now()
+        self._publish_history.append((now, topic))
+
+        if self._current_cycle_publish_counts is not None:
+            self._current_cycle_publish_counts["__all__"] = (
+                self._current_cycle_publish_counts.get("__all__", 0) + 1
+            )
+            self._current_cycle_publish_counts[topic] = (
+                self._current_cycle_publish_counts.get(topic, 0) + 1
+            )
+
+        if topic == "bot.news_alert":
+            self._last_bot_alert_at = now
+
+        self._prune_publish_history(now=now)
+
+    def _record_suppressed_publication(self, topic: str) -> None:
+        self._total_suppressed_publications += 1
+        self._suppressed_publish_counts[topic] = (
+            self._suppressed_publish_counts.get(topic, 0) + 1
+        )
+
+    def _cycle_count(self, topic: str) -> int:
+        if self._current_cycle_publish_counts is None:
+            return 0
+        return self._current_cycle_publish_counts.get(topic, 0)
+
+    def _hour_count(self, topic: str) -> int:
+        self._prune_publish_history()
+
+        if topic == "__all__":
+            return len(self._publish_history)
+
+        return sum(1 for _, published_topic in self._publish_history if published_topic == topic)
+
+    def _prune_publish_history(self, *, now: Any | None = None) -> None:
+        current_time = now or utc_now()
+        cutoff_seconds = 3_600.0
+        while self._publish_history:
+            published_at, _ = self._publish_history[0]
+            if (current_time - published_at).total_seconds() <= cutoff_seconds:
+                break
+            self._publish_history.popleft()
 
     def _is_high_impact(self, scored_item: ScoredNewsItem) -> bool:
         score = scored_item.score

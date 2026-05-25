@@ -1184,7 +1184,24 @@ class LiquidityTradingStrategy(TradingStrategy):
             # where symbol lives under scope and snapshot fields are flattened.
             if normalized.get("current_price") is not None and normalized.get("symbol"):
                 try:
-                    return LiquidityMapSnapshot(**normalized)
+                    # _normalize_snapshot_mapping intentionally preserves strategy-only
+                    # metadata such as exchange_symbol for signal metadata/scope, but
+                    # analytics.liquidity.models.LiquidityMapSnapshot does not accept
+                    # those extra fields in its constructor.  Filter to dataclass init
+                    # fields before constructing the typed snapshot; otherwise routed
+                    # liquidity strategies see liquidity.snapshot in the context but
+                    # fail later with missing_liquidity_snapshot_contract.
+                    init_fields = {
+                        item.name
+                        for item in fields(LiquidityMapSnapshot)
+                        if getattr(item, "init", True)
+                    }
+                    snapshot_kwargs = {
+                        key: value
+                        for key, value in normalized.items()
+                        if key in init_fields
+                    }
+                    return LiquidityMapSnapshot(**snapshot_kwargs)
                 except Exception:
                     # Continue unwrapping nested candidates below.  Some older
                     # deployments may require analytics model instances for

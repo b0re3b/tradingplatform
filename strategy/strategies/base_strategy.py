@@ -29,6 +29,9 @@ from ..enums import (
     TriggerType,
 )
 from ..exceptions import StrategyEvaluationError
+STRATEGY_MIN_OUTPUT_RR = 1.91
+
+
 from ..models import (
     EntryPlan,
     ExecutionCostPayload,
@@ -426,10 +429,15 @@ class StrategySignalMixin(StrategyMixinSupport):
             metadata.get("required_rr"),
             metadata.get("risk_reward_min"),
             self._tier_min_rr(tier_value),
-            default=1.8,
+            default=STRATEGY_MIN_OUTPUT_RR,
         )
         if min_rr is None or min_rr <= 0:
-            min_rr = 1.8
+            min_rr = STRATEGY_MIN_OUTPUT_RR
+        else:
+            # Strategy output must stay safely above the RiskManager t2 boundary.
+            # This avoids borderline 1.79999999999999 / 1.90000000000000 float
+            # failures without weakening RiskManager validation.
+            min_rr = max(float(min_rr), STRATEGY_MIN_OUTPUT_RR)
 
         configured_base = self._first_float(
             metadata.get("base_rr"),

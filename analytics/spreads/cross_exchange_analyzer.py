@@ -88,6 +88,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         config: CrossExchangeSpreadConfig,
         event_bus: EventBus,
         scheduler: Scheduler | None = None,
+        market_scheduler: Any | None = None,
     ) -> None:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -114,6 +115,7 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             config=config,
             event_bus=event_bus,
             scheduler=scheduler,
+            market_scheduler=market_scheduler,
             service_name=config.service_name,
         )
         self._config: CrossExchangeSpreadConfig = config
@@ -159,13 +161,11 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
 
     def register(self) -> None:
         """
-        Реєструє EventBus subscriptions.
+        Реєструє analyzer як MarketScheduler evaluator.
 
-        Production topic:
-            market.orderbook.updated
-
-        Raw topics market.orderbook / market.quote не використовуються,
-        якщо config.allow_legacy_raw_topics=False.
+        Production input не використовує старий EventBus topic
+        market.orderbook.updated. Дані приходять тільки зі shared
+        MarketStateStore snapshot через process_market_snapshot().
         """
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -191,10 +191,12 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
         if self._registered:
             return
 
-        self._subscribe_orderbook_updates(
-            self.on_orderbook_update,
-            name=f"{self._service_name}.on_orderbook_update",
-        )
+        registered_evaluator = self._register_market_scheduler_evaluator()
+        if not registered_evaluator:
+            self._logger.warning(
+                "CrossExchangeSpreadAnalyzer registered without an internal MarketScheduler evaluator; "
+                "ensure the facade is registered externally, otherwise no market data will be processed"
+            )
 
         self._registered = True
 
@@ -462,7 +464,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             "latest_snapshots": len(self._latest_snapshots),
             "latest_opportunities": len(self._latest_opportunities),
             "scope": "exchange:market_type:symbol:timeframe",
-            "price_input_source": "market.orderbook.updated",
+            "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
         }
 
 
@@ -723,7 +727,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                 "service_name": self._service_name,
                 "stats": self.get_stats(),
                 "scope": "exchange:market_type:symbol:timeframe",
-                "price_input_source": "market.orderbook.updated",
+                "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
             },
             priority=EventPriority.LOW,
         )
@@ -953,7 +959,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
-                "price_input_source": "market.orderbook.updated",
+                "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
                 "leg_a_key": str(spread_key_to_dict(snapshot.leg_a_key)),
                 "leg_b_key": str(spread_key_to_dict(snapshot.leg_b_key)),
             },
@@ -974,7 +982,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
-                "price_input_source": "market.orderbook.updated",
+                "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
                 "leg_a_key": str(spread_key_to_dict(snapshot.leg_a_key)),
                 "leg_b_key": str(spread_key_to_dict(snapshot.leg_b_key)),
             },
@@ -1079,7 +1089,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             quote_validity=QuoteValidity.VALID,
             timestamp=max(quote_a.timestamp, quote_b.timestamp),
             metadata={
-                "price_input_source": "market.orderbook.updated",
+                "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
                 "instrument_type": instrument_type.value,
                 "quote_a_age_ms": quote_age_ms(quote_a),
                 "quote_b_age_ms": quote_age_ms(quote_b),
@@ -1216,7 +1228,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
             headers={
                 "source_event_id": source_event_id,
                 "spread_type": SpreadType.CROSS_EXCHANGE.value,
-                "price_input_source": "market.orderbook.updated",
+                "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
                 "symbol": opportunity.symbol,
                 "buy_exchange": opportunity.buy_exchange,
                 "sell_exchange": opportunity.sell_exchange,
@@ -1242,7 +1256,9 @@ class CrossExchangeSpreadAnalyzer(BaseSpreadAnalyzer):
                     "opportunity_event_topic",
                     self.DEFAULT_OPPORTUNITY_TOPIC,
                 ),
-                "price_input_source": "market.orderbook.updated",
+                "price_input_source": "market_state_snapshot",
+            "input_mode": "market_state",
+            "market_scheduler_evaluator": getattr(self, "_market_scheduler_evaluator_name", None),
                 "buy_exchange": opportunity.buy_exchange,
                 "sell_exchange": opportunity.sell_exchange,
                 "buy_market_type": opportunity.buy_market_type,

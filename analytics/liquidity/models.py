@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from analytics.liquidity import LiquidityServiceContext
 from core.logger import get_logger
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
+
+if TYPE_CHECKING:
+    from analytics.liquidity.liquidity_service import LiquidityServiceContext
 
 from analytics.liquidity.enums import (
     ClusterStrength,
@@ -2321,80 +2323,29 @@ class LiquiditySignal:
             "magnet_score_down": self.magnet_score_down,
             "confidence": self.confidence,
             "explanation": self.explanation,
-            "nearest_buy_side_liquidity": self._liquidity_payload(
+            "nearest_buy_side_liquidity": self._nearest_liquidity_payload(
                 self.nearest_buy_side_liquidity
             ),
-            "nearest_sell_side_liquidity": self._liquidity_payload(
+            "nearest_sell_side_liquidity": self._nearest_liquidity_payload(
                 self.nearest_sell_side_liquidity
             ),
             "metadata": dict(self.metadata),
         }
 
-    def _liquidity_payload(
-            self,
-            context: LiquidityServiceContext,
-            snapshot: LiquidityMapSnapshot,
-    ) -> dict[str, Any]:
-        signal = snapshot.signal.to_event_payload() if snapshot.signal else None
+    def _nearest_liquidity_payload(
+        self,
+        value: LiquidityLevel | StopCluster | None,
+    ) -> dict[str, Any] | None:
+        if value is None:
+            return None
 
-        payload = {
-            # --- scope ---
-            "domain": "liquidity",
-            "symbol": context.symbol,
-            "exchange": context.exchange,
-            "market_type": context.market_type,
-            "timeframe": context.timeframe,
-            "scope": context.scope,
-            "scope_key": context.scope_key,
-            "liquidity_key": list(context.key),
-            "timestamp": snapshot.timestamp.isoformat(),
+        if hasattr(value, "to_event_payload"):
+            return value.to_event_payload()
 
-            # --- price ---
-            "current_price": snapshot.current_price,
-
-            # --- головна секція ---
-            "snapshot": snapshot.to_event_payload(),
-
-            # --- розгорнуті поля зі snapshot ---
-            "active_levels": [l.to_event_payload() for l in snapshot.active_levels],
-            "equal_levels": [l.to_event_payload() for l in snapshot.equal_levels],
-            "stop_clusters": [c.to_event_payload() for c in snapshot.stop_clusters],
-            "zones": [z.to_event_payload() for z in snapshot.zones],
-
-            "nearest_above_level": snapshot.nearest_above_level.to_event_payload() if snapshot.nearest_above_level else None,
-            "nearest_below_level": snapshot.nearest_below_level.to_event_payload() if snapshot.nearest_below_level else None,
-            "strongest_cluster_above": snapshot.strongest_cluster_above.to_event_payload() if snapshot.strongest_cluster_above else None,
-            "strongest_cluster_below": snapshot.strongest_cluster_below.to_event_payload() if snapshot.strongest_cluster_below else None,
-
-            # --- scores ---
-            "above_liquidity_score": snapshot.above_liquidity_score,
-            "below_liquidity_score": snapshot.below_liquidity_score,
-            "liquidity_pressure_score": snapshot.liquidity_pressure_score,
-            "bias": snapshot.bias.value if hasattr(snapshot.bias, "value") else snapshot.bias,
-
-            # --- signal ---
-            "signal": signal,
-
-            # --- strategy contract ---
-            "strategy_contract_version": "analytics-strategy-v1",
-            "strategy_contract": {
-                "version": "analytics-strategy-v1",
-                "domain": "liquidity",
-                "expected_by": "StrategyContext/SignalBuilder",
-            },
+        return {
+            "type": type(value).__name__,
+            "repr": repr(value),
         }
-
-        if snapshot.signal:
-            payload["sweep_risk"] = {
-                "up": snapshot.signal.sweep_risk_up,
-                "down": snapshot.signal.sweep_risk_down,
-            }
-            payload["magnet"] = {
-                "up": snapshot.signal.magnet_score_up,
-                "down": snapshot.signal.magnet_score_down,
-            }
-
-        return payload
 
 
 @dataclass(slots=True)

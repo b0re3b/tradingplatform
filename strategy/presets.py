@@ -857,12 +857,19 @@ ORDERFLOW_STRATEGIES: StrategyNames = (
     "orderflow_reversal",
 )
 
-PRICE_ACTION_STRATEGIES: StrategyNames = (
+INACTIVE_STRATEGY_NAMES: StrategyNames = (
     "market_structure",
     "fvg_reaction",
     "support_resistance_reaction",
     "trend_continuation",
 )
+
+def _drop_inactive_names(names: Sequence[str]) -> StrategyNames:
+    inactive = set(INACTIVE_STRATEGY_NAMES)
+    return tuple(name for name in names if name not in inactive)
+
+
+PRICE_ACTION_STRATEGIES: StrategyNames = ()
 
 OPEN_INTEREST_STRATEGIES: StrategyNames = (
     "oi_divergence",
@@ -926,7 +933,7 @@ HYBRID_STRATEGIES: StrategyNames = (
 )
 
 ALL_STRATEGY_NAMES: StrategyNames = tuple(STRATEGY_CATALOG.keys())
-DEFAULT_STRATEGIES: StrategyNames = ALL_STRATEGY_NAMES
+DEFAULT_STRATEGIES: StrategyNames = _drop_inactive_names(ALL_STRATEGY_NAMES)
 
 
 SCALPING_STRATEGIES: StrategyNames = (
@@ -950,10 +957,6 @@ SCALPING_STRATEGIES: StrategyNames = (
 )
 
 INTRADAY_STRATEGIES: StrategyNames = (
-    "market_structure",
-    "fvg_reaction",
-    "support_resistance_reaction",
-    "trend_continuation",
     "cvd_divergence",
     "orderflow_continuation",
     "orderflow_reversal",
@@ -980,9 +983,6 @@ INTRADAY_STRATEGIES: StrategyNames = (
 )
 
 SWING_STRATEGIES: StrategyNames = (
-    "market_structure",
-    "trend_continuation",
-    "support_resistance_reaction",
     "oi_breakout_confirmation",
     "oi_divergence",
     "oi_anomaly",
@@ -1036,14 +1036,11 @@ MEAN_REVERSION_STRATEGIES: StrategyNames = (
     "whale_absorption",
     "whale_liquidation_reversal",
     "spoofing_absorption_reversal",
-    "support_resistance_reaction",
     "mean_reversion_stack",
     "oi_funding_squeeze",
 )
 
 TREND_STACK_STRATEGIES: StrategyNames = (
-    "trend_continuation",
-    "market_structure",
     "orderflow_continuation",
     "oi_breakout_confirmation",
     "liquidation_cascade",
@@ -1195,7 +1192,6 @@ def _routing_config(
         stale_feature_threshold_seconds=stale_feature_threshold_seconds,
         event_to_categories={
             "analytics.orderflow": [StrategyCategory.ORDERFLOW],
-            "analytics.price_action": [StrategyCategory.PRICE_ACTION],
             "analytics.open_interest": [StrategyCategory.OPEN_INTEREST],
             "analytics.oi": [StrategyCategory.OPEN_INTEREST],
             "analytics.spoofing": [StrategyCategory.SPOOFING],
@@ -1219,7 +1215,6 @@ def _category_weights(
     values: dict[StrategyCategory, float] = {
         StrategyCategory.ORDERFLOW: 1.00,
         StrategyCategory.LIQUIDITY: 1.00,
-        StrategyCategory.PRICE_ACTION: 0.90,
         StrategyCategory.LIQUIDATIONS: 0.95,
         StrategyCategory.WHALES: 0.95,
         StrategyCategory.SPOOFING: 0.90,
@@ -1577,7 +1572,7 @@ class StrategyPresetBuilder:
         self.symbols = _clean_symbols(symbols)
         self.timeframes = _normalize_timeframes(timeframes, fallback=()) if timeframes else []
         self.allowed_regimes = _normalize_regimes(allowed_regimes)
-        self.strategy_names = _normalize_names(strategy_names or [])
+        self.strategy_names = _drop_inactive_names(_normalize_names(strategy_names or []))
         self.use_required_features = bool(use_required_features)
         self.metadata: dict[str, object] = dict(metadata or {})
 
@@ -1792,7 +1787,10 @@ class StrategyPresetBuilder:
         _strategy_logger = getattr(self, "logger", None) or getattr(self, "_logger", None) or logging.getLogger(__name__ + "." + self.__class__.__name__)
         if _strategy_logger.isEnabledFor(logging.DEBUG):
             _strategy_logger.debug("Entering StrategyPresetBuilder.build")
-        strategy_names = self.strategy_names or list(ALL_STRATEGY_NAMES)
+        strategy_names = list(self.strategy_names or list(DEFAULT_STRATEGIES))
+        if INACTIVE_STRATEGY_NAMES:
+            inactive = set(INACTIVE_STRATEGY_NAMES)
+            strategy_names = [name for name in strategy_names if name not in inactive]
 
         default_cooldown = int(self._runtime_defaults["cooldown_seconds"])
         default_max_age = int(self._runtime_defaults["max_signal_age_seconds"])

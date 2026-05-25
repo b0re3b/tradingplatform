@@ -182,26 +182,55 @@ class MarketStream:
         if not self.stream_config.wire_ingestion_into_clients:
             return
         for exchange, client in self.exchange_clients.items():
-            for attr, value in (
-                ("market_ingestion", self.ingestion),
-                ("ingestion", self.ingestion),
-                ("market_state", self.market_state),
-                ("market_state_store", self.market_state),
-                ("state_store", self.market_state),
-            ):
-                if hasattr(client, attr):
-                    with contextlib.suppress(Exception):
-                        setattr(client, attr, value)
+            ingestion_wired = False
+            state_wired = False
+
             setter = getattr(client, "set_market_ingestion", None)
             if callable(setter):
                 result = setter(self.ingestion)
                 if inspect.isawaitable(result):
                     raise RuntimeError(f"set_market_ingestion must be sync for {exchange}")
+                ingestion_wired = True
+
             state_setter = getattr(client, "set_market_state", None)
             if callable(state_setter):
                 result = state_setter(self.market_state)
                 if inspect.isawaitable(result):
                     raise RuntimeError(f"set_market_state must be sync for {exchange}")
+                state_wired = True
+
+            for attr, value in (
+                ("market_ingestion", self.ingestion),
+                ("_market_ingestion", self.ingestion),
+                ("ingestion", self.ingestion),
+                ("_ingestion", self.ingestion),
+                ("market_state", self.market_state),
+                ("_market_state", self.market_state),
+                ("market_state_store", self.market_state),
+                ("_market_state_store", self.market_state),
+                ("state_store", self.market_state),
+                ("_state_store", self.market_state),
+            ):
+                if hasattr(client, attr):
+                    with contextlib.suppress(Exception):
+                        setattr(client, attr, value)
+                        if "ingestion" in attr:
+                            ingestion_wired = True
+                        if "state" in attr:
+                            state_wired = True
+
+            self._logger.info(
+                "MarketStream wired exchange client | exchange=%s ingestion=%s market_state=%s",
+                exchange,
+                ingestion_wired,
+                state_wired,
+            )
+            if not ingestion_wired:
+                self._logger.warning(
+                    "MarketStream could not wire MarketIngestionService into exchange client | exchange=%s client=%s",
+                    exchange,
+                    client.__class__.__name__,
+                )
 
     async def _start_exchange_clients(self) -> None:
         for exchange, client in self.exchange_clients.items():

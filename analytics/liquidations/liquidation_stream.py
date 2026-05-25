@@ -532,16 +532,31 @@ class LiquidationStream:
 
 
     def _register_market_scheduler_evaluator(self) -> None:
+        """Register the state-driven liquidation evaluator in MarketScheduler.
+
+        State-driven mode is production mode: raw liquidation events are first
+        written into MarketStateStore and later processed from consistent
+        snapshots by MarketScheduler.  Running this mode without a scheduler is
+        a broken wiring state, because the component will only emit health /
+        stream snapshots and will never publish normalized liquidation analytics.
+        Fail fast so this cannot silently reach production again.
+        """
         market_scheduler = getattr(self, "market_scheduler", None)
         if market_scheduler is None:
-            self.logger.warning(
-                "LiquidationStream state-driven mode requires MarketScheduler; liquidation snapshots will not be processed"
+            raise RuntimeError(
+                "Invalid LiquidationStream wiring: market_state_store was provided, "
+                "therefore state-driven mode is active, but market_scheduler is None. "
+                "Pass MarketScheduler into LiquidationStream or remove market_state_store "
+                "to use legacy EventBus mode."
             )
-            return
+
         register_evaluator = getattr(market_scheduler, "register_evaluator", None)
         if not callable(register_evaluator):
-            self.logger.warning("Configured market_scheduler has no register_evaluator(); liquidations will not be processed")
-            return
+            raise RuntimeError(
+                "Invalid LiquidationStream wiring: configured market_scheduler has no "
+                "register_evaluator(); liquidation snapshots cannot be processed."
+            )
+
         name = f"liquidations:stream:{self.service_name}"
         register_evaluator(
             name=name,

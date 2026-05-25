@@ -71,6 +71,7 @@ class BaseSpreadAnalyzer(ABC):
         config: BaseSpreadConfig,
         event_bus: EventBus,
         scheduler: Scheduler | None = None,
+        market_scheduler: Any | None = None,
         service_name: str = "spread_analyzer",
     ) -> None:
         try:
@@ -97,6 +98,8 @@ class BaseSpreadAnalyzer(ABC):
         self._config = config
         self._event_bus = event_bus
         self._scheduler = scheduler
+        self._market_scheduler = market_scheduler
+        self._market_scheduler_evaluator_name: str | None = None
         self._service_name = service_name
 
         self._logger = get_logger(
@@ -255,13 +258,7 @@ class BaseSpreadAnalyzer(ABC):
 
         await self._emit_lifecycle_event(
             self._config.analyzer_started_event_topic,
-            {
-                "analyzer": self.__class__.__name__,
-                "service_name": self._service_name,
-                "production_input_topics": list(self._production_input_topics()),
-                "production_price_input_topics": list(self._production_price_input_topics()),
-                "scope": "exchange:market_type:symbol:timeframe",
-            },
+            self._build_analyzer_started_payload(),
         )
 
     async def stop(self) -> None:
@@ -349,6 +346,8 @@ class BaseSpreadAnalyzer(ABC):
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "unregister", _analytics_args)
         except Exception:
             pass
+        self._unregister_market_scheduler_evaluator()
+
         if not self._subscriptions:
             self._registered = False
             return
@@ -1210,6 +1209,83 @@ class BaseSpreadAnalyzer(ABC):
             "ask_size",
         }
         return any(key in payload for key in orderbook_keys)
+
+
+    # ------------------------------------------------------------------
+    # MarketScheduler helpers
+    # ------------------------------------------------------------------
+
+    def _market_scheduler_evaluator_id(self) -> str:
+        return f"spreads:{self._service_name}:{self.__class__.__name__}"
+
+    def _market_scheduler_dirty_reasons(self) -> tuple[str, ...]:
+        return (
+            "orderbook",
+            "orderbook_resync_required",
+            "rest_snapshot",
+            "price",
+            "funding",
+            "open_interest",
+            "trade",
+            "trades_batch",
+        )
+
+    def _register_market_scheduler_evaluator(self) -> bool:
+        market_scheduler = getattr(self, "_market_scheduler", None)
+        if market_scheduler is None:
+            self._logger.warning(
+                "Spread analyzer MarketScheduler is not configured; state-driven input is disabled | analyzer=%s",
+                self.__class__.__name__,
+            )
+            return False
+
+        register_evaluator = getattr(market_scheduler, "register_evaluator", None)
+        if not callable(register_evaluator):
+            self._logger.warning(
+                "Configured market_scheduler has no register_evaluator(); state-driven spread input is disabled | analyzer=%s",
+                self.__class__.__name__,
+            )
+            return False
+
+        name = self._market_scheduler_evaluator_id()
+        register_evaluator(
+            name=name,
+            callback=self.process_market_snapshot,
+            enabled=True,
+            metadata={
+                "domain": "spreads",
+                "analyzer": self.__class__.__name__,
+                "service_name": self._service_name,
+                "input_mode": "market_state",
+                "dirty_reasons": list(self._market_scheduler_dirty_reasons()),
+            },
+            dirty_reasons=self._market_scheduler_dirty_reasons(),
+        )
+        self._market_scheduler_evaluator_name = name
+        self._logger.info(
+            "Spread analyzer registered as MarketScheduler evaluator | analyzer=%s evaluator=%s",
+            self.__class__.__name__,
+            name,
+        )
+        return True
+
+    def _unregister_market_scheduler_evaluator(self) -> None:
+        market_scheduler = getattr(self, "_market_scheduler", None)
+        name = getattr(self, "_market_scheduler_evaluator_name", None)
+        if market_scheduler is None or not name:
+            return
+
+        unregister_evaluator = getattr(market_scheduler, "unregister_evaluator", None)
+        if callable(unregister_evaluator):
+            try:
+                unregister_evaluator(name)
+            except Exception as exc:
+                self._mark_exception(
+                    "Failed to unregister MarketScheduler evaluator",
+                    exc,
+                    evaluator_name=name,
+                )
+        self._market_scheduler_evaluator_name = None
 
     # ------------------------------------------------------------------
     # EventBus helpers
@@ -2515,6 +2591,45 @@ class BaseSpreadAnalyzer(ABC):
             "exceptions": 0,
         }
 
+    def _build_state_input_contract(self) -> dict[str, Any]:
+        """Return the real state-driven input contract used by this analyzer.
+
+        The old lifecycle event only listed legacy EventBus topics such as
+        market.orderbook.updated.  In the high-load runtime the analyzer is
+        driven by MarketScheduler snapshots, so startup diagnostics must expose
+        evaluator registration and dirty-reason filters explicitly.
+        """
+        return {
+            "input_mode": "market_state",
+            "market_scheduler_attached": self._market_scheduler is not None,
+            "market_scheduler_evaluator_name": self._market_scheduler_evaluator_name,
+            "market_scheduler_evaluator_registered": self._market_scheduler_evaluator_name is not None,
+            "dirty_reasons": list(self._market_scheduler_dirty_reasons()),
+            "market_snapshot_entrypoint": "process_market_snapshot",
+            "expected_snapshot_fields": [
+                "scope",
+                "orderbook",
+                "funding",
+                "dirty_reasons",
+                "updated_at_ms",
+            ],
+            "legacy_eventbus_topics": {
+                "production_input_topics": list(self._production_input_topics()),
+                "production_price_input_topics": list(self._production_price_input_topics()),
+                "legacy_raw_input_topics": list(self._legacy_raw_input_topics()),
+                "legacy_quote_input_topics": list(self._legacy_quote_input_topics()),
+            },
+            "scope": "exchange:market_type:symbol:timeframe",
+        }
+
+    def _build_analyzer_started_payload(self) -> dict[str, Any]:
+        contract = self._build_state_input_contract()
+        return {
+            "analyzer": self.__class__.__name__,
+            "service_name": self._service_name,
+            **contract,
+        }
+
     def _build_start_log_extra(self) -> dict[str, Any]:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -2546,11 +2661,9 @@ class BaseSpreadAnalyzer(ABC):
             "cooldown_seconds": self._config.cooldown_seconds,
             "subscriptions": len(self._subscriptions),
             "scheduler_jobs": len(self._scheduler_job_ids),
-            "production_input_topics": list(self._production_input_topics()),
-            "production_price_input_topics": list(self._production_price_input_topics()),
+            **self._build_state_input_contract(),
             "allow_legacy_raw_topics": getattr(self._config, "allow_legacy_raw_topics", False),
             "allow_legacy_quote_topics": getattr(self._config, "allow_legacy_quote_topics", False),
-            "scope": "exchange:market_type:symbol:timeframe",
         }
 
     def _build_stop_log_extra(self) -> dict[str, Any]:

@@ -40,6 +40,7 @@ from app.runtime import (
 )
 from app.universe import discover_exchange_universe
 from data.market_restore import MarketRestoreConfig, MarketStateRestorer
+from data.market_models import MarketScope
 
 
 logger = get_logger(__name__, service="app.main", event_type="bootstrap")
@@ -99,10 +100,6 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "ANALYTICS_EXCHANGE",
         "ANALYTICS_MARKET_TYPE",
         "ANALYTICS_SYMBOLS",
-        "PRICE_ACTION_EXCHANGE",
-        "PRICE_ACTION_MARKET_TYPE",
-        "PRICE_ACTION_SYMBOLS",
-        "PRICE_ACTION_TIMEFRAMES",
         "ORDERFLOW_DEFAULT_EXCHANGE",
         "ORDERFLOW_DEFAULT_MARKET_TYPE",
         "ORDERFLOW_DEFAULT_TIMEFRAME",
@@ -141,6 +138,8 @@ def _log_env_diagnostics(env_file: Path) -> None:
         "STARTUP_WARMUP_PERSIST_ENABLED",
         "STARTUP_WARMUP_PERSIST_REQUIRED",
         "STARTUP_WARMUP_FLUSH_STORAGE_BEFORE_TRADING",
+        "STARTUP_WARMUP_FORCE_INGEST_PERSIST",
+        "STARTUP_MARKET_STATE_EVALUATE_MAX_PASSES",
         "STARTUP_PARQUET_LOAD_ENABLED",
         "STARTUP_PARQUET_LOAD_REQUIRED",
         "STARTUP_PARQUET_LOAD_DAYS",
@@ -209,7 +208,7 @@ async def _start_analytics_component(component: Any) -> None:
         register() once, then start() once when available.
 
     This guarantees EventBus subscriptions and Scheduler jobs are installed for
-    PriceAction, Spoofing, Spreads, Funding/OI, Liquidations, Liquidity,
+    Spoofing, Spreads, Funding/OI, Liquidations, Liquidity,
     Orderflow and Whales without putting domain logic into app.
     """
     has_register = callable(getattr(component, "register", None))
@@ -422,12 +421,11 @@ class TradingSystemRuntime:
             self.components.append(market_stream)
 
             # Register market stream now, but intentionally do not start WS clients yet.
-            # Historical REST warmup must populate state/analytics before live market
-            # events and before strategy/risk/execution are started.
+            # Live market starts only after analytics/strategy/risk/execution are ready.
             await register_component(market_stream)
 
         # ------------------------------------------------------------------
-        # Analytics + startup history
+        # Analytics
         # ------------------------------------------------------------------
         if self.settings.enable_analytics:
             analytics_components = build_analytics_components(
@@ -445,14 +443,8 @@ class TradingSystemRuntime:
                 self.components.append(component)
                 await _start_analytics_component(component)
 
-            # Start snapshot evaluation before warmup so REST/Parquet data written
-            # into MarketStateStore can immediately feed analytics.
+            # Start snapshot evaluation before live stream start.
             await start_component(market_scheduler)
-
-            # Restore local Parquet history first, then REST warmup fills the
-            # missing/fresh tail from Binance before strategy/risk/execution start.
-            await self._load_startup_parquet_history(universe)
-            await self._run_startup_warmup(universe)
 
         # ------------------------------------------------------------------
         # Strategy
@@ -555,10 +547,13 @@ class TradingSystemRuntime:
         )
 
     def _startup_warmup_timeframes(self) -> list[str]:
-        configured = [str(tf).strip() for tf in self.settings.startup_warmup_timeframes if str(tf).strip()]
+        """Return timeframes used during startup history hydration."""
+        configured: list[str] = []
+        configured.extend(str(tf).strip() for tf in self.settings.startup_warmup_timeframes if str(tf).strip())
+
         if not configured:
             configured = [str(tf).strip() for tf in self.settings.timeframes if str(tf).strip()]
-        # Preserve order and remove duplicates.
+
         seen: set[str] = set()
         result: list[str] = []
         for timeframe in configured:
@@ -754,7 +749,7 @@ class TradingSystemRuntime:
 
         A single MarketScheduler tick is intentionally bounded by batch_size.
         During startup warmup/restores a REST batch can mark more scopes dirty
-        than that limit, so one tick can leave price_action/orderflow scopes
+        than that limit, so one tick can leave analytics scopes
         unprocessed.  Drain until the scheduler reports no snapshots or a small
         safety limit is reached.
         """
@@ -784,6 +779,243 @@ class TradingSystemRuntime:
                     break
         except Exception:
             logger.exception("Market state evaluation failed | reason=%s", reason)
+
+    async def _warmup_analytics_from_market_state(self) -> None:
+        """Best-effort explicit warmup hook for analyzers that can rebuild from MarketStateStore.
+
+        State-driven analyzers normally receive snapshots through MarketScheduler.
+        Some domain analyzers may also expose an
+        explicit warmup_from_market_state() method to rebuild child-module state
+        from restored candles before strategy/risk/execution are started.
+        """
+        warmed = 0
+        skipped = 0
+
+        for component in self.components:
+            warmup = getattr(component, "warmup_from_market_state", None)
+            if not callable(warmup):
+                continue
+
+            try:
+                result = warmup()
+                if inspect.isawaitable(result):
+                    result = await result
+
+                warmed += 1
+                logger.info(
+                    "Analytics component warmed from MarketStateStore | component=%s result=%s",
+                    component.__class__.__name__,
+                    result,
+                )
+            except Exception:
+                skipped += 1
+                logger.exception(
+                    "Analytics component warmup_from_market_state failed | component=%s",
+                    component.__class__.__name__,
+                )
+
+        logger.info(
+            "Analytics MarketState explicit warmup completed | warmed=%s failed=%s",
+            warmed,
+            skipped,
+        )
+
+    @staticmethod
+    def _first_present(payload: Any, *keys: str) -> Any:
+        if not isinstance(payload, dict):
+            return None
+        for key in keys:
+            if key in payload and payload.get(key) is not None:
+                return payload.get(key)
+        return None
+
+    def _normalize_startup_candle_payload(
+        self,
+        candle: Any,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+    ) -> dict[str, Any] | None:
+        """Normalize REST kline rows before they are forced through ingestion.
+
+        Binance adapters in this project have existed in both forms: normalized
+        dicts and raw list/tuple klines.  Startup must not depend on the adapter
+        having a hidden MarketIngestion side effect, so this helper converts both
+        shapes into the CandleUpdate.from_payload contract.
+        """
+        if isinstance(candle, dict):
+            open_time = self._first_present(candle, "open_time_ms", "open_time", "timestamp_ms", "timestamp", "start", "t")
+            close_time = self._first_present(candle, "close_time_ms", "close_time", "end", "T")
+            open_price = self._first_present(candle, "open", "o")
+            high = self._first_present(candle, "high", "h")
+            low = self._first_present(candle, "low", "l")
+            close = self._first_present(candle, "close", "c")
+            volume = self._first_present(candle, "volume", "v")
+            is_closed = self._first_present(candle, "is_closed", "closed", "x")
+            timestamp = self._first_present(candle, "timestamp_ms", "event_time", "timestamp") or close_time or open_time
+            exchange_symbol = self._first_present(candle, "exchange_symbol", "raw_symbol", "symbol") or symbol
+            source = self._first_present(candle, "source") or "startup_rest_warmup"
+        elif isinstance(candle, (list, tuple)) and len(candle) >= 6:
+            # Binance /fapi/v1/klines raw shape:
+            # [open_time, open, high, low, close, volume, close_time, ...]
+            open_time = candle[0]
+            open_price = candle[1]
+            high = candle[2]
+            low = candle[3]
+            close = candle[4]
+            volume = candle[5]
+            close_time = candle[6] if len(candle) > 6 else None
+            is_closed = True
+            timestamp = close_time or open_time
+            exchange_symbol = symbol
+            source = "startup_rest_warmup"
+        else:
+            return None
+
+        try:
+            open_ms = int(float(open_time))
+        except (TypeError, ValueError):
+            return None
+
+        timeframe_ms = self._timeframe_to_ms(timeframe)
+        try:
+            close_ms = int(float(close_time)) if close_time is not None else open_ms + timeframe_ms - 1
+        except (TypeError, ValueError):
+            close_ms = open_ms + timeframe_ms - 1
+
+        normalized = {
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "exchange_symbol": exchange_symbol,
+            "timeframe": timeframe,
+            "open_time_ms": open_ms,
+            "close_time_ms": close_ms,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume if volume is not None else 0.0,
+            "is_closed": bool(is_closed if is_closed is not None else True),
+            "timestamp_ms": timestamp,
+            "source": source,
+            "metadata": {
+                "source": "startup_rest_warmup",
+                "startup_warmup": True,
+            },
+        }
+        return normalized
+
+    async def _ingest_startup_candles(
+        self,
+        candles: Any,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+        suppress_persistable_events: bool | None = None,
+    ) -> int:
+        """Force REST warmup candles into the shared MarketStateStore.
+
+        Some exchange REST adapters already ingest klines as a side effect, while
+        others only return rows. Re-ingesting normalized candles is safe for
+        MarketStateStore because candles are keyed by open_time_ms.
+        """
+        if self.market_ingestion is None or not candles:
+            return 0
+
+        items: list[Any]
+        if isinstance(candles, dict):
+            raw_items = candles.get("candles") or candles.get("items") or candles.get("data") or []
+            items = list(raw_items) if isinstance(raw_items, (list, tuple)) else []
+        elif isinstance(candles, (list, tuple)):
+            items = list(candles)
+        else:
+            return 0
+
+        normalized: list[dict[str, Any]] = []
+        for candle in items:
+            payload = self._normalize_startup_candle_payload(
+                candle,
+                exchange=exchange,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+            if payload is not None:
+                normalized.append(payload)
+
+        if not normalized:
+            return 0
+
+        ingest = getattr(self.market_ingestion, "ingest_candles_batch", None)
+        if not callable(ingest):
+            logger.warning("Startup candle ingestion skipped: MarketIngestionService has no ingest_candles_batch")
+            return 0
+
+        # Default to emitting persistable events when startup persistence is enabled.
+        # Operators can turn it off with STARTUP_WARMUP_FORCE_INGEST_PERSIST=false.
+        if suppress_persistable_events is None:
+            suppress_persistable_events = not bool(getattr(self.settings, "startup_warmup_force_ingest_persist", True))
+
+        result = ingest(
+            normalized,
+            source="startup_rest_warmup",
+            suppress_persistable_events=suppress_persistable_events,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+
+        try:
+            return int(result or 0)
+        except (TypeError, ValueError):
+            return len(normalized)
+
+    async def _market_state_candle_count(
+        self,
+        *,
+        exchange: str,
+        market_type: str,
+        symbol: str,
+        timeframe: str,
+    ) -> dict[str, Any]:
+        """Read candle availability from MarketStateStore for diagnostics/strict gates."""
+        if self.market_state_store is None:
+            return {"ok": False, "reason": "market_state_store_missing", "candle_count": 0, "closed_candles": 0}
+
+        try:
+            snapshot = await self.market_state_store.snapshot(
+                MarketScope(exchange=exchange, market_type=market_type, symbol=symbol, timeframe=timeframe),
+                depth=getattr(self.settings, "market_scheduler_snapshot_depth", None),
+            )
+        except Exception as exc:
+            logger.exception(
+                "MarketState candle diagnostics failed | exchange=%s market_type=%s symbol=%s timeframe=%s",
+                exchange,
+                market_type,
+                symbol,
+                timeframe,
+            )
+            return {"ok": False, "reason": str(exc), "candle_count": 0, "closed_candles": 0}
+
+        window = getattr(snapshot, "candles", {}).get(timeframe)
+        candles = tuple(getattr(window, "candles", ()) or ()) if window is not None else ()
+        closed = [item for item in candles if bool(getattr(item, "is_closed", False))]
+        return {
+            "ok": bool(closed),
+            "exchange": exchange,
+            "market_type": market_type,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candle_count": int(getattr(window, "candle_count", len(candles)) or 0) if window is not None else 0,
+            "closed_candles": len(closed),
+            "first_open_time_ms": getattr(candles[0], "open_time_ms", None) if candles else None,
+            "last_open_time_ms": getattr(candles[-1], "open_time_ms", None) if candles else None,
+            "last_close_time_ms": getattr(candles[-1], "close_time_ms", None) if candles else None,
+        }
 
     @staticmethod
     def _timeframe_to_ms(timeframe: str) -> int:
@@ -968,7 +1200,7 @@ class TradingSystemRuntime:
         - Analytics are registered/started.
         - Strategy/risk/execution/Telegram/news are NOT started yet.
 
-        This lets price_action/liquidity/funding build initial state without
+        This lets analytics build initial state without
         producing live strategy/risk/execution side effects.
         """
         if not self._startup_warmup_enabled():
@@ -1026,11 +1258,29 @@ class TradingSystemRuntime:
             batch_size,
         )
 
+        orderbook_success = 0
+        orderbook_failed: list[str] = []
         kline_success = 0
         kline_failed: list[str] = []
         funding_success = 0
         funding_failed: list[str] = []
         sem = asyncio.Semaphore(concurrency)
+
+        async def warmup_orderbook(symbol: str) -> tuple[str, bool, str | None]:
+            async with sem:
+                try:
+                    limit = max(5, int(getattr(self.settings, "startup_warmup_orderbook_limit", 100)))
+                    await rest.get_orderbook_snapshot(symbol=symbol, limit=limit)
+                    return symbol, True, None
+                except Exception as exc:
+                    if self._is_derivative_symbol_unavailable_error(exc):
+                        self._disable_derivative_snapshot_symbol(symbol, exc)
+                    logger.exception(
+                        "Startup orderbook warmup failed | exchange=%s symbol=%s",
+                        warmup_exchange,
+                        symbol,
+                    )
+                    return symbol, False, str(exc)
 
         async def warmup_klines(symbol: str, timeframe: str) -> tuple[str, str, int, str | None]:
             async with sem:
@@ -1048,7 +1298,21 @@ class TradingSystemRuntime:
                             interval=timeframe,
                             limit=effective_kline_limit,
                         )
-                        return symbol, timeframe, len(candles or []), None
+                        loaded = len(candles or [])
+                        ingested = await self._ingest_startup_candles(
+                            candles,
+                            exchange=warmup_exchange,
+                            market_type=self.settings.analytics_market_type,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                        state_info = await self._market_state_candle_count(
+                            exchange=warmup_exchange,
+                            market_type=self.settings.analytics_market_type,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+                        return symbol, timeframe, max(loaded, ingested, int(state_info.get("closed_candles") or 0)), None
 
                     timeframe_ms = self._timeframe_to_ms(timeframe)
                     cursor_ms = warmup_start_ms
@@ -1069,12 +1333,27 @@ class TradingSystemRuntime:
                         if not candles:
                             break
 
+                        await self._ingest_startup_candles(
+                            candles,
+                            exchange=warmup_exchange,
+                            market_type=self.settings.analytics_market_type,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                        )
+
                         page_new = 0
                         last_open_ms: int | None = None
                         for candle in candles:
-                            if not isinstance(candle, dict):
+                            normalized_candle = self._normalize_startup_candle_payload(
+                                candle,
+                                exchange=warmup_exchange,
+                                market_type=self.settings.analytics_market_type,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                            )
+                            if normalized_candle is None:
                                 continue
-                            open_time = candle.get("open_time_ms") or candle.get("open_time") or candle.get("timestamp_ms")
+                            open_time = normalized_candle.get("open_time_ms")
                             try:
                                 open_ms = int(float(open_time))
                             except (TypeError, ValueError):
@@ -1092,7 +1371,13 @@ class TradingSystemRuntime:
                         if len(candles) < klines_per_request:
                             break
 
-                    return symbol, timeframe, total, None
+                    state_info = await self._market_state_candle_count(
+                        exchange=warmup_exchange,
+                        market_type=self.settings.analytics_market_type,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                    )
+                    return symbol, timeframe, max(total, int(state_info.get("closed_candles") or 0)), None
                 except Exception as exc:
                     if self._is_derivative_symbol_unavailable_error(exc):
                         self._disable_derivative_snapshot_symbol(symbol, exc)
@@ -1122,9 +1407,27 @@ class TradingSystemRuntime:
                     )
                     return symbol, 0, str(exc)
 
-        # Candle warmup is shared by price_action and liquidity. REST emits
-        # market.candles.snapshot; CandlesCache turns it into market.candles.updated;
-        # price_action/liquidity analytics consume those updates before strategy starts.
+        # Orderbook warmup writes REST depth snapshots into MarketStateStore before
+        # live WS deltas arrive. This gives spoofing/spreads valid book depth and
+        # prevents delta-before-snapshot resync-only startup states.
+        if bool(getattr(self.settings, "startup_warmup_orderbook_enabled", True)):
+            for start in range(0, len(symbols), batch_size):
+                batch = symbols[start : start + batch_size]
+                results = await asyncio.gather(
+                    *(warmup_orderbook(symbol) for symbol in batch),
+                    return_exceptions=False,
+                )
+                for symbol, ok, error in results:
+                    if ok:
+                        orderbook_success += 1
+                    else:
+                        orderbook_failed.append(f"{symbol}:{error or 'empty'}")
+                await self._evaluate_market_state_once(reason="startup_warmup_orderbook_batch")
+                await self._wait_event_bus_idle(timeout=self.settings.startup_warmup_eventbus_idle_timeout)
+
+        # Candle warmup writes directly into MarketStateStore through
+        # MarketIngestionService. Price-action/liquidity receive restored scopes
+        # through MarketScheduler snapshots before strategy/risk/execution start.
         kline_jobs = [(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
         for start in range(0, len(kline_jobs), batch_size):
             batch = kline_jobs[start : start + batch_size]
@@ -1164,12 +1467,12 @@ class TradingSystemRuntime:
         if self.settings.startup_warmup_required:
             if kline_jobs and kline_success <= 0:
                 raise RuntimeError(
-                    "Startup warmup failed: no historical candles were loaded for price_action/liquidity"
+                    "Startup warmup failed: no historical candles were loaded for analytics"
                 )
             if kline_failed:
                 raise RuntimeError(
                     "Startup warmup failed: some candle scopes do not have enough history "
-                    f"for price_action/liquidity | failed_count={len(kline_failed)} examples={kline_failed[:20]}"
+                    f"for analytics | failed_count={len(kline_failed)} examples={kline_failed[:20]}"
                 )
 
             if symbols and funding_success <= 0:
@@ -1180,7 +1483,9 @@ class TradingSystemRuntime:
                 )
 
         logger.info(
-            "Startup warmup completed | kline_success=%s kline_failed=%s funding_success=%s funding_failed=%s disabled_symbols=%s",
+            "Startup warmup completed | orderbook_success=%s orderbook_failed=%s kline_success=%s kline_failed=%s funding_success=%s funding_failed=%s disabled_symbols=%s",
+            orderbook_success,
+            len(orderbook_failed),
             kline_success,
             len(kline_failed),
             funding_success,
@@ -1188,6 +1493,12 @@ class TradingSystemRuntime:
             len(self._derivative_snapshot_disabled_symbols),
         )
 
+        if orderbook_failed:
+            logger.warning(
+                "Startup orderbook warmup had partial failures | failed_count=%s examples=%s",
+                len(orderbook_failed),
+                orderbook_failed[:20],
+            )
         if kline_failed:
             logger.warning(
                 "Startup candle warmup had partial failures | failed_count=%s examples=%s",

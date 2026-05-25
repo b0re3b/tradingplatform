@@ -218,7 +218,7 @@ class BaseSpoofingModule(ABC):
             pass
         return utc_now()
 
-    def ensure_utc(self, dt: datetime | None) -> datetime:
+    def ensure_utc(self, dt: datetime | int | float | str | None) -> datetime:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
             if _analytics_logger is None:
@@ -242,9 +242,39 @@ class BaseSpoofingModule(ABC):
             pass
         if dt is None:
             return utc_now()
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+
+        if isinstance(dt, datetime):
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+
+        if isinstance(dt, (int, float)) and not isinstance(dt, bool):
+            # MarketScheduler / MarketStateStore usually pass epoch milliseconds.
+            # Accept seconds, milliseconds, microseconds and nanoseconds defensively.
+            value = float(dt)
+            abs_value = abs(value)
+            if abs_value >= 1_000_000_000_000_000_000:
+                value /= 1_000_000_000.0
+            elif abs_value >= 1_000_000_000_000_000:
+                value /= 1_000_000.0
+            elif abs_value >= 1_000_000_000_000:
+                value /= 1_000.0
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+
+        if isinstance(dt, str):
+            text = dt.strip()
+            if not text:
+                return utc_now()
+            try:
+                numeric = float(text)
+            except ValueError:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    return parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            return self.ensure_utc(numeric)
+
+        return utc_now()
 
     # -------------------------------------------------------------------------
     # Scoped multi-exchange futures helpers

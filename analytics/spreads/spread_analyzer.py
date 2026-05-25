@@ -29,22 +29,17 @@ class SpreadAnalyzer:
     - надає read-only facade API для latest snapshots/opportunities.
 
     Correct production input flow:
-        exchange adapters
-            -> market.orderbook / market.funding
-            -> OrderBookCache / FundingCache
-            -> market.orderbook.updated / market.funding.updated
-            -> analytics.spreads analyzers
+        exchange adapters / REST warmup / parquet restore
+            -> MarketIngestionService
+            -> MarketStateStore dirty scopes
+            -> MarketScheduler
+            -> SpreadAnalyzer.process_market_snapshot() або child analyzer evaluator-и
             -> analytics.spreads.*
 
-    Price data:
-        market.orderbook.updated
-            -> QuoteSnapshot як внутрішня normalized top-of-book модель
+    Price/funding data:
+        MarketStateStore snapshot
+            -> QuoteSnapshot/FundingSnapshot як внутрішні normalized моделі
             -> SpotFuturesSpreadAnalyzer / CrossExchangeSpreadAnalyzer
-
-    Funding data:
-        market.funding.updated
-            -> FundingSnapshot
-            -> SpotFuturesSpreadAnalyzer
 
     Важливо:
     - facade не отримує market data напряму;
@@ -56,14 +51,15 @@ class SpreadAnalyzer:
     - CrossExchangeSpreadAnalyzer залишається production-компонентом.
     """
 
-    PRICE_INPUT_SOURCE = "market.orderbook.updated"
-    FUNDING_INPUT_SOURCE = "market.funding.updated"
+    PRICE_INPUT_SOURCE = "market_state_snapshot"
+    FUNDING_INPUT_SOURCE = "market_state_snapshot"
 
     def __init__(
         self,
         *,
         event_bus: EventBus,
         scheduler: Scheduler | None = None,
+        market_scheduler: Any | None = None,
         spot_futures_config: SpotFuturesSpreadConfig | None = None,
         cross_exchange_config: CrossExchangeSpreadConfig | None = None,
         enable_spot_futures: bool = True,
@@ -93,6 +89,7 @@ class SpreadAnalyzer:
             pass
         self._event_bus = event_bus
         self._scheduler = scheduler
+        self._market_scheduler = market_scheduler
 
         self._spot_futures_config = spot_futures_config or SpotFuturesSpreadConfig()
         self._cross_exchange_config = cross_exchange_config or CrossExchangeSpreadConfig()
@@ -114,6 +111,7 @@ class SpreadAnalyzer:
                 config=self._spot_futures_config,
                 event_bus=self._event_bus,
                 scheduler=self._scheduler,
+                market_scheduler=self._market_scheduler,
             )
 
         if self._enable_cross_exchange:
@@ -121,6 +119,7 @@ class SpreadAnalyzer:
                 config=self._cross_exchange_config,
                 event_bus=self._event_bus,
                 scheduler=self._scheduler,
+                market_scheduler=self._market_scheduler,
             )
 
         self._running = False

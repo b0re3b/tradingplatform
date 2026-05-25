@@ -482,8 +482,23 @@ class NewsAIConfig:
     publish_high_impact_event: bool = True
     publish_failed_events: bool = True
 
-    max_items_per_cycle: int = 200
+    max_items_per_cycle: int = 120
     max_concurrent_sources: int = 5
+    max_items_to_score_per_cycle: int = 60
+
+    # Publication guardrails. These limits are intentionally moderate: the
+    # service can still surface important market news quickly, but it will not
+    # flood EventBus/Scheduler consumers with hundreds of dashboard/bot updates.
+    max_published_events_per_cycle: int = 35
+    max_published_events_per_hour: int = 90
+    max_scored_events_per_cycle: int = 20
+    max_scored_events_per_hour: int = 55
+    max_high_impact_events_per_cycle: int = 8
+    max_high_impact_events_per_hour: int = 20
+    max_bot_alerts_per_cycle: int = 8
+    max_bot_alerts_per_hour: int = 18
+    min_seconds_between_bot_alerts: float = 20.0
+    publish_suppressed_summary_event: bool = True
 
     default_language: NewsLanguage = NewsLanguage.EN
     tracked_symbols: tuple[str, ...] = (
@@ -518,6 +533,43 @@ class NewsAIConfig:
 
         if self.max_concurrent_sources <= 0:
             raise ValueError("NewsAIConfig.max_concurrent_sources must be > 0")
+
+        if self.max_items_to_score_per_cycle <= 0:
+            raise ValueError("NewsAIConfig.max_items_to_score_per_cycle must be > 0")
+
+        if self.max_items_to_score_per_cycle > self.max_items_per_cycle:
+            raise ValueError(
+                "NewsAIConfig.max_items_to_score_per_cycle must be <= max_items_per_cycle"
+            )
+
+        publication_limits = {
+            "max_published_events_per_cycle": self.max_published_events_per_cycle,
+            "max_published_events_per_hour": self.max_published_events_per_hour,
+            "max_scored_events_per_cycle": self.max_scored_events_per_cycle,
+            "max_scored_events_per_hour": self.max_scored_events_per_hour,
+            "max_high_impact_events_per_cycle": self.max_high_impact_events_per_cycle,
+            "max_high_impact_events_per_hour": self.max_high_impact_events_per_hour,
+            "max_bot_alerts_per_cycle": self.max_bot_alerts_per_cycle,
+            "max_bot_alerts_per_hour": self.max_bot_alerts_per_hour,
+        }
+        for name, value in publication_limits.items():
+            if value <= 0:
+                raise ValueError(f"NewsAIConfig.{name} must be > 0")
+
+        if self.min_seconds_between_bot_alerts < 0:
+            raise ValueError("NewsAIConfig.min_seconds_between_bot_alerts must be >= 0")
+
+        if self.max_scored_events_per_cycle > self.max_published_events_per_cycle:
+            raise ValueError(
+                "NewsAIConfig.max_scored_events_per_cycle must be <= "
+                "max_published_events_per_cycle"
+            )
+
+        if self.max_scored_events_per_hour > self.max_published_events_per_hour:
+            raise ValueError(
+                "NewsAIConfig.max_scored_events_per_hour must be <= "
+                "max_published_events_per_hour"
+            )
 
         if not self.service_name.strip():
             raise ValueError("NewsAIConfig.service_name must not be empty")
@@ -559,6 +611,19 @@ class NewsAIConfig:
             "publish_failed_events": self.publish_failed_events,
             "max_items_per_cycle": self.max_items_per_cycle,
             "max_concurrent_sources": self.max_concurrent_sources,
+            "max_items_to_score_per_cycle": self.max_items_to_score_per_cycle,
+            "publication_limits": {
+                "max_published_events_per_cycle": self.max_published_events_per_cycle,
+                "max_published_events_per_hour": self.max_published_events_per_hour,
+                "max_scored_events_per_cycle": self.max_scored_events_per_cycle,
+                "max_scored_events_per_hour": self.max_scored_events_per_hour,
+                "max_high_impact_events_per_cycle": self.max_high_impact_events_per_cycle,
+                "max_high_impact_events_per_hour": self.max_high_impact_events_per_hour,
+                "max_bot_alerts_per_cycle": self.max_bot_alerts_per_cycle,
+                "max_bot_alerts_per_hour": self.max_bot_alerts_per_hour,
+                "min_seconds_between_bot_alerts": self.min_seconds_between_bot_alerts,
+                "publish_suppressed_summary_event": self.publish_suppressed_summary_event,
+            },
             "default_language": str(self.default_language),
             "tracked_symbols": list(self.normalized_tracked_symbols),
             "service_name": self.service_name,
@@ -721,24 +786,7 @@ def build_default_news_source_configs() -> tuple[NewsSourceConfig, ...]:
                 "reason": "Listings, delistings, trading updates, maintenance and API announcements.",
             },
         ),
-        NewsSourceConfig(
-            name="bybit_announcements",
-            source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
-            url="https://announcements.bybit.com/en/",
-            request_timeout_seconds=12.0,
-            max_items_per_fetch=35,
-            min_fetch_interval_seconds=60.0,
-            default_language=NewsLanguage.EN,
-            default_categories=(NewsCategory.EXCHANGE, NewsCategory.LISTING, NewsCategory.DELISTING),
-            source_reputation_score=0.90,
-            is_official_source=True,
-            is_exchange_source=True,
-            metadata={
-                "display_name": "Bybit Announcements",
-                "priority": "official_exchange_announcements",
-                "reason": "Fast official exchange updates for listings, delistings and product changes.",
-            },
-        ),
+
         NewsSourceConfig(
             name="okx_latest_announcements",
             source_type=NewsSourceType.EXCHANGE_ANNOUNCEMENT,
@@ -793,24 +841,7 @@ def build_default_news_source_configs() -> tuple[NewsSourceConfig, ...]:
                 "reason": "Dedicated delisting page for high-risk market events.",
             },
         ),
-        NewsSourceConfig(
-            name="coinbase_blog",
-            source_type=NewsSourceType.STATIC_HTML,
-            url="https://www.coinbase.com/blog",
-            request_timeout_seconds=12.0,
-            max_items_per_fetch=20,
-            min_fetch_interval_seconds=300.0,
-            default_language=NewsLanguage.EN,
-            default_categories=(NewsCategory.EXCHANGE, NewsCategory.REGULATION),
-            source_reputation_score=0.86,
-            is_official_source=True,
-            is_exchange_source=True,
-            metadata={
-                "display_name": "Coinbase Blog",
-                "priority": "official_exchange_blog",
-                "reason": "Official U.S. exchange updates, regulatory milestones and product news.",
-            },
-        ),
+
         NewsSourceConfig(
             name="kraken_blog",
             source_type=NewsSourceType.STATIC_HTML,
@@ -899,23 +930,7 @@ def build_default_news_source_configs() -> tuple[NewsSourceConfig, ...]:
                 "reason": "Official derivatives/commodities regulation source for crypto market structure news.",
             },
         ),
-        NewsSourceConfig(
-            name="cftc_enforcement_press_releases",
-            source_type=NewsSourceType.RSS,
-            url="https://www.cftc.gov/RSS/RSSEnforcement/rssEnf.xml",
-            request_timeout_seconds=10.0,
-            max_items_per_fetch=20,
-            min_fetch_interval_seconds=300.0,
-            default_language=NewsLanguage.EN,
-            default_categories=(NewsCategory.REGULATION, NewsCategory.LEGAL),
-            source_reputation_score=0.94,
-            is_official_source=True,
-            metadata={
-                "display_name": "CFTC Enforcement Press Releases",
-                "priority": "official_regulation_enforcement",
-                "reason": "Enforcement actions can move exchange tokens, DeFi protocols and broad sentiment.",
-            },
-        ),
+
         NewsSourceConfig(
             name="us_treasury_press_releases",
             source_type=NewsSourceType.STATIC_HTML,

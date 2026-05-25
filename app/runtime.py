@@ -195,10 +195,6 @@ class RuntimeSettings:
     orderflow_default_exchange: str = "binance"
     orderflow_default_market_type: str = "usdm_futures"
     orderflow_default_timeframe: str = "1m"
-    price_action_exchange: str = "binance"
-    price_action_market_type: str = "usdm_futures"
-    price_action_symbols: list[str] = field(default_factory=list)
-    price_action_timeframes: list[str] = field(default_factory=lambda: ["1m", "15m"])
     liquidity_candles_updated_topics: list[str] = field(default_factory=lambda: ["market.candles.updated"])
     liquidity_min_candles_for_snapshot: int = 5
 
@@ -229,6 +225,8 @@ class RuntimeSettings:
     startup_warmup_kline_limit: int = 1500
     startup_warmup_klines_per_request: int = 1500
     startup_warmup_funding_limit: int = 24
+    startup_warmup_orderbook_enabled: bool = True
+    startup_warmup_orderbook_limit: int = 100
     startup_warmup_concurrency: int = 8
     startup_warmup_batch_size: int = 50
     startup_warmup_eventbus_idle_timeout: float = 30.0
@@ -236,6 +234,8 @@ class RuntimeSettings:
     startup_warmup_persist_enabled: bool = True
     startup_warmup_persist_required: bool = True
     startup_warmup_flush_storage_before_trading: bool = True
+    startup_warmup_force_ingest_persist: bool = True
+    startup_market_state_evaluate_max_passes: int = 50
 
     # Startup Parquet restore. Loads locally persisted market datasets back
     # through MarketStateRestorer -> MarketIngestionService before REST warmup/live WS.
@@ -342,10 +342,6 @@ class RuntimeSettings:
             orderflow_default_exchange=env_str("ORDERFLOW_DEFAULT_EXCHANGE", env_str("ANALYTICS_EXCHANGE", "binance")).lower(),
             orderflow_default_market_type=env_str("ORDERFLOW_DEFAULT_MARKET_TYPE", env_str("ANALYTICS_MARKET_TYPE", "usdm_futures")),
             orderflow_default_timeframe=env_str("ORDERFLOW_DEFAULT_TIMEFRAME", env_str("MARKET_DATA_PRIMARY_TIMEFRAME", market_timeframes[0] if market_timeframes else "1m")),
-            price_action_exchange=env_str("PRICE_ACTION_EXCHANGE", env_str("ANALYTICS_EXCHANGE", "binance")).lower(),
-            price_action_market_type=env_str("PRICE_ACTION_MARKET_TYPE", env_str("ANALYTICS_MARKET_TYPE", "usdm_futures")),
-            price_action_symbols=[s.upper() for s in env_list("PRICE_ACTION_SYMBOLS", analytics_symbols)],
-            price_action_timeframes=env_list("PRICE_ACTION_TIMEFRAMES", market_timeframes),
             liquidity_candles_updated_topics=env_list("LIQUIDITY_CANDLES_UPDATED_TOPICS", ["market.candles.updated"]),
             liquidity_min_candles_for_snapshot=max(1, env_int("LIQUIDITY_MIN_CANDLES_FOR_SNAPSHOT", 5)),
 
@@ -370,6 +366,8 @@ class RuntimeSettings:
             startup_warmup_kline_limit=max(1, env_int("STARTUP_WARMUP_KLINE_LIMIT", 1500)),
             startup_warmup_klines_per_request=max(1, env_int("STARTUP_WARMUP_KLINES_PER_REQUEST", 1500)),
             startup_warmup_funding_limit=max(1, env_int("STARTUP_WARMUP_FUNDING_LIMIT", 24)),
+            startup_warmup_orderbook_enabled=env_bool("STARTUP_WARMUP_ORDERBOOK_ENABLED", True),
+            startup_warmup_orderbook_limit=max(5, env_int("STARTUP_WARMUP_ORDERBOOK_LIMIT", 100)),
             startup_warmup_concurrency=max(1, env_int("STARTUP_WARMUP_CONCURRENCY", 8)),
             startup_warmup_batch_size=max(1, env_int("STARTUP_WARMUP_BATCH_SIZE", 50)),
             startup_warmup_eventbus_idle_timeout=env_float("STARTUP_WARMUP_EVENTBUS_IDLE_TIMEOUT", 30.0),
@@ -377,6 +375,8 @@ class RuntimeSettings:
             startup_warmup_persist_enabled=env_bool("STARTUP_WARMUP_PERSIST_ENABLED", True),
             startup_warmup_persist_required=env_bool("STARTUP_WARMUP_PERSIST_REQUIRED", True),
             startup_warmup_flush_storage_before_trading=env_bool("STARTUP_WARMUP_FLUSH_STORAGE_BEFORE_TRADING", True),
+            startup_warmup_force_ingest_persist=env_bool("STARTUP_WARMUP_FORCE_INGEST_PERSIST", True),
+            startup_market_state_evaluate_max_passes=max(1, env_int("STARTUP_MARKET_STATE_EVALUATE_MAX_PASSES", 50)),
 
             startup_parquet_load_enabled=env_bool("STARTUP_PARQUET_LOAD_ENABLED", True),
             startup_parquet_load_required=env_bool("STARTUP_PARQUET_LOAD_REQUIRED", False),

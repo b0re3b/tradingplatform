@@ -809,6 +809,34 @@ class TradeExecutor:
 
         except asyncio.CancelledError:
             raise
+        except ExecutionRejectedError as exc:
+            self._stats.register_rejected(error=str(exc))
+            self._logger.warning(
+                "signal.confirmed rejected before execution | signal_id=%s symbol=%s error=%s",
+                payload.get("signal_id"),
+                payload.get("symbol"),
+                str(exc),
+            )
+
+            await self._emit_event(
+                "execution.trade_rejected",
+                {
+                    **payload,
+                    "error": str(exc),
+                    "failure_stage": "signal_confirmed_validation",
+                },
+                priority=EventPriority.CRITICAL,
+            )
+        except ExecutionError as exc:
+            # execute_intent() already emitted execution.execution_failed and
+            # updated execution failure stats. Do not convert order/network
+            # failures into trade_rejected, and do not spam a second traceback.
+            self._logger.warning(
+                "signal.confirmed execution failed | signal_id=%s symbol=%s error=%s",
+                payload.get("signal_id"),
+                payload.get("symbol"),
+                str(exc),
+            )
         except Exception as exc:
             self._stats.register_rejected(error=str(exc))
             self._logger.exception("Failed to handle signal.confirmed")

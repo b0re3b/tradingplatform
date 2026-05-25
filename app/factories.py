@@ -31,12 +31,11 @@ from exchanges.mexc.mexc_ws import MexcWebSocketClient
 from analytics.orderflow.analyzer import OrderFlowAnalyzer
 from analytics.open_interest.oi_analyzer import OIAnalyzer
 from analytics.funding.funding_analyzer import FundingAnalyzer
-from analytics.liquidations.liquidation_stream import LiquidationStream
-from analytics.liquidations.config import LiquidationStreamConfig
+from analytics.liquidations import build_liquidations_components
+from analytics.liquidations.config import CascadeDetectorConfig, LiquidationStreamConfig
 from analytics.liquidity.config import LiquidityConfig
 from analytics.liquidity.liquidity_map import LiquidityMap
 from analytics.liquidity.liquidity_service import LiquidityService
-from analytics.price_action.price_action_analyzer import PriceActionAnalyzer
 from analytics.spoofing.analyzer import SpoofingAnalyzer
 from analytics.spoofing.config import SpoofingConfig
 from analytics.spreads.spread_analyzer import SpreadAnalyzer
@@ -503,28 +502,6 @@ def build_analytics_components(
     Symbols/timeframes/exchange/market_type are not defined in this factory.
     They are resolved from RuntimeSettings.from_env() and exchange discovery.
     """
-    discovered_symbols = universe.all_canonical_symbols()
-    configured_analytics_symbols = [
-        str(symbol).upper()
-        for symbol in settings.analytics_symbols
-        if str(symbol).strip()
-    ]
-
-    price_action_symbols = [
-        str(symbol).upper()
-        for symbol in (settings.price_action_symbols or configured_analytics_symbols)
-        if str(symbol).strip()
-    ]
-    if not price_action_symbols:
-        source_exchange_symbols = getattr(universe, settings.price_action_exchange, [])
-        price_action_symbols = [str(symbol).upper() for symbol in source_exchange_symbols if str(symbol).strip()]
-    if not price_action_symbols:
-        price_action_symbols = discovered_symbols
-
-    price_action_timeframes = [str(tf).strip() for tf in settings.price_action_timeframes if str(tf).strip()]
-    if not price_action_timeframes:
-        price_action_timeframes = [str(tf).strip() for tf in settings.timeframes if str(tf).strip()]
-
     liquidity_config = LiquidityConfig(
         candles_updated_input_topics=tuple(settings.liquidity_candles_updated_topics),
         min_candles_for_snapshot=settings.liquidity_min_candles_for_snapshot,
@@ -538,13 +515,16 @@ def build_analytics_components(
         *,
         evaluator_name: str | None = None,
         evaluator_kwargs: dict[str, Any] | None = None,
+        register_scheduler_evaluator: bool = True,
     ) -> Any:
         components.append(component)
 
         callback = getattr(component, "process_market_snapshot", None)
         name = evaluator_name or f"{component.__class__.__name__}:{len(components)}"
 
-        if market_scheduler is None:
+        # Some components own MarketScheduler registration internally and must
+        # not be registered twice from app factory.
+        if market_scheduler is None or not register_scheduler_evaluator:
             return component
 
         if callable(callback):
@@ -614,21 +594,33 @@ def build_analytics_components(
             "dirty_reasons": {"funding"},
         },
     )
-    add_component(
-        _construct(
-            LiquidationStream,
-            event_bus=event_bus,
-            scheduler=scheduler,
-            config=LiquidationStreamConfig(),
-            market_state_store=market_state_store,
-        ),
-        evaluator_name="analytics.liquidations.stream",
-        evaluator_kwargs={
-            "exchange": settings.analytics_exchange,
-            "market_type": settings.analytics_market_type,
-            "dirty_reasons": {"liquidation"},
-        },
-    )
+    for liquidation_component in build_liquidations_components(
+        event_bus=event_bus,
+        scheduler=scheduler,
+        stream_config=LiquidationStreamConfig(),
+        cascade_config=CascadeDetectorConfig(),
+        market_state_store=market_state_store,
+        market_scheduler=market_scheduler,
+    ):
+        liquidation_component_name = liquidation_component.__class__.__name__
+        add_component(
+            liquidation_component,
+            evaluator_name=(
+                "analytics.liquidations.stream"
+                if liquidation_component_name == "LiquidationStream"
+                else "analytics.liquidations.cascade_detector"
+            ),
+            evaluator_kwargs={
+                "exchange": settings.analytics_exchange,
+                "market_type": settings.analytics_market_type,
+                "dirty_reasons": {"liquidation"},
+            },
+            # LiquidationStream owns its MarketScheduler evaluator when market_scheduler
+            # is passed to the constructor. CascadeDetector consumes normalized
+            # liquidation events from EventBus and must not be registered as a
+            # duplicate state snapshot evaluator here.
+            register_scheduler_evaluator=False,
+        )
     add_component(
         _construct(
             LiquidityService,
@@ -646,30 +638,6 @@ def build_analytics_components(
         },
     )
 
-    for symbol in price_action_symbols:
-        for timeframe in price_action_timeframes:
-            add_component(
-                _construct(
-                    PriceActionAnalyzer,
-                    symbol,
-                    timeframe=timeframe,
-                    event_bus=event_bus,
-                    exchange=settings.price_action_exchange,
-                    market_type=settings.price_action_market_type,
-                    scheduler=scheduler,
-                    market_state_store=market_state_store,
-                ),
-                evaluator_name=f"analytics.price_action:{symbol}:{timeframe}",
-                evaluator_kwargs={
-                    "exchange": settings.price_action_exchange,
-                    "market_type": settings.price_action_market_type,
-                    "symbol": symbol,
-                    "timeframe": timeframe,
-                    "dirty_reasons": {"candle", "candle_closed", "warmup"},
-                    "max_snapshots_per_tick": 1,
-                },
-            )
-
     add_component(
         _construct(
             SpoofingAnalyzer,
@@ -678,41 +646,25 @@ def build_analytics_components(
             config=SpoofingConfig(),
             orderbook_cache=caches.get("orderbook"),
             market_state_store=market_state_store,
+            market_scheduler=market_scheduler,
         ),
-        evaluator_name="analytics.spoofing",
-        evaluator_kwargs={
-            "exchange": settings.analytics_exchange,
-            "market_type": settings.analytics_market_type,
-            "dirty_reasons": {"orderbook", "orderbook_resync_required", "rest_snapshot"},
-            "metadata": {
-                "domain": "spoofing",
-                "feature_source": "spoofing",
-                "exchange": settings.analytics_exchange,
-                "market_type": settings.analytics_market_type,
-                "dirty_reasons": ["orderbook", "orderbook_resync_required", "rest_snapshot"],
-                "requires_orderbook_depth": True,
-            },
-        },
+        # SpoofingAnalyzer owns its MarketScheduler evaluator in the corrected
+        # state-driven analytics package.  The app must pass market_scheduler
+        # into the constructor and must not register a duplicate evaluator here.
+        register_scheduler_evaluator=False,
     )
     add_component(
-        _construct(SpreadAnalyzer, event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
-        evaluator_name="analytics.spreads",
-        evaluator_kwargs={
-            "exchange": settings.analytics_exchange,
-            "market_type": settings.analytics_market_type,
-            # Spreads are quote/orderbook driven with funding as an optional
-            # enhancer.  A single-exchange spot/futures basis analyzer also
-            # needs orderbook snapshots; cross-exchange will only activate when
-            # multiple exchange scopes exist.
-            "dirty_reasons": {
-                "orderbook",
-                "orderbook_resync_required",
-                "rest_snapshot",
-                "price",
-                "funding",
-                "open_interest",
-            },
-        },
+        _construct(
+            SpreadAnalyzer,
+            event_bus=event_bus,
+            scheduler=scheduler,
+            market_state_store=market_state_store,
+            market_scheduler=market_scheduler,
+        ),
+        # SpreadAnalyzer/BaseSpreadAnalyzer own their MarketScheduler evaluator
+        # in the corrected state-driven analytics package.  The app must not
+        # duplicate domain dirty-reason registration here.
+        register_scheduler_evaluator=False,
     )
     add_component(
         _construct(WhaleAnalyzer, config=WhalesConfig(), event_bus=event_bus, scheduler=scheduler, market_state_store=market_state_store),
@@ -734,7 +686,6 @@ def build_analytics_components(
 
 def build_strategy_factories() -> dict[str, Callable[..., Any]]:
     from strategy.strategies.orderflow import CvdDivergenceStrategy, OrderflowContinuationStrategy, OrderflowReversalStrategy
-    from strategy.strategies.price_action import MarketStructureStrategy, FVGReactionStrategy, SupportResistanceReactionStrategy, TrendContinuationStrategy
     from strategy.strategies.open_interest import OIDivergenceStrategy, OIBreakoutConfirmationStrategy, OIAnomalyStrategy, OICapitulationStrategy
     from strategy.strategies.liquidations import LiquidationCascadeStrategy, SqueezeReversalStrategy
     from strategy.strategies.liquidity import EqualHighLowStrategy, LiquidityMapBiasStrategy, LiquiditySweepStrategy, StopHuntReversalStrategy
@@ -774,10 +725,6 @@ def build_strategy_factories() -> dict[str, Callable[..., Any]]:
         "cvd_divergence": CvdDivergenceStrategy,
         "orderflow_continuation": OrderflowContinuationStrategy,
         "orderflow_reversal": OrderflowReversalStrategy,
-        "market_structure": MarketStructureStrategy,
-        "fvg_reaction": FVGReactionStrategy,
-        "support_resistance_reaction": SupportResistanceReactionStrategy,
-        "trend_continuation": TrendContinuationStrategy,
         "oi_divergence": OIDivergenceStrategy,
         "oi_breakout_confirmation": OIBreakoutConfirmationStrategy,
         "oi_anomaly": OIAnomalyStrategy,

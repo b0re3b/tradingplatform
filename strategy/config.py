@@ -153,14 +153,6 @@ DEFAULT_ANALYTICS_EVENT_CATEGORY_PREFIXES: tuple[
     # Orderflow
     ("analytics.orderflow.", (StrategyCategory.ORDERFLOW,)),
 
-    # Price Action
-    ("analytics.price_action.", (StrategyCategory.PRICE_ACTION,)),
-    ("analytics.market_structure.", (StrategyCategory.PRICE_ACTION,)),
-    ("analytics.support_resistance.", (StrategyCategory.PRICE_ACTION,)),
-    ("analytics.fair_value_gap.", (StrategyCategory.PRICE_ACTION,)),
-    ("analytics.fvg.", (StrategyCategory.PRICE_ACTION,)),
-    ("analytics.trend.", (StrategyCategory.PRICE_ACTION,)),
-
     # Spoofing
     ("analytics.spoofing.", (StrategyCategory.SPOOFING,)),
 
@@ -406,7 +398,6 @@ class WeightingConfig:
         default_factory=lambda: {
             StrategyCategory.ORDERFLOW: 1.00,
             StrategyCategory.LIQUIDITY: 1.00,
-            StrategyCategory.PRICE_ACTION: 0.85,
             StrategyCategory.LIQUIDATIONS: 0.95,
             StrategyCategory.WHALES: 0.90,
             StrategyCategory.SPOOFING: 0.80,

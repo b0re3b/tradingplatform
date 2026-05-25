@@ -1539,8 +1539,72 @@ class LiquidityService:
         context: LiquidityServiceContext,
         snapshot: LiquidityMapSnapshot,
     ) -> dict[str, Any]:
-        payload = snapshot.to_event_payload()
-        payload.update(self._scope_payload(context))
+        return self._liquidity_payload(context, snapshot)
+
+    def _liquidity_payload(
+            self,
+            context: LiquidityServiceContext,
+            snapshot: LiquidityMapSnapshot,
+    ) -> dict[str, Any]:
+        signal = snapshot.signal.to_event_payload() if snapshot.signal else None
+
+        payload = {
+            # --- scope ---
+            "domain": "liquidity",
+            "symbol": context.symbol,
+            "exchange": context.exchange,
+            "market_type": context.market_type,
+            "timeframe": context.timeframe,
+            "scope": context.scope,
+            "scope_key": context.scope_key,
+            "liquidity_key": list(context.key),
+            "timestamp": snapshot.timestamp.isoformat(),
+
+            # --- price ---
+            "current_price": snapshot.current_price,
+
+            # --- головна секція ---
+            "snapshot": snapshot.to_event_payload(),
+
+            # --- розгорнуті поля зі snapshot ---
+            "active_levels": [l.to_event_payload() for l in snapshot.active_levels],
+            "equal_levels": [l.to_event_payload() for l in snapshot.equal_levels],
+            "stop_clusters": [c.to_event_payload() for c in snapshot.stop_clusters],
+            "zones": [z.to_event_payload() for z in snapshot.zones],
+
+            "nearest_above_level": snapshot.nearest_above_level.to_event_payload() if snapshot.nearest_above_level else None,
+            "nearest_below_level": snapshot.nearest_below_level.to_event_payload() if snapshot.nearest_below_level else None,
+            "strongest_cluster_above": snapshot.strongest_cluster_above.to_event_payload() if snapshot.strongest_cluster_above else None,
+            "strongest_cluster_below": snapshot.strongest_cluster_below.to_event_payload() if snapshot.strongest_cluster_below else None,
+
+            # --- scores ---
+            "above_liquidity_score": snapshot.above_liquidity_score,
+            "below_liquidity_score": snapshot.below_liquidity_score,
+            "liquidity_pressure_score": snapshot.liquidity_pressure_score,
+            "bias": snapshot.bias.value if hasattr(snapshot.bias, "value") else snapshot.bias,
+
+            # --- signal ---
+            "signal": signal,
+
+            # --- strategy contract ---
+            "strategy_contract_version": "analytics-strategy-v1",
+            "strategy_contract": {
+                "version": "analytics-strategy-v1",
+                "domain": "liquidity",
+                "expected_by": "StrategyContext/SignalBuilder",
+            },
+        }
+
+        if snapshot.signal:
+            payload["sweep_risk"] = {
+                "up": snapshot.signal.sweep_risk_up,
+                "down": snapshot.signal.sweep_risk_down,
+            }
+            payload["magnet"] = {
+                "up": snapshot.signal.magnet_score_up,
+                "down": snapshot.signal.magnet_score_down,
+            }
+
         return payload
 
     @staticmethod

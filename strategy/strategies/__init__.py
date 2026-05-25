@@ -19,12 +19,6 @@ _EXPORTS: dict[str, str] = {
     "OrderflowContinuationStrategy": ".orderflow",
     "OrderflowReversalStrategy": ".orderflow",
 
-    # Price action
-    "MarketStructureStrategy": ".price_action",
-    "FVGReactionStrategy": ".price_action",
-    "SupportResistanceReactionStrategy": ".price_action",
-    "TrendContinuationStrategy": ".price_action",
-
     # Open interest
     "OIAnomalyStrategy": ".open_interest",
     "OIBreakoutConfirmationStrategy": ".open_interest",
@@ -66,6 +60,7 @@ _EXPORTS: dict[str, str] = {
     "WhaleAccumulationStrategy": ".whales",
     "WhaleBreakoutStrategy": ".whales",
     "WhaleDistributionStrategy": ".whales",
+    "WhaleLargeTradeStrategy": ".whales",
     "WhaleLiquidationReversalStrategy": ".whales",
 
     # Hybrid
@@ -155,13 +150,6 @@ if TYPE_CHECKING:
         OrderflowReversalStrategy,
     )
 
-    from .price_action import (
-        FVGReactionStrategy,
-        MarketStructureStrategy,
-        SupportResistanceReactionStrategy,
-        TrendContinuationStrategy,
-    )
-
     from .spreads import (
         CrossExchangeArbStrategy,
         FundingAdjustedBasisStrategy,
@@ -185,5 +173,6 @@ if TYPE_CHECKING:
         WhaleAccumulationStrategy,
         WhaleBreakoutStrategy,
         WhaleDistributionStrategy,
+        WhaleLargeTradeStrategy,
         WhaleLiquidationReversalStrategy,
     )

@@ -6740,8 +6740,26 @@ class SignalNormalizer(BaseStrategyComponent):
 
         # Flat enrichment is section-specific. Do not copy the whole payload into
         # all sections; only create a section when the relevant fields exist.
-        topic = self._topic_from_payload(payload)
+        topic = self._topic_from_payload(payload).lower()
         is_large_trade_event = "large_trade" in topic
+        is_cluster_event = "cluster" in topic
+        is_liquidation_event = "liquidation" in topic
+
+        def has_any_value(*keys: str) -> bool:
+            return any(value_for(key, default=None) is not None for key in keys)
+
+        has_cluster_context_fields = is_cluster_event or has_any_value(
+            "cluster_side",
+            "cluster_score",
+            "continuation_probability",
+            "exhaustion_probability",
+        )
+        has_liquidation_context_fields = is_liquidation_event or has_any_value(
+            "liquidation_side",
+            "liquidation_notional",
+            "liquidated_notional",
+            "total_liquidation_notional",
+        )
         if pressure is None and not is_large_trade_event:
             flat_pressure: dict[str, Any] = {}
             for key in (
@@ -6821,7 +6839,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_large_trade:
                 large_trade = flat_large_trade
 
-        if cluster is None and not is_large_trade_event:
+        if cluster is None and not is_large_trade_event and has_cluster_context_fields:
             flat_cluster: dict[str, Any] = {}
             for key in (
                     "cluster_side",
@@ -6849,7 +6867,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster:
                 cluster = flat_cluster
 
-        if cluster_update is None and not is_large_trade_event:
+        if cluster_update is None and not is_large_trade_event and has_cluster_context_fields:
             flat_cluster_update: dict[str, Any] = {}
             for key in (
                     "cluster_update_side",
@@ -6877,7 +6895,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster_update:
                 cluster_update = flat_cluster_update
 
-        if cluster_exhaustion is None and not is_large_trade_event:
+        if cluster_exhaustion is None and not is_large_trade_event and has_cluster_context_fields:
             flat_cluster_exhaustion: dict[str, Any] = {}
             for key in (
                     "exhausted_side",
@@ -6904,7 +6922,7 @@ class SignalNormalizer(BaseStrategyComponent):
             if flat_cluster_exhaustion:
                 cluster_exhaustion = flat_cluster_exhaustion
 
-        if liquidation_context is None and not is_large_trade_event:
+        if liquidation_context is None and not is_large_trade_event and has_liquidation_context_fields:
             flat_liquidation_context: dict[str, Any] = {}
             for key in (
                     "liquidation_side",

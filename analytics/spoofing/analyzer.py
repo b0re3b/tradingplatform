@@ -71,10 +71,9 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     Центральний orchestrator для analytics.spoofing.
 
     Відповідає за:
-    - підписку на data-layer topics через EventBus;
+    - реєстрацію state-driven evaluator-а у MarketScheduler;
     - роботу зі scoped key: exchange + market_type + symbol + timeframe;
-    - читання normalized orderbook state з OrderBookCache або payload
-      market.orderbook.updated;
+    - читання normalized orderbook/trade state зі shared MarketStateStore snapshot;
     - оновлення PersistenceTracker;
     - запуск wall / pull / advanced detector-ів;
     - агрегацію результатів через SpoofingScoreEngine;
@@ -82,11 +81,11 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
     - cleanup через Scheduler.
 
     Correct production flow:
-        exchange adapters
-            -> market.orderbook
-            -> data.OrderBookCache
-            -> market.orderbook.updated
-            -> SpoofingAnalyzer
+        exchange adapters / REST orderbook snapshot / live depth+trade streams
+            -> MarketIngestionService
+            -> MarketStateStore dirty scopes
+            -> MarketScheduler
+            -> SpoofingAnalyzer.process_market_snapshot()
             -> analytics.spoofing.*
     """
 
@@ -100,6 +99,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         config: SpoofingConfig,
         orderbook_cache: SupportsOrderBookCache | None = None,
         market_state_store: Any | None = None,
+        market_scheduler: Any | None = None,
         persistence_tracker: PersistenceTracker | None = None,
         wall_detector: OrderbookWallDetector | None = None,
         pull_detector: OrderPullDetector | None = None,
@@ -137,6 +137,8 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
 
         self.config.validate()
         self._market_state_store = market_state_store
+        self._market_scheduler = market_scheduler
+        self._market_scheduler_evaluator_name: str | None = None
         state_cache_bundle = build_state_backed_cache_bundle(market_state_store)
         self.orderbook_cache = orderbook_cache or (state_cache_bundle.orderbook if state_cache_bundle is not None else None)
         self._state_snapshot_source = state_cache_bundle.source if state_cache_bundle is not None else None
@@ -326,7 +328,12 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
             self.log_warning("SpoofingAnalyzer registration skipped: disabled by config")
             return
 
-        self._register_eventbus_subscriptions()
+        registered_evaluator = self._register_market_scheduler_evaluator()
+        if not registered_evaluator:
+            self.log_warning(
+                "SpoofingAnalyzer registered without an internal MarketScheduler evaluator; "
+                "ensure the component is registered externally, otherwise no market data will be processed"
+            )
         self._register_scheduler_jobs()
 
         self._registered = True
@@ -334,7 +341,10 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
 
         self.log_info(
             "SpoofingAnalyzer registered",
-            source_topics=list(self.config.production_source_topics),
+            input_mode="market_state",
+            source_topics=[],
+            market_scheduler_evaluator_name=self._market_scheduler_evaluator_name,
+            dirty_reasons=list(self._market_scheduler_dirty_reasons()),
             cleanup_job_id=self._cleanup_job_id,
             publish_updates=self.config.analyzer.publish_updates,
             publish_detected_only=self.config.analyzer.publish_detected_only,
@@ -368,7 +378,21 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 "registered": self._registered,
                 "running": self._running,
                 "input_mode": "market_state",
-                "input_topics": list(self.config.production_source_topics),
+                "input_transport": "MarketScheduler",
+                "input_topics": [],
+                "legacy_eventbus_topics": [],
+                "market_snapshot_entrypoint": "process_market_snapshot",
+                "market_scheduler_attached": self._market_scheduler is not None,
+                "market_scheduler_evaluator_name": self._market_scheduler_evaluator_name,
+                "market_scheduler_evaluator_registered": self._market_scheduler_evaluator_name is not None,
+                "dirty_reasons": list(self._market_scheduler_dirty_reasons()),
+                "expected_snapshot_fields": [
+                    "scope",
+                    "orderbook",
+                    "trades",
+                    "dirty_reasons",
+                    "updated_at_ms",
+                ],
                 "orderbook_cache_attached": self.orderbook_cache is not None,
                 "market_state_store_attached": self._market_state_store is not None,
                 "publish_updates": self.config.analyzer.publish_updates,
@@ -437,6 +461,7 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
                 )
 
         self._subscriptions.clear()
+        self._unregister_market_scheduler_evaluator()
 
         if self.scheduler is not None and self._cleanup_job_id is not None:
             try:
@@ -460,6 +485,76 @@ class SpoofingAnalyzer(BaseSpoofingAnalyzer):
         self._started = False
 
         self.log_info("SpoofingAnalyzer stopped")
+
+
+    def _market_scheduler_evaluator_id(self) -> str:
+        return "spoofing:analyzer"
+
+    def _market_scheduler_dirty_reasons(self) -> tuple[str, ...]:
+        return (
+            "orderbook",
+            "orderbook_resync_required",
+            "rest_snapshot",
+            "trade",
+            "trades_batch",
+        )
+
+    def _register_market_scheduler_evaluator(self) -> bool:
+        market_scheduler = getattr(self, "_market_scheduler", None)
+        if market_scheduler is None:
+            self.log_warning(
+                "SpoofingAnalyzer MarketScheduler is not configured; state-driven input is disabled"
+            )
+            return False
+
+        register_evaluator = getattr(market_scheduler, "register_evaluator", None)
+        if not callable(register_evaluator):
+            self.log_warning(
+                "Configured market_scheduler has no register_evaluator(); state-driven spoofing input is disabled"
+            )
+            return False
+
+        name = self._market_scheduler_evaluator_id()
+        register_evaluator(
+            name=name,
+            callback=self.process_market_snapshot,
+            enabled=True,
+            metadata={
+                "domain": "spoofing",
+                "component": self.component.value,
+                "service": "spoofing_analyzer",
+                "input_mode": "market_state",
+                "dirty_reasons": list(self._market_scheduler_dirty_reasons()),
+                "requires_orderbook_depth": True,
+                "uses_trades": True,
+            },
+            dirty_reasons=self._market_scheduler_dirty_reasons(),
+        )
+        self._market_scheduler_evaluator_name = name
+        self.log_info(
+            "SpoofingAnalyzer registered as MarketScheduler evaluator",
+            evaluator=name,
+            dirty_reasons=list(self._market_scheduler_dirty_reasons()),
+        )
+        return True
+
+    def _unregister_market_scheduler_evaluator(self) -> None:
+        market_scheduler = getattr(self, "_market_scheduler", None)
+        name = getattr(self, "_market_scheduler_evaluator_name", None)
+        if market_scheduler is None or not name:
+            return
+
+        unregister_evaluator = getattr(market_scheduler, "unregister_evaluator", None)
+        if callable(unregister_evaluator):
+            try:
+                unregister_evaluator(name)
+            except Exception as exc:
+                self.log_exception(
+                    "Failed to unregister SpoofingAnalyzer MarketScheduler evaluator",
+                    evaluator=name,
+                    error=str(exc),
+                )
+        self._market_scheduler_evaluator_name = None
 
     def _register_eventbus_subscriptions(self) -> None:
         try:

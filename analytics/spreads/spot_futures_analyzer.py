@@ -42,11 +42,11 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
     - funding leg: futures/perpetual market_type.
 
     Correct production input flow:
-        exchange adapters
-            -> market.orderbook / market.funding
-            -> OrderBookCache / FundingCache
-            -> market.orderbook.updated / market.funding.updated
-            -> SpotFuturesSpreadAnalyzer
+        exchange adapters / REST warmup / parquet restore
+            -> MarketIngestionService
+            -> MarketStateStore dirty scopes
+            -> MarketScheduler
+            -> SpotFuturesSpreadAnalyzer.process_market_snapshot()
             -> analytics.spreads.spot_futures.updated
             -> analytics.spreads.signal.generated
 
@@ -74,6 +74,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         config: SpotFuturesSpreadConfig,
         event_bus: EventBus,
         scheduler: Scheduler | None = None,
+        market_scheduler: Any | None = None,
     ) -> None:
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -100,6 +101,7 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
             config=config,
             event_bus=event_bus,
             scheduler=scheduler,
+            market_scheduler=market_scheduler,
             service_name=config.service_name,
         )
         self._config: SpotFuturesSpreadConfig = config
@@ -149,14 +151,11 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
 
     def register(self) -> None:
         """
-        Реєструє EventBus subscriptions.
+        Реєструє analyzer як MarketScheduler evaluator.
 
-        Production subscriptions:
-            market.orderbook.updated
-            market.funding.updated
-
-        Raw topics market.orderbook / market.quote / market.funding не
-        використовуються, якщо config.allow_legacy_raw_topics=False.
+        Production input не використовує старі EventBus topics
+        market.orderbook.updated / market.funding.updated. Дані приходять тільки
+        зі shared MarketStateStore snapshot через process_market_snapshot().
         """
         try:
             _analytics_logger = getattr(self, "logger", None) or getattr(self, "_logger", None)
@@ -182,14 +181,12 @@ class SpotFuturesSpreadAnalyzer(BaseSpreadAnalyzer):
         if self._registered:
             return
 
-        self._subscribe_orderbook_updates(
-            self.on_orderbook_update,
-            name=f"{self._service_name}.on_orderbook_update",
-        )
-        self._subscribe_funding_updates(
-            self.on_funding_update,
-            name=f"{self._service_name}.on_funding_update",
-        )
+        registered_evaluator = self._register_market_scheduler_evaluator()
+        if not registered_evaluator:
+            self._logger.warning(
+                "SpotFuturesSpreadAnalyzer registered without an internal MarketScheduler evaluator; "
+                "ensure the facade is registered externally, otherwise no market data will be processed"
+            )
 
         self._registered = True
 

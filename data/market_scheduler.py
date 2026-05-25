@@ -179,9 +179,33 @@ class MarketScheduler:
         "liquidation": frozenset({DirtyReason.LIQUIDATION.value}),
         "whales": frozenset({DirtyReason.TRADE.value, DirtyReason.TRADES_BATCH.value, DirtyReason.LIQUIDATION.value}),
         "whale": frozenset({DirtyReason.TRADE.value, DirtyReason.TRADES_BATCH.value, DirtyReason.LIQUIDATION.value}),
-        "spoofing": frozenset({DirtyReason.ORDERBOOK.value, DirtyReason.ORDERBOOK_RESYNC_REQUIRED.value, DirtyReason.REST_SNAPSHOT.value}),
-        "spreads": frozenset({DirtyReason.PRICE.value, DirtyReason.FUNDING.value, DirtyReason.OPEN_INTEREST.value}),
-        "spread": frozenset({DirtyReason.PRICE.value, DirtyReason.FUNDING.value, DirtyReason.OPEN_INTEREST.value}),
+        "spoofing": frozenset({
+            DirtyReason.ORDERBOOK.value,
+            DirtyReason.ORDERBOOK_RESYNC_REQUIRED.value,
+            DirtyReason.REST_SNAPSHOT.value,
+            DirtyReason.TRADE.value,
+            DirtyReason.TRADES_BATCH.value,
+        }),
+        "spreads": frozenset({
+            DirtyReason.ORDERBOOK.value,
+            DirtyReason.ORDERBOOK_RESYNC_REQUIRED.value,
+            DirtyReason.REST_SNAPSHOT.value,
+            DirtyReason.PRICE.value,
+            DirtyReason.FUNDING.value,
+            DirtyReason.OPEN_INTEREST.value,
+            DirtyReason.TRADE.value,
+            DirtyReason.TRADES_BATCH.value,
+        }),
+        "spread": frozenset({
+            DirtyReason.ORDERBOOK.value,
+            DirtyReason.ORDERBOOK_RESYNC_REQUIRED.value,
+            DirtyReason.REST_SNAPSHOT.value,
+            DirtyReason.PRICE.value,
+            DirtyReason.FUNDING.value,
+            DirtyReason.OPEN_INTEREST.value,
+            DirtyReason.TRADE.value,
+            DirtyReason.TRADES_BATCH.value,
+        }),
     }
 
     def __init__(

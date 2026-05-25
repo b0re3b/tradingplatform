@@ -196,6 +196,8 @@ class FundingAnalyzer:
 
         self._history_write_buffer: list[dict[str, Any]] = []
         self._history_buffer_lock = asyncio.Lock()
+        self._parquet_flush_lock = asyncio.Lock()
+        self._parquet_flush_task: asyncio.Task[int] | None = None
         self._parquet_unavailable_logged = False
 
         self._registered = False
@@ -3252,9 +3254,9 @@ class FundingAnalyzer:
             name=self.config.parquet_flush_job_name,
             func=self.flush_history_to_parquet,
             interval=self.config.parquet_flush_interval_sec,
-            timeout=self.config.parquet_flush_timeout_sec,
-            max_retries=1,
-            retry_delay=1.0,
+            timeout=max(60.0, float(self.config.parquet_flush_timeout_sec)),
+            max_retries=0,
+            retry_delay=0.0,
             allow_overlap=False,
             run_immediately=False,
             enabled=True,
@@ -3568,25 +3570,83 @@ class FundingAnalyzer:
             _analytics_logger.debug("%s.%s entered | args=%s", _analytics_class_name, "flush_history_to_parquet", _analytics_args)
         except Exception:
             pass
+
         if not self.config.enable_parquet_history:
             return 0
 
-        async with self._history_buffer_lock:
-            if not self._history_write_buffer:
-                return 0
-            rows = list(self._history_write_buffer)
-            self._history_write_buffer.clear()
-
-        try:
-            written = await asyncio.to_thread(self._write_history_rows_to_parquet, rows)
-            if written:
-                self.logger.debug("FundingAnalyzer parquet history flushed | records=%s", written)
-            return written
-        except Exception:
-            async with self._history_buffer_lock:
-                self._history_write_buffer[0:0] = rows
-            self.logger.exception("Failed to flush FundingAnalyzer history to parquet")
+        # If a previous scheduler timeout cancelled the awaiting coroutine,
+        # the underlying asyncio.to_thread() write may still be running.
+        # Do not start a second parquet writer over the same dataset.
+        existing_task = self._parquet_flush_task
+        if existing_task is not None and not existing_task.done():
+            self.logger.warning(
+                "FundingAnalyzer parquet flush skipped: previous parquet write is still running"
+            )
             return 0
+
+        if self._parquet_flush_lock.locked():
+            self.logger.warning(
+                "FundingAnalyzer parquet flush skipped: previous flush coroutine is still running"
+            )
+            return 0
+
+        async with self._parquet_flush_lock:
+            existing_task = self._parquet_flush_task
+            if existing_task is not None and not existing_task.done():
+                self.logger.warning(
+                    "FundingAnalyzer parquet flush skipped: previous parquet write is still running"
+                )
+                return 0
+
+            async with self._history_buffer_lock:
+                if not self._history_write_buffer:
+                    return 0
+                rows = list(self._history_write_buffer)
+                self._history_write_buffer.clear()
+
+            loop = asyncio.get_running_loop()
+            write_task = loop.create_task(asyncio.to_thread(self._write_history_rows_to_parquet, rows))
+            self._parquet_flush_task = write_task
+
+            def _clear_finished_task(task: asyncio.Task[int]) -> None:
+                if self._parquet_flush_task is task:
+                    self._parquet_flush_task = None
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc is not None:
+                    self.logger.exception(
+                        "FundingAnalyzer background parquet write failed after cancellation",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+
+            write_task.add_done_callback(_clear_finished_task)
+
+            try:
+                # shield() prevents scheduler wait_for() cancellation from
+                # killing the thread-backed write task. If the scheduler timeout
+                # cancels this coroutine, the write continues in background and
+                # the next flush will skip until it is done.
+                written = await asyncio.shield(write_task)
+                if written:
+                    self.logger.debug("FundingAnalyzer parquet history flushed | records=%s", written)
+                return int(written or 0)
+
+            except asyncio.CancelledError:
+                self.logger.warning(
+                    "FundingAnalyzer parquet flush coroutine cancelled while write continues in background | records=%s",
+                    len(rows),
+                )
+                return 0
+
+            except Exception:
+                if self._parquet_flush_task is write_task:
+                    self._parquet_flush_task = None
+                async with self._history_buffer_lock:
+                    self._history_write_buffer[0:0] = rows
+                self.logger.exception("Failed to flush FundingAnalyzer history to parquet")
+                return 0
+
 
     async def _buffer_history_record(
         self,
